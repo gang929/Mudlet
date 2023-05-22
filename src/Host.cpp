@@ -1,9 +1,10 @@
 /***************************************************************************
  *   Copyright (C) 2008-2013 by Heiko Koehn - KoehnHeiko@googlemail.com    *
  *   Copyright (C) 2014 by Ahmed Charles - acharles@outlook.com            *
- *   Copyright (C) 2015-2022 by Stephen Lyons - slysven@virginmedia.com    *
+ *   Copyright (C) 2015-2023 by Stephen Lyons - slysven@virginmedia.com    *
  *   Copyright (C) 2016 by Ian Adkins - ieadkins@gmail.com                 *
  *   Copyright (C) 2018 by Huadong Qi - novload@outlook.com                *
+ *   Copyright (C) 2023 by Lecker Kebap - Leris@mudlet.org                 *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
  *   it under the terms of the GNU General Public License as published by  *
@@ -189,14 +190,14 @@ QString stopWatch::getElapsedDayTimeString() const
         elapsed *= -1;
     }
 
-    qint64 days = elapsed / std::chrono::milliseconds(24h).count();
+    qint64 const days = elapsed / std::chrono::milliseconds(24h).count();
     qint64 remainder = elapsed - (days * std::chrono::milliseconds(24h).count());
-    quint8 hours = static_cast<quint8>(remainder / std::chrono::milliseconds(1h).count());
+    quint8 const hours = static_cast<quint8>(remainder / std::chrono::milliseconds(1h).count());
     remainder = remainder - (hours * std::chrono::milliseconds(1h).count());
-    quint8 minutes = static_cast<quint8>(remainder / std::chrono::milliseconds(1min).count());
+    quint8 const minutes = static_cast<quint8>(remainder / std::chrono::milliseconds(1min).count());
     remainder = remainder - (minutes * std::chrono::milliseconds(1min).count());
-    quint8 seconds = static_cast<quint8>(remainder / std::chrono::milliseconds(1s).count());
-    quint16 milliSeconds = static_cast<quint16>(remainder - (seconds * std::chrono::milliseconds(1s).count()));
+    quint8 const seconds = static_cast<quint8>(remainder / std::chrono::milliseconds(1s).count());
+    quint16 const milliSeconds = static_cast<quint16>(remainder - (seconds * std::chrono::milliseconds(1s).count()));
     return qsl("%1:%2:%3:%4:%5:%6").arg((isNegative ? QLatin1String("-") : QLatin1String("+")), QString::number(days), QString::number(hours), QString::number(minutes), QString::number(seconds), QString::number(milliSeconds));
 }
 
@@ -214,10 +215,6 @@ Host::Host(int port, const QString& hostname, const QString& login, const QStrin
 , mBlockScriptCompile(true)
 , mBlockStopWatchCreation(true)
 , mEchoLuaErrors(false)
-, mBorderBottomHeight(0)
-, mBorderLeftWidth(0)
-, mBorderRightWidth(0)
-, mBorderTopHeight(0)
 , mCommandLineFont(QFont(qsl("Bitstream Vera Sans Mono"), 14, QFont::Normal))
 , mCommandSeparator(qsl(";;"))
 , mEnableGMCP(true)
@@ -225,6 +222,8 @@ Host::Host(int port, const QString& hostname, const QString& login, const QStrin
 , mEnableMSP(true)
 , mEnableMSDP(false)
 , mServerMXPenabled(true)
+, mAskTlsAvailable(true)
+, mMSSPTlsPort(0)
 , mMxpClient(this)
 , mMxpProcessor(&mMxpClient)
 , mFORCE_GA_OFF(false)
@@ -326,6 +325,7 @@ Host::Host(int port, const QString& hostname, const QString& login, const QStrin
 , mEnableTextAnalyzer(false)
 , mTimerDebugOutputSuppressionInterval(QTime())
 , mSearchOptions(dlgTriggerEditor::SearchOption::SearchOptionNone)
+, mBufferSearchOptions(TConsole::SearchOption::SearchOptionNone)
 , mpDlgIRC(nullptr)
 , mpDlgProfilePreferences(nullptr)
 , mTutorialForCompactLineAlreadyShown(false)
@@ -350,7 +350,6 @@ Host::Host(int port, const QString& hostname, const QString& login, const QStrin
 , mWideAmbigousWidthGlyphs(false)
 , mSGRCodeHasColSpaceId(false)
 , mServerMayRedefineColors(false)
-, mSpellDic(qsl("en_US"))
 // DISABLED: - Prevent "None" option for user dictionary - changed to true and not changed anywhere else
 , mEnableUserDictionary(true)
 , mUseSharedDictionary(false)
@@ -377,9 +376,9 @@ Host::Host(int port, const QString& hostname, const QString& login, const QStrin
     mLuaInterpreter.updateAnsi16ColorsInTable();
     mLuaInterpreter.updateExtendedAnsiColorsInTable();
 
-    QString directoryLogFile = mudlet::getMudletPath(mudlet::profileDataItemPath, mHostName, qsl("log"));
-    QString logFileName = qsl("%1/errors.txt").arg(directoryLogFile);
-    QDir dirLogFile;
+    const QString directoryLogFile = mudlet::getMudletPath(mudlet::profileDataItemPath, mHostName, qsl("log"));
+    const QString logFileName = qsl("%1/errors.txt").arg(directoryLogFile);
+    const QDir dirLogFile;
     if (!dirLogFile.exists(directoryLogFile)) {
         dirLogFile.mkpath(directoryLogFile);
     }
@@ -392,20 +391,10 @@ Host::Host(int port, const QString& hostname, const QString& login, const QStrin
      * otherwise - note that this must be done AFTER setDevice(...):
      */
     mErrorLogStream.setDevice(&mErrorLogFile);
+    // In Qt6 the default encoding is UTF-8
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
     mErrorLogStream.setCodec(QTextCodec::codecForName("UTF-8"));
-
-    QTimer::singleShot(0, this, [this]() {
-        qDebug() << "Host::Host() - restore map case 4 {QTimer::singleShot(0)} lambda.";
-        if (mpMap->restore(QString(), false)) {
-            mpMap->audit();
-            if (mpMap->mpMapper) {
-                mpMap->mpMapper->mp2dMap->init();
-                mpMap->mpMapper->updateAreaComboBox();
-                mpMap->mpMapper->resetAreaComboBoxToPlayerRoomArea();
-                mpMap->mpMapper->show();
-            }
-        }
-    });
+#endif
 
     mGMCP_merge_table_keys.append("Char.Status");
     mDoubleClickIgnore.insert('"');
@@ -438,7 +427,7 @@ Host::Host(int port, const QString& hostname, const QString& login, const QStrin
         thankForUsingPTB();
     }
 
-    if (mudlet::self()->firstLaunch) {
+    if (mudlet::self()->smFirstLaunch) {
         QTimer::singleShot(0, this, [this]() {
             mpConsole->mpCommandLine->setPlaceholderText(tr("Text to send to the game"));
         });
@@ -451,10 +440,10 @@ Host::Host(int port, const QString& hostname, const QString& login, const QStrin
     // enable by default in case of offline connection; if the profile connects - timer will be disabled
     purgeTimer.start(1min);
 
-    auto i = mudlet::self()->mShortcutsManager->iterator();
+    auto i = mudlet::self()->mpShortcutsManager->iterator();
     while (i.hasNext()) {
         auto entry = i.next();
-        profileShortcuts.insert(entry, new QKeySequence(*mudlet::self()->mShortcutsManager->getSequence(entry)));
+        profileShortcuts.insert(entry, new QKeySequence(*mudlet::self()->mpShortcutsManager->getSequence(entry)));
     }
 
     startMapAutosave();
@@ -470,6 +459,20 @@ Host::~Host()
     mErrorLogStream.flush();
     mErrorLogFile.close();
     TDebug::removeHost(this);
+}
+
+void Host::loadMap()
+{
+    qDebug() << "Host::loadMap() - restore map case 4.";
+    if (mpMap->restore(QString(), false)) {
+        mpMap->audit();
+        if (mpMap->mpMapper) {
+            mpMap->mpMapper->mp2dMap->init();
+            mpMap->mpMapper->updateAreaComboBox();
+            mpMap->mpMapper->resetAreaComboBoxToPlayerRoomArea();
+            mpMap->mpMapper->show();
+        }
+    }
 }
 
 void Host::startMapAutosave()
@@ -489,17 +492,30 @@ void Host::timerEvent(QTimerEvent *event)
 
 void Host::autoSaveMap()
 {
-    if (mpMap->mUnsavedMap) {
-        mpConsole->saveMap(mudlet::getMudletPath(mudlet::profileMapPathFileName, mHostName, qsl("autosave.dat")));
+    if (mpMap->isUnsaved()) {
+#if defined(DEBUG_MAPAUTOSAVE)
+        QString nowString = QDateTime::currentDateTimeUtc().toString("HH:mm:ss.zzz");
+#endif
+        if (!mIsProfileLoadingSequence) {
+#if defined(DEBUG_MAPAUTOSAVE)
+            qDebug().nospace().noquote() << "Host::autoSaveMap() INFO - map auto save initiated at:" << nowString << ".";
+#endif
+            // FIXME: https://github.com/Mudlet/Mudlet/issues/6316 - unchecked return value - we are not handling a failure to save the map!
+            mpConsole->saveMap(mudlet::getMudletPath(mudlet::profileMapPathFileName, mHostName, qsl("autosave.dat")));
+#if defined(DEBUG_MAPAUTOSAVE)
+        } else {
+            qDebug().nospace().noquote() << "Host::autoSaveMap() INFO - map auto save requested at:" << nowString << " but declined whilst \"Host::mIsProfileLoadingSequence\" flag set.";
+#endif
+        }
     }
 }
 
 void Host::loadPackageInfo()
 {
-    QStringList packages = mInstalledPackages;
+    const QStringList packages = mInstalledPackages;
     for (int i = 0; i < packages.size(); i++) {
-        QString packagePath{mudlet::self()->getMudletPath(mudlet::profilePackagePath, getName(), packages.at(i))};
-        QDir dir(packagePath);
+        const QString packagePath{mudlet::self()->getMudletPath(mudlet::profilePackagePath, getName(), packages.at(i))};
+        const QDir dir(packagePath);
         if (dir.exists(qsl("config.lua"))) {
             getPackageConfig(dir.absoluteFilePath(qsl("config.lua")));
         }
@@ -508,7 +524,7 @@ void Host::loadPackageInfo()
 
 void Host::createModuleBackup(const QString &filename, const QString &saveName)
 {
-    QString time = QDateTime::currentDateTime().toString("yyyy-MM-dd#HH-mm-ss");
+    const QString time = QDateTime::currentDateTime().toString("yyyy-MM-dd#HH-mm-ss");
     QFile::copy(filename, saveName + time);
 }
 
@@ -540,7 +556,7 @@ void Host::saveModules(bool backup)
 {
     QMapIterator<QString, QStringList> it(modulesToWrite);
     mModulesToSync.clear();
-    QString savePath = mudlet::getMudletPath(mudlet::moduleBackupsPath);
+    const QString savePath = mudlet::getMudletPath(mudlet::moduleBackupsPath);
     auto savePathDir = QDir(savePath);
     if (!savePathDir.exists()) {
         savePathDir.mkpath(savePath);
@@ -548,8 +564,8 @@ void Host::saveModules(bool backup)
     while (it.hasNext()) {
         it.next();
         QStringList entry = it.value();
-        QString moduleName = it.key();
-        QString filename = entry[0];
+        const QString moduleName = it.key();
+        const QString filename = entry[0];
 
         if (backup) {
             createModuleBackup(filename, savePath + moduleName);
@@ -569,7 +585,7 @@ void Host::reloadModules()
         if (otherHost == this || !otherHost->mpConsole) {
             continue;
         }
-        QMap<QString, int>& modulePri = otherHost->mModulePriorities;
+        QMap<QString, int> const& modulePri = otherHost->mModulePriorities;
         QMap<int, QStringList> moduleOrder;
 
         auto modulePrioritiesIt = modulePri.constBegin();
@@ -581,9 +597,8 @@ void Host::reloadModules()
         QMapIterator<int, QStringList> it(moduleOrder);
         while (it.hasNext()) {
             it.next();
-            QStringList moduleList = it.value();
-            for (int i = 0, total = moduleList.size(); i < total; ++i) {
-                QString moduleName = moduleList[i];
+            const QStringList moduleList = it.value();
+            for (auto moduleName : moduleList) {
                 if (mModulesToSync.contains(moduleName)) {
                     otherHost->reloadModule(moduleName, mHostName);
                 }
@@ -599,21 +614,21 @@ void Host::updateModuleZips(const QString& zipName, const QString& moduleName)
         return;
     }
     zip* zipFile = nullptr;
-    QString packagePathName = mudlet::getMudletPath(mudlet::profilePackagePath, mHostName, moduleName);
-    QString filename_xml = mudlet::getMudletPath(mudlet::profilePackagePathFileName, mHostName, moduleName);
+    const QString packagePathName = mudlet::getMudletPath(mudlet::profilePackagePath, mHostName, moduleName);
+    const QString filename_xml = mudlet::getMudletPath(mudlet::profilePackagePathFileName, mHostName, moduleName);
     int err = 0;
     zipFile = zip_open(zipName.toStdString().c_str(), ZIP_CREATE, &err);
     if (!zipFile) {
         return;
     }
-    QDir packageDir = QDir(packagePathName);
+    const QDir packageDir = QDir(packagePathName);
     if (!packageDir.exists()) {
         packageDir.mkpath(packagePathName);
     }
-    int xmlIndex = zip_name_locate(zipFile, qsl("%1.xml").arg(moduleName).toUtf8().constData(), ZIP_FL_ENC_GUESS);
+    const int xmlIndex = zip_name_locate(zipFile, qsl("%1.xml").arg(moduleName).toUtf8().constData(), ZIP_FL_ENC_GUESS);
     zip_delete(zipFile, xmlIndex);
     struct zip_source* s = zip_source_file(zipFile, filename_xml.toUtf8().constData(), 0, -1);
-    if (mudlet::debugMode && s == nullptr) {
+    if (mudlet::smDebugMode && s == nullptr) {
         TDebug(QColor(Qt::white), QColor(Qt::red)) << tr("Failed to open xml file \"%1\" inside module %2 to update it. Error message was: \"%3\".",
                                                          // Intentional comment to separate arguments
                                                          "This error message will appear when the xml file inside the module zip cannot be updated for some reason.")
@@ -625,7 +640,7 @@ void Host::updateModuleZips(const QString& zipName, const QString& moduleName)
         err = zip_close(zipFile);
     }
 
-    if (mudlet::debugMode && err == -1) {
+    if (mudlet::smDebugMode && err == -1) {
         TDebug(QColor(Qt::white), QColor(Qt::red)) << tr("Failed to save \"%1\" to module \"%2\". Error message was: \"%3\".",
                                                          // Intentional comment to separate arguments
                                                          "This error message will appear when a module is saved as package but cannot be done for some reason.")
@@ -677,7 +692,7 @@ void Host::reloadModule(const QString& syncModuleName, const QString& syncingFro
     moduleIterator.toFront();
     while (moduleIterator.hasNext()) {
         moduleIterator.next();
-        QStringList entry = installedModules[moduleIterator.key()];
+        const QStringList entry = installedModules[moduleIterator.key()];
         mInstalledModules[moduleIterator.key()] = entry;
     }
 }
@@ -773,9 +788,6 @@ void Host::resetProfile_phase2()
 // returns true+filepath if successful or false+error message otherwise
 std::tuple<bool, QString, QString> Host::saveProfile(const QString& saveFolder, const QString& saveName, bool syncModules)
 {
-    emit profileSaveStarted();
-    qApp->processEvents();
-
     QString directory_xml;
     if (saveFolder.isEmpty()) {
         directory_xml = mudlet::getMudletPath(mudlet::profileXmlFilesPath, getName());
@@ -790,13 +802,16 @@ std::tuple<bool, QString, QString> Host::saveProfile(const QString& saveFolder, 
         filename_xml = qsl("%1/%2.xml").arg(directory_xml, saveName);
     }
 
+    if (!mLoadedOk) {
+        return {false, filename_xml, qsl("profile was not loaded correctly to begin with")};
+    }
 
     if (mIsProfileLoadingSequence) {
         //If we're inside of profile loading sequence modules might not be loaded yet, thus we can accidetnally clear their contents
         return std::make_tuple(false, filename_xml, qsl("profile loading is in progress"));
     }
 
-    QDir dir_xml;
+    const QDir dir_xml;
     if (!dir_xml.exists(directory_xml)) {
         dir_xml.mkpath(directory_xml);
     }
@@ -804,6 +819,9 @@ std::tuple<bool, QString, QString> Host::saveProfile(const QString& saveFolder, 
     if (currentlySavingProfile()) {
         return std::make_tuple(false, QString(), qsl("a save is already in progress"));
     }
+
+    emit profileSaveStarted();
+    qApp->processEvents();
 
     auto writer = new XMLexport(this);
     writers.insert(qsl("profile"), writer);
@@ -815,7 +833,7 @@ std::tuple<bool, QString, QString> Host::saveProfile(const QString& saveFolder, 
         waitForAsyncXmlSave();
         saveModules(saveName != qsl("autosave"));
     });
-    QObject::connect(watcher, &QFutureWatcher<void>::finished, this, [=]() {
+    connect(watcher, &QFutureWatcher<void>::finished, this, [=]() {
         // reload, or queue module reload for when xml is ready
         if (syncModules) {
             reloadModules();
@@ -906,9 +924,9 @@ void Host::updateConsolesFont()
         mpEditorDialog->mpErrorConsole->setFont(mDisplayFont.family());
         mpEditorDialog->mpErrorConsole->setFontSize(mDisplayFont.pointSize());
     }
-    if (mudlet::self()->mpDebugArea) {
-        mudlet::self()->mpDebugConsole->setFont(mDisplayFont.family());
-        mudlet::self()->mpDebugConsole->setFontSize(mDisplayFont.pointSize());
+    if (mudlet::self()->smpDebugArea) {
+        mudlet::self()->smpDebugConsole->setFont(mDisplayFont.family());
+        mudlet::self()->smpDebugConsole->setFontSize(mDisplayFont.pointSize());
     }
 }
 
@@ -923,7 +941,7 @@ void Host::thankForUsingPTB()
 
 void Host::setMediaLocationGMCP(const QString& mediaUrl)
 {
-    QUrl url = QUrl(mediaUrl);
+    QUrl const url = QUrl(mediaUrl);
 
     if (!url.isValid()) {
         return;
@@ -939,7 +957,7 @@ QString Host::getMediaLocationGMCP() const
 
 void Host::setMediaLocationMSP(const QString& mediaUrl)
 {
-    QUrl url = QUrl(mediaUrl);
+    QUrl const url = QUrl(mediaUrl);
 
     if (!url.isValid()) {
         return;
@@ -989,15 +1007,15 @@ unsigned int Host::assemblePath()
 {
     unsigned int totalWeight = 0;
     QStringList pathList;
-    for (int i : qAsConst(mpMap->mPathList)) {
-        QString n = QString::number(i);
+    for (const int i : qAsConst(mpMap->mPathList)) {
+        const QString n = QString::number(i);
         pathList.append(n);
     }
     QStringList directionList = mpMap->mDirList;
     QStringList weightList;
-    for (int stepWeight : qAsConst(mpMap->mWeightList)) {
+    for (const int stepWeight : qAsConst(mpMap->mWeightList)) {
         totalWeight += stepWeight;
-        QString n = QString::number(stepWeight);
+        const QString n = QString::number(stepWeight);
         weightList.append(n);
     }
     QString tableName = qsl("speedWalkPath");
@@ -1014,7 +1032,7 @@ bool Host::checkForMappingScript()
     // the mapper script reminder is only shown once
     // because it is too difficult and error prone (->proper script sequence)
     // to disable this message
-    bool ret = (mLuaInterpreter.check_for_mappingscript() || mHaveMapperScript);
+    const bool ret = (mLuaInterpreter.check_for_mappingscript() || mHaveMapperScript);
     mHaveMapperScript = true;
     return ret;
 }
@@ -1044,27 +1062,27 @@ void Host::check_for_mappingscript()
 
 bool Host::checkForCustomSpeedwalk()
 {
-    bool ret = mLuaInterpreter.check_for_custom_speedwalk();
+    const bool ret = mLuaInterpreter.check_for_custom_speedwalk();
     return ret;
 }
 
 void Host::startSpeedWalk()
 {
-    int totalWeight = assemblePath();
+    const int totalWeight = assemblePath();
     Q_UNUSED(totalWeight);
-    QString f = qsl("doSpeedWalk");
-    QString n = QString();
+    const QString f = qsl("doSpeedWalk");
+    const QString n = QString();
     mLuaInterpreter.call(f, n);
 }
 
 void Host::startSpeedWalk(int sourceRoom, int targetRoom)
 {
-    QString sourceName = qsl("speedWalkFrom");
+    const QString sourceName = qsl("speedWalkFrom");
     mLuaInterpreter.set_lua_integer(sourceName, sourceRoom);
-    QString targetName = qsl("speedWalkTo");
+    const QString targetName = qsl("speedWalkTo");
     mLuaInterpreter.set_lua_integer(targetName, targetRoom);
-    QString f = qsl("doSpeedWalk");
-    QString n = QString();
+    const QString f = qsl("doSpeedWalk");
+    const QString n = QString();
     mLuaInterpreter.call(f, n);
 }
 
@@ -1212,7 +1230,7 @@ int Host::findStopWatchId(const QString& name) const
 {
     // Scan through existing names, in ascending id order
     QList<int> stopWatchIdList = mStopWatchMap.keys();
-    int total = stopWatchIdList.size();
+    const int total = stopWatchIdList.size();
     if (total > 1) {
         std::sort(stopWatchIdList.begin(), stopWatchIdList.end());
     }
@@ -1428,7 +1446,7 @@ QPair<bool, QString> Host::setStopWatchName(const QString& currentName, const QS
     stopWatch* pStopWatch = nullptr;
     // Scan through existing names, in ascending id order
     QList<int> stopWatchIdList = mStopWatchMap.keys();
-    int total = stopWatchIdList.size();
+    const int total = stopWatchIdList.size();
     if (total > 1) {
         std::sort(stopWatchIdList.begin(), stopWatchIdList.end());
     }
@@ -1546,7 +1564,7 @@ void Host::raiseEvent(const TEvent& pE)
         return;
     }
 
-    static QString star = qsl("*");
+    static const QString star = qsl("*");
 
     if (mEventHandlerMap.contains(pE.mArgumentList.at(0))) {
         QList<TScript*> scriptList = mEventHandlerMap.value(pE.mArgumentList.at(0));
@@ -1562,13 +1580,13 @@ void Host::raiseEvent(const TEvent& pE)
     }
 
     if (mAnonymousEventHandlerFunctions.contains(pE.mArgumentList.at(0))) {
-        QStringList functionsList = mAnonymousEventHandlerFunctions.value(pE.mArgumentList.at(0));
+        const QStringList functionsList = mAnonymousEventHandlerFunctions.value(pE.mArgumentList.at(0));
         for (int i = 0, total = functionsList.size(); i < total; ++i) {
             mLuaInterpreter.callEventHandler(functionsList.at(i), pE);
         }
     }
     if (mAnonymousEventHandlerFunctions.contains(star)) {
-        QStringList functionsList = mAnonymousEventHandlerFunctions.value(star);
+        const QStringList functionsList = mAnonymousEventHandlerFunctions.value(star);
         for (int i = 0, total = functionsList.size(); i < total; ++i) {
             mLuaInterpreter.callEventHandler(functionsList.at(i), pE);
         }
@@ -1642,9 +1660,9 @@ bool Host::isClosingDown()
 
 std::pair<bool, QString> Host::installPackage(const QString& fileName, int module)
 {
-    // As the pointed to dialog is only used now WITHIN this method and this
+    // As the pointer to dialog is only used now WITHIN this method and this
     // method can be re-entered, it is best to use a local rather than a class
-    // pointer just in case we accidentally reenter this method in the future.
+    // pointer just in case we accidentally re-enter this method in the future.
     QDialog* pUnzipDialog = nullptr;
 
     //     Module notes:
@@ -1663,13 +1681,7 @@ std::pair<bool, QString> Host::installPackage(const QString& fileName, int modul
         return {false, qsl("could not open file '%1").arg(fileName)};
     }
 
-    QString packageName = fileName.section(qsl("/"), -1);
-    packageName.remove(qsl(".trigger"), Qt::CaseInsensitive);
-    packageName.remove(qsl(".xml"), Qt::CaseInsensitive);
-    packageName.remove(qsl(".zip"), Qt::CaseInsensitive);
-    packageName.remove(qsl(".mpackage"), Qt::CaseInsensitive);
-    packageName.remove(QLatin1Char('\\'));
-    packageName.remove(QLatin1Char('.'));
+    QString packageName = sanitizePackageName(fileName);
     if (module) {
         if ((module == 2) && (mActiveModules.contains(packageName))) {
             uninstallPackage(packageName, 2);
@@ -1687,14 +1699,15 @@ std::pair<bool, QString> Host::installPackage(const QString& fileName, int modul
     }
     QFile file2;
     if (fileName.endsWith(qsl(".zip"), Qt::CaseInsensitive) || fileName.endsWith(qsl(".mpackage"), Qt::CaseInsensitive)) {
-        QString _home = mudlet::getMudletPath(mudlet::profileHomePath, getName());
-        QString _dest = mudlet::getMudletPath(mudlet::profilePackagePath, getName(), packageName);
+        const QString _home = mudlet::getMudletPath(mudlet::profileHomePath, getName());
+        const QString _dest = mudlet::getMudletPath(mudlet::profilePackagePath, getName(), packageName);
         // home directory for the PROFILE
-        QDir _tmpDir(_home);
+        const QDir _tmpDir(_home);
         // directory to store the expanded archive file contents
-        _tmpDir.mkpath(_dest);
-
-        // TODO: report failure to create destination folder for package/module in profile
+        const bool mkpathSuccessful = _tmpDir.mkpath(_dest);
+        if (!mkpathSuccessful) {
+            return {false, qsl("could not create destination folder")};
+        }
 
         QUiLoader loader(this);
         QFile uiFile(qsl(":/ui/package_manager_unpack.ui"));
@@ -1722,10 +1735,10 @@ std::pair<bool, QString> Host::installPackage(const QString& fileName, int modul
         pUnzipDialog->repaint(); // Force a redraw
         qApp->processEvents();   // Try to ensure we are on top of any other dialogs and freshly drawn
 
-        auto successful = mudlet::unzip(fileName, _dest, _tmpDir);
+        auto unzipSuccessful = mudlet::unzip(fileName, _dest, _tmpDir);
         pUnzipDialog->deleteLater();
         pUnzipDialog = nullptr;
-        if (!successful) {
+        if (!unzipSuccessful) {
             return {false, qsl("could not unzip package")};
         }
 
@@ -1754,19 +1767,16 @@ std::pair<bool, QString> Host::installPackage(const QString& fileName, int modul
                 }
             }
             // continuing, so update the folder name on disk
-            QString newpath(qsl("%1/%2").arg(_home, packageName));
+            const QString newpath(qsl("%1/%2").arg(_home, packageName));
             _dir.rename(_dir.absolutePath(), newpath);
             _dir = QDir(newpath);
         }
         QStringList _filterList;
         _filterList << qsl("*.xml") << qsl("*.trigger");
-        QFileInfoList entries = _dir.entryInfoList(_filterList, QDir::Files);
+        QFileInfoList const entries = _dir.entryInfoList(_filterList, QDir::Files);
         for (auto& entry : entries) {
             file2.setFileName(entry.absoluteFilePath());
             file2.open(QFile::ReadOnly | QFile::Text);
-            QString profileName = getName();
-            QString login = getLogin();
-            QString pass = getPass();
             XMLimport reader(this);
             if (module) {
                 QStringList moduleEntry;
@@ -1778,18 +1788,12 @@ std::pair<bool, QString> Host::installPackage(const QString& fileName, int modul
                 mInstalledPackages.append(packageName);
             }
             reader.importPackage(&file2, packageName, module); // TODO: Missing false return value handler
-            setName(profileName);
-            setLogin(login);
-            setPass(pass);
             file2.close();
         }
     } else {
         file2.setFileName(fileName);
         file2.open(QFile::ReadOnly | QFile::Text);
         //mInstalledPackages.append( packageName );
-        QString profileName = getName();
-        QString login = getLogin();
-        QString pass = getPass();
         XMLimport reader(this);
         if (module) {
             QStringList moduleEntry;
@@ -1801,9 +1805,6 @@ std::pair<bool, QString> Host::installPackage(const QString& fileName, int modul
             mInstalledPackages.append(packageName);
         }
         reader.importPackage(&file2, packageName, module); // TODO: Missing false return value handler
-        setName(profileName);
-        setLogin(login);
-        setPass(pass);
         file2.close();
     }
     if (mpEditorDialog) {
@@ -1862,13 +1863,23 @@ std::pair<bool, QString> Host::installPackage(const QString& fileName, int modul
     return {true, QString()};
 }
 
+QString Host::sanitizePackageName(const QString packageName) const {
+    auto tempName = packageName.section(qsl("/"), -1);
+    tempName.remove(qsl(".trigger"), Qt::CaseInsensitive);
+    tempName.remove(qsl(".xml"), Qt::CaseInsensitive);
+    tempName.remove(qsl(".zip"), Qt::CaseInsensitive);
+    tempName.remove(qsl(".mpackage"), Qt::CaseInsensitive);
+    tempName.remove(QLatin1Char('\\'));
+    return tempName;
+}
+
 // credit: http://john.nachtimwald.com/2010/06/08/qt-remove-directory-and-its-contents/
 bool Host::removeDir(const QString& dirName, const QString& originalPath)
 {
     bool result = true;
-    QDir dir(dirName);
+    const QDir dir(dirName);
     if (dir.exists(dirName)) {
-        for (QFileInfo &info : dir.entryInfoList(QDir::NoDotAndDotDot | QDir::System | QDir::Hidden | QDir::AllDirs | QDir::Files, QDir::DirsFirst)) {
+        for (QFileInfo  const&info : dir.entryInfoList(QDir::NoDotAndDotDot | QDir::System | QDir::Hidden | QDir::AllDirs | QDir::Files, QDir::DirsFirst)) {
             // prevent recursion outside of the original branch
             if (info.isDir() && info.absoluteFilePath().startsWith(originalPath)) {
                 result = removeDir(info.absoluteFilePath(), originalPath);
@@ -1902,6 +1913,12 @@ bool Host::uninstallPackage(const QString& packageName, int module)
     //     As with the installPackage, the module codes are:
     //     0=package, 1=uninstall from dialog, 2=uninstall due to module syncing,
     //     3=uninstall from a script
+
+    // block packages/modules from being uninstalled while a profile save is in progress
+    // just so the save mechanism doesn't get surprised with something getting removed from memory under its feet
+    if (currentlySavingProfile()) {
+        return false;
+    }
 
     if (module) {
         if (!mInstalledModules.contains(packageName)) {
@@ -1997,9 +2014,22 @@ bool Host::uninstallPackage(const QString& packageName, int module)
 
     getActionUnit()->updateToolbar();
 
-    QString dest = mudlet::getMudletPath(mudlet::profilePackagePath, getName(), packageName);
+    const QString dest = mudlet::getMudletPath(mudlet::profilePackagePath, getName(), packageName);
     removeDir(dest, dest);
-    saveProfile();
+
+    // ensure only one timer is running in case multiple modules are uninstalled at once
+    if (!mSaveTimer.has_value() || !mSaveTimer.value()) {
+        mSaveTimer = true;
+        // save the profile on the next Qt main loop cycle in order for the asyncronous save mechanism
+        // not to try to write to disk a package/module that just got uninstalled and removed from memory
+        QTimer::singleShot(0, this, [this]() {
+            mSaveTimer = false;
+            if (auto [ok, filename, error] = saveProfile(); !ok) {
+                qDebug() << qsl("Host::uninstallPackage: Couldn't save '%1' to '%2' because: %3").arg(getName(), filename, error);
+            }
+        });
+    }
+
     //NOW we reset if we're uninstalling a module
     if (mpEditorDialog && module == 3) {
         mpEditorDialog->doCleanReset();
@@ -2012,9 +2042,9 @@ bool Host::uninstallPackage(const QString& packageName, int module)
 
 void Host::readPackageConfig(const QString& luaConfig, QString& packageName, bool isModule)
 {
-    QString newName = getPackageConfig(luaConfig, isModule);
-    if (!newName.isEmpty()){
-        packageName = newName;
+    const QString newName = getPackageConfig(luaConfig, isModule);
+    if (!newName.isEmpty()) {
+        packageName = sanitizePackageName(newName);
     }
 }
 
@@ -2029,11 +2059,13 @@ QString Host::getPackageConfig(const QString& luaConfig, bool isModule)
         QTextStream in(&configFile);
         /*
          * We also have to explicit set the codec to use whilst reading the file
-         * as otherwise QTextCodec::codecForLocale() is used which might be a
-         * local8Bit codec that thus will not handle all the characters
-         * contained in Unicode:
+         * as otherwise QTextCodec::codecForLocale() is used which for Qt5
+         * might be a local8Bit codec that thus will not handle all the
+         * characters contained in Unicode. In Qt6 the default is UTF-8.
          */
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
         in.setCodec(QTextCodec::codecForName("UTF-8"));
+#endif
         while (!in.atEnd()) {
             strings += in.readLine();
         }
@@ -2103,7 +2135,7 @@ QString Host::getPackageConfig(const QString& luaConfig, bool isModule)
         break;
     }
 
-    if (mudlet::debugMode) {
+    if (mudlet::smDebugMode) {
         TDebug(QColor(Qt::white), QColor(Qt::red)) << "LUA: " << reason.c_str() << " in " << luaConfig << " ERROR:" << e.c_str() << "\n" >> 0;
     }
 
@@ -2116,14 +2148,16 @@ QString Host::getPackageConfig(const QString& luaConfig, bool isModule)
 // host name argument...
 QPair<bool, QString> Host::writeProfileData(const QString& item, const QString& what)
 {
-    QFile file(mudlet::getMudletPath(mudlet::profileDataItemPath, getName(), item));
+    QSaveFile file(mudlet::getMudletPath(mudlet::profileDataItemPath, getName(), item));
     if (file.open(QIODevice::WriteOnly | QIODevice::Unbuffered)) {
         QDataStream ofs(&file);
         if (mudlet::scmRunTimeQtVersion >= QVersionNumber(5, 13, 0)) {
             ofs.setVersion(mudlet::scmQDataStreamFormat_5_12);
         }
         ofs << what;
-        file.close();
+        if (!file.commit()) {
+            qDebug() << "Host::writeProfileData: writing host data: " << file.errorString();
+        }
     }
 
     if (file.error() == QFile::NoError) {
@@ -2137,7 +2171,7 @@ QPair<bool, QString> Host::writeProfileData(const QString& item, const QString& 
 QString Host::readProfileData(const QString& item)
 {
     QFile file(mudlet::getMudletPath(mudlet::profileDataItemPath, getName(), item));
-    bool success = file.open(QIODevice::ReadOnly);
+    const bool success = file.open(QIODevice::ReadOnly);
     QString ret;
     if (success) {
         QDataStream ifs(&file);
@@ -2190,7 +2224,8 @@ void Host::setWideAmbiguousEAsianGlyphs(const Qt::CheckState state)
         if (encoding == "GBK"
             || encoding == "GB18030"
             || encoding == "BIG5"
-            || encoding == "BIG5-HKSCS") {
+            || encoding == "BIG5-HKSCS"
+            || encoding == "EUC-KR") {
 
             // Need to use wide width for ambiguous characters
             if (!mWideAmbigousWidthGlyphs) {
@@ -2258,16 +2293,16 @@ QColor Host::getAnsiColor(const int ansiCode, const bool isBackground) const
         } else if (ansiCode >= 16 && ansiCode <= 231) {
             // because color 1-15 behave like normal ANSI colors we need to subtract 16
             // 6x6 RGB color space
-            int r = (ansiCode - 16) / 36;
-            int g = (ansiCode - 16 - (r * 36)) / 6;
-            int b = (ansiCode - 16 - (r * 36)) - (g * 6);
+            const int r = (ansiCode - 16) / 36;
+            const int g = (ansiCode - 16 - (r * 36)) / 6;
+            const int b = (ansiCode - 16 - (r * 36)) - (g * 6);
             // Values are scaled according to the standard Xterm color palette
             // http://jonasjacek.github.io/colors/
             return QColor(r == 0 ? 0 : (r - 1) * 40 + 95,
                           g == 0 ? 0 : (g - 1) * 40 + 95,
                           b == 0 ? 0 : (b - 1) * 40 + 95);
         } else if (ansiCode < 256) {
-            int k = (ansiCode - 232) * 10 + 8;
+            const int k = (ansiCode - 232) * 10 + 8;
             return QColor(k, k, k);
         } else {
             return QColor(); // No-op
@@ -2355,7 +2390,7 @@ void Host::processGMCPDiscordStatus(const QJsonObject& discordInfo)
     if (gameName != QJsonValue::Undefined) {
         setDiscordGameName(gameName.toString());
         pMudlet->updateDiscordNamedIcon();
-        QPair<bool, QString> richPresenceSupported = pMudlet->mDiscord.gameIntegrationSupported(getUrl());
+        QPair<bool, QString> const richPresenceSupported = pMudlet->mDiscord.gameIntegrationSupported(getUrl());
         if (richPresenceSupported.first && pMudlet->mDiscord.usingMudletsDiscordID(this)) {
             pMudlet->mDiscord.setDetailText(this, tr("Playing %1").arg(richPresenceSupported.second));
             pMudlet->mDiscord.setLargeImage(this, richPresenceSupported.second);
@@ -2536,6 +2571,20 @@ bool Host::discordUserIdMatch(const QString& userName, const QString& userDiscri
     }
 }
 
+QString  Host::getSpellDic()
+{
+    if (!mSpellDic.isEmpty()) {
+        return mSpellDic;
+    }
+#if defined(Q_OS_OPENBSD)
+    // OpenBSD does not ship a USA dictionary so we will have to use
+    // a different starting one to try and locate system ones
+    return (qsl("en-GB"));
+#else
+    return (qsl("en_US"));
+#endif
+}
+
 void Host::setSpellDic(const QString& newDict)
 {
     bool isChanged = false;
@@ -2554,10 +2603,10 @@ void Host::setSpellDic(const QString& newDict)
 void Host::setUserDictionaryOptions(const bool _useDictionary, const bool useShared)
 {
     Q_UNUSED(_useDictionary);
-    bool useDictionary = true;
+    const bool useDictionary = true;
     bool dictionaryChanged {};
     // Copy the value while we have the lock:
-    bool isSpellCheckingEnabled = mEnableSpellCheck;
+    const bool isSpellCheckingEnabled = mEnableSpellCheck;
     if (mEnableUserDictionary != useDictionary) {
         mEnableUserDictionary = useDictionary;
         dictionaryChanged = true;
@@ -2597,34 +2646,34 @@ void Host::setUserDictionaryOptions(const bool _useDictionary, const bool useSha
 // This does not take care of any QMaps or other containers that the mudlet
 // and HostManager classes have that use the name of this profile as a key,
 // however it should ensure that other classes get updated:
-void Host::setName(const QString& newName)
+void Host::setName(const QString& name)
 {
-    if (mHostName == newName) {
+    if (mHostName == name) {
         return;
     }
 
-    TDebug::changeHostName(this, newName);
+    TDebug::changeHostName(this, name);
     int currentPlayerRoom = 0;
     if (mpMap) {
         currentPlayerRoom = mpMap->mRoomIdHash.take(mHostName);
     }
 
-    mHostName = newName;
+    mHostName = name;
 
-    mTelnet.mProfileName = newName;
+    mTelnet.mProfileName = name;
     if (mpMap) {
-        mpMap->mProfileName = newName;
+        mpMap->mProfileName = name;
         if (currentPlayerRoom) {
-            mpMap->mRoomIdHash.insert(newName, currentPlayerRoom);
+            mpMap->mRoomIdHash.insert(name, currentPlayerRoom);
         }
     }
 
     if (mpConsole) {
         // If skipped they will be taken care of in the TMainConsole constructor:
-        mpConsole->setProperty("HostName", newName);
-        mpConsole->setProfileName(newName);
+        mpConsole->setProperty("HostName", name);
+        mpConsole->setProfileName(name);
     }
-    mTimerUnit.changeHostName(newName);
+    mTimerUnit.changeHostName(name);
 }
 
 void Host::removeAllNonPersistentStopWatches()
@@ -2693,19 +2742,19 @@ void Host::loadSecuredPassword()
 
     job->setKey(getName());
 
-    connect(job, &QKeychain::ReadPasswordJob::finished, this, [=](QKeychain::Job* job) {
-        if (job->error()) {
-            const auto error = job->errorString();
+    connect(job, &QKeychain::ReadPasswordJob::finished, this, [=](QKeychain::Job* task) {
+        if (task->error()) {
+            const auto error = task->errorString();
             if (error != qsl("Entry not found") && error != qsl("No match")) {
                 qDebug().nospace().noquote() << "Host::loadSecuredPassword() ERROR - could not retrieve secure password for \"" << getName() << "\", error is: " << error << ".";
             }
 
         } else {
-            auto readJob = static_cast<QKeychain::ReadPasswordJob*>(job);
+            auto readJob = static_cast<QKeychain::ReadPasswordJob*>(task);
             setPass(readJob->textData());
         }
 
-        job->deleteLater();
+        task->deleteLater();
     });
 
     job->start();
@@ -2743,6 +2792,11 @@ void Host::setSearchOptions(const dlgTriggerEditor::SearchOptions optionsState)
     if (mpEditorDialog) {
         mpEditorDialog->setSearchOptions(optionsState);
     }
+}
+
+void Host::setBufferSearchOptions(const TConsole::SearchOptions optionsState)
+{
+    mBufferSearchOptions = optionsState;
 }
 
 std::pair<bool, QString> Host::setMapperTitle(const QString& title)
@@ -3260,6 +3314,20 @@ std::pair<bool, QString> Host::setWindow(const QString& windowname, const QStrin
     if (!mpConsole) {
         return {false, QString()};
     }
+    //checks - for reasons why the indicated thing might not be moved to the indicated destination
+    auto pDCheck = mpConsole->mDockWidgetMap.value(name);
+    if (pDCheck) {
+        return {false, qsl("element '%1' is the base of a floating/dockable user window and may not be moved").arg(name)};
+    }
+    if (mpDockableMapWidget) {
+        if (!name.compare(QLatin1String("mapper"), Qt::CaseInsensitive)) {
+            return {false, qsl("element '%1' is the map in a floating/dockable window and may not be moved").arg(name)};
+        }
+        if (!windowname.compare(QLatin1String("mapper"), Qt::CaseInsensitive)) {
+            return {false, qsl("window '%1' is the map in a floating/dockable window and may not receive other elements").arg(windowname)};
+        }
+    }
+
     //children
     auto pL = mpConsole->mLabelMap.value(name);
     auto pC = mpConsole->mSubConsoleMap.value(name);
@@ -3271,7 +3339,9 @@ std::pair<bool, QString> Host::setWindow(const QString& windowname, const QStrin
     auto pD = mpConsole->mDockWidgetMap.value(windowname);
     auto pSW = mpConsole->mScrollBoxMap.value(windowname);
 
-    if (!pSW && !pD && windowname.toLower() != QLatin1String("main")) {
+    if (!pSW && !pD && windowname.compare(QLatin1String("main"), Qt::CaseInsensitive)) {
+        // Third argument is non-zero (i.e. true) if the window name is NOT
+        // the given string:
         return {false, qsl("window '%1' not found").arg(windowname)};
     }
 
@@ -3313,7 +3383,7 @@ std::pair<bool, QString> Host::setWindow(const QString& windowname, const QStrin
             pN->show();
         }
         return {true, QString()};
-    } else if (pM && name.toLower() == QLatin1String("mapper")) {
+    } else if (pM && !name.compare(QLatin1String("mapper"), Qt::CaseInsensitive)) {
         pM->setParent(pW);
         pM->move(x1, y1);
         if (show) {
@@ -3718,7 +3788,7 @@ bool Host::setBackgroundImage(const QString& name, QString& imgPath, int mode)
 
     auto pL = mpConsole->mLabelMap.value(name);
     if (pL) {
-        QPixmap bgPixmap(imgPath);
+        QPixmap const bgPixmap(imgPath);
         pL->setPixmap(bgPixmap);
         return true;
     }
@@ -3803,7 +3873,7 @@ void Host::showHideOrCreateMapper(const bool loadDefaultMap)
 void Host::toggleMapperVisibility()
 {
     auto pMap = mpMap.data();
-    bool visStatus = mpMap->mpMapper->isVisible();
+    const bool visStatus = mpMap->mpMapper->isVisible();
     if (pMap->mpMapper->isFloatAndDockable()) {
         // If we are using a floating/dockable widget we must show/hide that
         // only and not the mapper widget (otherwise it messes up {shrinks
@@ -3837,7 +3907,7 @@ void Host::createMapper(const bool loadDefaultMap)
     if (loadDefaultMap && pMap->mpRoomDB->isEmpty()) {
         qDebug() << "Host::create_mapper() - restore map case 3.";
         pMap->pushErrorMessagesToFile(tr("Pre-Map loading(3) report"), true);
-        QDateTime now(QDateTime::currentDateTime());
+        QDateTime const now(QDateTime::currentDateTime());
         if (pMap->restore(QString())) {
             pMap->audit();
             pMap->mpMapper->mp2dMap->init();
@@ -3850,6 +3920,10 @@ void Host::createMapper(const bool loadDefaultMap)
 
     } else {
         if (pMap->mpMapper) {
+            // Needed to set the area selector widget to right area when map is
+            // loaded by clicking on Map main toolbar button:
+            pMap->mpMapper->updateAreaComboBox();
+            pMap->mpMapper->resetAreaComboBoxToPlayerRoomArea();
             pMap->mpMapper->show();
         }
     }
@@ -3892,7 +3966,7 @@ bool Host::commitLayoutUpdates(bool flush)
     if (mpConsole && !flush) {
         // commit changes (or rather clear the layout changed flags) for dockwidget
         // consoles (user windows)
-        for (auto dockedConsoleName : mDockLayoutChanges) {
+        for (auto dockedConsoleName : qAsConst(mDockLayoutChanges)) {
             auto pD = mpConsole->mDockWidgetMap.value(dockedConsoleName);
             if (Q_LIKELY(pD) && pD->property("layoutChanged").toBool()) {
                 pD->setProperty("layoutChanged", QVariant(false));
@@ -3905,10 +3979,11 @@ bool Host::commitLayoutUpdates(bool flush)
     // commit changes (or rather clear the layout changed flags) for
     // dockable/floating toolbars across all profiles:
     if (!flush) {
-        for (auto pToolBar : mToolbarLayoutChanges) {
-            // Under some circumstances there is NOT a
-            // pToolBar->property("layoutChanged") and examining that
-            // non-existent variant to see if it was true or false causes seg. faults!
+        for (auto pToolBar : qAsConst(mToolbarLayoutChanges)) {
+            if (!pToolBar || pToolBar.isNull()) {
+                // This can happen when a TToolBar is deleted
+                continue;
+            }
             if (Q_UNLIKELY(!pToolBar->property("layoutChanged").isValid())) {
                 qWarning().nospace().noquote() << "host::commitLayoutUpdates() WARNING - was about to check for \"layoutChanged\" meta-property on a toolbar without that property!";
             } else if (pToolBar->property("layoutChanged").toBool()) {
@@ -3927,7 +4002,7 @@ void Host::setupIreDriverBugfix()
     // but other games implementing GA don't. Thus, only enable the workaround
     // for the former only
 
-    QStringList ireGameUrls{"achaea.com", "lusternia.com", "imperian.com", "aetolia.com", "starmourn.com"};
+    const QStringList ireGameUrls{"achaea.com", "lusternia.com", "imperian.com", "aetolia.com", "starmourn.com"};
     if (ireGameUrls.contains(getUrl(), Qt::CaseInsensitive)) {
         set_USE_IRE_DRIVER_BUGFIX(true);
     }
@@ -4017,11 +4092,96 @@ void Host::setCaretEnabled(bool enabled) {
     mpConsole->setCaretMode(enabled);
 }
 
-bool Host::autoWrap() const {
-    return mAutoWrap;
+void Host::setFocusOnHostActiveCommandLine()
+{
+    if (mFocusTimerRunning) {
+        return;
+    }
+
+    mFocusTimerRunning = true;
+    QTimer::singleShot(0, this, [this]() {
+        auto pCommandLine = activeCommandLine();
+        if (pCommandLine) {
+            pCommandLine->activateWindow();
+            pCommandLine->console()->show();
+            pCommandLine->console()->raise();
+            pCommandLine->console()->repaint();
+            pCommandLine->setFocus(Qt::OtherFocusReason);
+        } else {
+            mpConsole->mpCommandLine->activateWindow();
+            mpConsole->show();
+            mpConsole->raise();
+            mpConsole->repaint();
+            mpConsole->mpCommandLine->setFocus(Qt::OtherFocusReason);
+        }
+        mFocusTimerRunning = false;
+    });
 }
 
-void Host::setAutoWrap(bool enabled) {
-    mAutoWrap = enabled;
-    mpConsole->setAutoWrap(enabled);
+void Host::recordActiveCommandLine(TCommandLine* pCommandLine)
+{
+    mpLastCommandLineUsed.removeAll(QPointer<TCommandLine>(pCommandLine));
+    mpLastCommandLineUsed.push(QPointer<TCommandLine>(pCommandLine));
+}
+
+void Host::forgetCommandLine(TCommandLine* pCommandLine)
+{
+    if (pCommandLine) {
+        mpLastCommandLineUsed.removeAll(QPointer<TCommandLine>(pCommandLine));
+    }
+}
+
+// Returns a pointer to the last used TCommandLine for this profile:
+TCommandLine* Host::activeCommandLine()
+{
+    TCommandLine* pCommandLine = nullptr;
+    if (mpLastCommandLineUsed.isEmpty()) {
+        return nullptr;
+    }
+
+    do {
+        pCommandLine = mpLastCommandLineUsed.top();
+        if (!pCommandLine) {
+            mpLastCommandLineUsed.pop();
+        }
+    } while (!mpLastCommandLineUsed.isEmpty() && !pCommandLine);
+
+    return pCommandLine;
+}
+
+QPointer<TConsole> Host::parentTConsole(QObject* start) const
+{
+    QPointer<TConsole> result;
+    auto ptr = start;
+    if (!ptr) {
+        // Handle pathalogical case:
+        return result;
+    }
+    do {
+        ptr = ptr->parent();
+    } while (ptr && !ptr->inherits("TConsole"));
+    // QObject::inherits(...) uses a const char* - so no need to wrap raw string literal!
+    if (!ptr) {
+        // Handle not found case:
+        return result;
+    }
+    return qobject_cast<TConsole*>(ptr);
+}
+
+void Host::setBorders(QMargins borders)
+{
+    auto original = mBorders;
+    if (borders == original) {
+        return;
+    }
+    mBorders = borders;
+    if (mpConsole.isNull()) {
+        return;
+    }
+    auto x = mpConsole->width();
+    auto y = mpConsole->height();
+    QSize const s = QSize(x, y);
+    QResizeEvent event(s, s);
+    QApplication::sendEvent(mpConsole, &event);
+    mpConsole->raiseMudletSysWindowResizeEvent(x, y);
 }

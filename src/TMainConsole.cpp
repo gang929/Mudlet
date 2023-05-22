@@ -1,6 +1,6 @@
 /***************************************************************************
  *   Copyright (C) 2008-2013 by Heiko Koehn - KoehnHeiko@googlemail.com    *
- *   Copyright (C) 2014-2022 by Stephen Lyons - slysven@virginmedia.com    *
+ *   Copyright (C) 2014-2023 by Stephen Lyons - slysven@virginmedia.com    *
  *   Copyright (C) 2014 by Ahmed Charles - acharles@outlook.com            *
  *   Copyright (C) 2016 by Ian Adkins - ieadkins@gmail.com                 *
  *                                                                         *
@@ -89,10 +89,10 @@ TMainConsole::~TMainConsole()
     }
 }
 
-void TMainConsole::setLabelStyleSheet(std::string& buf, std::string& sh)
+void TMainConsole::setLabelStyleSheet(std::string& buf, std::string& stylesheet)
 {
-    QString key{buf.c_str()};
-    QString sheet{sh.c_str()};
+    const QString key{buf.c_str()};
+    const QString sheet{stylesheet.c_str()};
     if (mLabelMap.find(key) != mLabelMap.end()) {
         QLabel* pC = mLabelMap[key];
         if (!pC) {
@@ -105,7 +105,7 @@ void TMainConsole::setLabelStyleSheet(std::string& buf, std::string& sh)
 
 std::optional<QString> TMainConsole::getLabelStyleSheet(const QString& name) const
 {
-    QMap<QString, TLabel*>::const_iterator it = mLabelMap.constFind(name);
+    QMap<QString, TLabel*>::const_iterator const it = mLabelMap.constFind(name);
     if (it != mLabelMap.cend() && it.key() == name) {
         return it.value()->styleSheet();
     }
@@ -115,7 +115,7 @@ std::optional<QString> TMainConsole::getLabelStyleSheet(const QString& name) con
 
 std::optional<QSize> TMainConsole::getLabelSizeHint(const QString& name) const
 {
-    QMap<QString, TLabel*>::const_iterator it = mLabelMap.constFind(name);
+    QMap<QString, TLabel*>::const_iterator const it = mLabelMap.constFind(name);
     if (it != mLabelMap.cend() && it.key() == name) {
         return it.value()->sizeHint();
     }
@@ -155,8 +155,9 @@ std::pair<bool, QString> TMainConsole::setCmdLineStyleSheet(const QString& name,
 
 void TMainConsole::toggleLogging(bool isMessageEnabled)
 {
-    QFile file(mudlet::getMudletPath(mudlet::profileDataItemPath, mpHost->getName(), qsl("autolog")));
-    QDateTime logDateTime = QDateTime::currentDateTime();
+    const auto loggingPath = mudlet::getMudletPath(mudlet::profileDataItemPath, mpHost->getName(), qsl("autolog"));
+    QFile file(loggingPath);
+    QDateTime const logDateTime = QDateTime::currentDateTime();
     if (!mLogToLogFile) {
         file.open(QIODevice::WriteOnly | QIODevice::Text);
         QTextStream out(&file);
@@ -186,7 +187,7 @@ void TMainConsole::toggleLogging(bool isMessageEnabled)
 
         // The preset file name formats are derived from date/times so that
         // alphabetical filename and date sort order are the same...
-        QDir dirLogFile;
+        const QDir dirLogFile;
         if (!dirLogFile.exists(directoryLogFile)) {
             dirLogFile.mkpath(directoryLogFile);
         }
@@ -212,21 +213,22 @@ void TMainConsole::toggleLogging(bool isMessageEnabled)
         // We have to set a codec here to convert the QString based QTextStream
         // encoding (from UTF-16) to UTF-8 - by default a local 8-Bit one would
         // be used, which is problematic on Windows for non-ASCII (or Latin1?)
-        // characters:
-        QTextCodec* pLogCodec = QTextCodec::codecForName("UTF-8");
-        mLogStream.setCodec(pLogCodec);
+        // characters. The default in Qt6 is UTF-8:
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+        out.setCodec(QTextCodec::codecForName("UTF-8"));
+#endif
         if (isMessageEnabled) {
-            QString message = qsl("%1\n").arg(tr("Logging has started. Log file is %1").arg(mLogFile.fileName()));
+            const QString message = qsl("%1\n").arg(tr("Logging has started. Log file is %1").arg(mLogFile.fileName()));
             printSystemMessage(message);
             // This puts text onto console that is IMMEDIATELY POSTED into log file so
             // must be done BEFORE logging starts - or actually mLogToLogFile gets set!
         }
         mLogToLogFile = true;
     } else {
-        file.remove();
+        QFile::remove(loggingPath);
         mLogToLogFile = false;
         if (isMessageEnabled) {
-            QString message = qsl("%1\n").arg(tr("Logging has been stopped. Log file is %1").arg(mLogFile.fileName()));
+            const QString message = qsl("%1\n").arg(tr("Logging has been stopped. Log file is %1").arg(mLogFile.fileName()));
             printSystemMessage(message);
             // This puts text onto console that is IMMEDIATELY POSTED into log file so
             // must be done AFTER logging ends - or actually mLogToLogFile gets reset!
@@ -271,7 +273,7 @@ void TMainConsole::toggleLogging(bool isMessageEnabled)
             bool isAtBody = false;
             bool foundBody = false;
             while (!mLogStream.atEnd()) {
-                QString line = mLogStream.readLine();
+                const QString line = mLogStream.readLine();
                 if (line.contains("<body><div>")) {
                     // Begin writing old log to the current log when the body is
                     // found.
@@ -324,7 +326,7 @@ void TMainConsole::toggleLogging(bool isMessageEnabled)
     } else {
         // Logging is being turned off
         buffer.logRemainingOutput();
-        QString endDateTimeLine = logDateTime.toString(tr("'Log session ending at 'hh:mm:ss' on 'dddd', 'd' 'MMMM' 'yyyy'.",
+        const QString endDateTimeLine = logDateTime.toString(tr("'Log session ending at 'hh:mm:ss' on 'dddd', 'd' 'MMMM' 'yyyy'.",
                                              "This is the format argument to QDateTime::toString(...) and needs to follow the rules for that function {literal text must be single quoted} as well as being suitable for the translation locale"));
         if (mpHost->mIsCurrentLogFileInHtmlFormat) {
             mLogStream << qsl("<p>%1</p>\n").arg(endDateTimeLine);
@@ -342,7 +344,7 @@ void TMainConsole::toggleLogging(bool isMessageEnabled)
 
 void TMainConsole::selectCurrentLine(std::string& buf)
 {
-    QString key = buf.c_str();
+    const QString key = buf.c_str();
     if (key.isEmpty() || key == QLatin1String("main")) {
         TConsole::selectCurrentLine();
         return;
@@ -355,7 +357,7 @@ void TMainConsole::selectCurrentLine(std::string& buf)
 
 std::list<int> TMainConsole::getFgColor(std::string& buf)
 {
-    QString key = buf.c_str();
+    const QString key = buf.c_str();
     if (key.isEmpty() || key == QLatin1String("main")) {
         return TConsole::getFgColor();
     }
@@ -369,7 +371,7 @@ std::list<int> TMainConsole::getFgColor(std::string& buf)
 
 std::list<int> TMainConsole::getBgColor(std::string& buf)
 {
-    QString key = buf.c_str();
+    const QString key = buf.c_str();
     if (key.isEmpty() || key == QLatin1String("main")) {
         return TConsole::getBgColor();
     }
@@ -397,7 +399,7 @@ QPair<quint8, TChar> TMainConsole::getTextAttributes(const QString& name) const
 
 void TMainConsole::luaWrapLine(std::string& buf, int line)
 {
-    QString key = buf.c_str();
+    const QString key = buf.c_str();
     if (key.isEmpty() || key == QLatin1String("main")) {
         TConsole::luaWrapLine(line);
         return;
@@ -410,7 +412,7 @@ void TMainConsole::luaWrapLine(std::string& buf, int line)
 
 QString TMainConsole::getCurrentLine(std::string& buf)
 {
-    QString key = buf.c_str();
+    const QString key = buf.c_str();
     if (key.isEmpty() || key == QLatin1String("main")) {
         return TConsole::getCurrentLine();
     }
@@ -477,7 +479,7 @@ void TMainConsole::resetMainConsole()
     }
 }
 
-// This is a sub-console overlaid on to the main console
+// This is a sub-console overlaid on to the main or other console
 TConsole* TMainConsole::createMiniConsole(const QString& windowname, const QString& name, int x, int y, int width, int height)
 {
     //if pW then add Console as Overlay to the Userwindow
@@ -498,7 +500,6 @@ TConsole* TMainConsole::createMiniConsole(const QString& windowname, const QStri
         mSubConsoleMap[name] = pC;
         pC->setObjectName(name);
         pC->mConsoleName = name;
-        pC->setFocusPolicy(Qt::NoFocus);
         const auto& hostCommandLine = mpHost->mpConsole->mpCommandLine;
         pC->setFocusProxy(hostCommandLine);
         pC->mUpperPane->setFocusProxy(hostCommandLine);
@@ -535,7 +536,6 @@ TScrollBox* TMainConsole::createScrollBox(const QString& windowname, const QStri
         }
         mScrollBoxMap[name] = pS;
         pS->setObjectName(name);
-        pS->setFocusPolicy(Qt::NoFocus);
         pS->resize(width, height);
         pS->setContentsMargins(0, 0, 0, 0);
         pS->move(x, y);
@@ -554,14 +554,13 @@ TLabel* TMainConsole::createLabel(const QString& windowname, const QString& name
     auto pS = mScrollBoxMap.value(windowname);
     if (!pL) {
         if (pW) {
-            pL = new TLabel(mpHost, pW->widget());
+            pL = new TLabel(mpHost, name, pW->widget());
         } else if (pS) {
-            pL = new TLabel(mpHost, pS->widget());
+            pL = new TLabel(mpHost, name, pS->widget());
         } else {
-            pL = new TLabel(mpHost, mpMainFrame);
+            pL = new TLabel(mpHost, name, mpMainFrame);
         }
         mLabelMap[name] = pL;
-        pL->setObjectName(name);
         pL->setAutoFillBackground(fillBackground);
         pL->setClickThrough(clickThrough);
         pL->resize(width, height);
@@ -570,9 +569,9 @@ TLabel* TMainConsole::createLabel(const QString& windowname, const QString& name
         pL->show();
         mpHost->setBackgroundColor(name, 32, 32, 32, 255);
         return pL;
-    } else {
-        return nullptr;
     }
+
+    return nullptr;
 }
 
 std::pair<bool, QString> TMainConsole::deleteLabel(const QString& name)
@@ -653,11 +652,11 @@ std::pair<bool, QString> TMainConsole::setLabelCustomCursor(const QString& name,
 
     auto pL = mLabelMap.value(name);
     if (pL) {
-        QPixmap cursor_pixmap = QPixmap(pixMapLocation);
+        QPixmap const cursor_pixmap = QPixmap(pixMapLocation);
         if (cursor_pixmap.isNull()) {
             return {false, qsl("couldn't find custom cursor, is the location \"%1\" correct?").arg(pixMapLocation)};
         }
-        QCursor custom_cursor = QCursor(cursor_pixmap, hotX, hotY);
+        QCursor const custom_cursor = QCursor(cursor_pixmap, hotX, hotY);
         pL->setCursor(custom_cursor);
         return {true, QString()};
     }
@@ -692,7 +691,7 @@ std::pair<bool, QString> TMainConsole::createMapper(const QString& windowname, i
         mpHost->mpMap->mpMapper = mpMapper;
         qDebug() << "TConsole::createMapper() - restore map case 2.";
         mpHost->mpMap->pushErrorMessagesToFile(tr("Pre-Map loading(2) report"), true);
-        QDateTime now(QDateTime::currentDateTime());
+        QDateTime const now(QDateTime::currentDateTime());
 
         if (mpHost->mpMap->restore(QString())) {
             mpHost->mpMap->audit();
@@ -742,15 +741,13 @@ std::pair<bool, QString> TMainConsole::createCommandLine(const QString& windowna
 
     if (!pN) {
         if (pS) {
-            pN = new TCommandLine(mpHost, mpCommandLine->SubCommandLine, this, pS->widget());
+            pN = new TCommandLine(mpHost, name, TCommandLine::SubCommandLine, this, pS->widget());
         } else if (pW) {
-            pN = new TCommandLine(mpHost, mpCommandLine->SubCommandLine, this, pW->widget());
+            pN = new TCommandLine(mpHost, name, TCommandLine::SubCommandLine, this, pW->widget());
         } else {
-            pN = new TCommandLine(mpHost, mpCommandLine->SubCommandLine, this, mpMainFrame);
+            pN = new TCommandLine(mpHost, name, TCommandLine::SubCommandLine, this, mpMainFrame);
         }
         mSubCommandLineMap[name] = pN;
-        pN->mCommandLineName = name;
-        pN->setObjectName(name);
         pN->resize(width, height);
         pN->move(x, y);
         pN->show();
@@ -763,7 +760,7 @@ bool TMainConsole::setBackgroundImage(const QString& name, const QString& path)
 {
     auto pL = mLabelMap.value(name);
     if (pL) {
-        QPixmap bgPixmap(path);
+        QPixmap const bgPixmap(path);
         pL->setPixmap(bgPixmap);
         return true;
     } else {
@@ -924,7 +921,7 @@ QSize TMainConsole::getUserWindowSize(const QString& windowname) const
 {
     auto pW = mDockWidgetMap.value(windowname);
     if (pW){
-        QSize windowSize = pW->widget()->size();
+        QSize const windowSize = pW->widget()->size();
         QSize userWindowSize(windowSize.width(), windowSize.height());
         return userWindowSize;
     }
@@ -933,7 +930,7 @@ QSize TMainConsole::getUserWindowSize(const QString& windowname) const
 
 QPair<bool, QString> TMainConsole::addWordToSet(const QString& word)
 {
-    QString errMsg = qsl("the word \"%1\" already seems to be in the user dictionary");
+    const QString errMsg = qsl("the word \"%1\" already seems to be in the user dictionary");
     QPair<bool, QString> result{};
     if (!mEnableUserDictionary) {
         return qMakePair(false, QLatin1String("a user dictionary is not enable for this profile"));
@@ -973,7 +970,7 @@ QPair<bool, QString> TMainConsole::addWordToSet(const QString& word)
 
 QPair<bool, QString> TMainConsole::removeWordFromSet(const QString& word)
 {
-    QString errMsg = qsl("the word \"%1\" does not seem to be in the user dictionary");
+    const QString errMsg = qsl("the word \"%1\" does not seem to be in the user dictionary");
     QPair<bool, QString> result{};
     if (!mEnableUserDictionary) {
         return qMakePair(false, QLatin1String("a user dictionary is not enable for this profile"));
@@ -1018,7 +1015,7 @@ void TMainConsole::setSystemSpellDictionary(const QString& newDict)
 
     mSpellDic = newDict;
 
-    QString path = mudlet::getMudletPath(mudlet::hunspellDictionaryPath, mpHost->getSpellDic());
+    const QString path = mudlet::getMudletPath(mudlet::hunspellDictionaryPath, mpHost->getSpellDic());
     QString spell_aff = qsl("%1%2.aff").arg(path, newDict);
     QString spell_dic = qsl("%1%2.dic").arg(path, newDict);
 
@@ -1149,6 +1146,7 @@ bool TMainConsole::setTextFormat(const QString& name, const QColor& fgColor, con
 
 void TMainConsole::printOnDisplay(std::string& incomingSocketData, const bool isFromServer)
 {
+    Q_ASSERT_X(mpLineEdit_networkLatency, "TMainConsole::printOnDisplay(...)", "mpLineEdit_networkLatency does not point to a valid QLineEdit");
     mProcessingTimer.restart();
     mTriggerEngineMode = true;
     buffer.translateToPlainText(incomingSocketData, isFromServer);
@@ -1162,7 +1160,7 @@ void TMainConsole::printOnDisplay(std::string& incomingSocketData, const bool is
         mpHost->mLuaInterpreter.signalMXPEvent(event.name, event.attrs, event.actions);
     }
 
-    double processT = mProcessingTimer.elapsed() / 1000.0;
+    double const processT = mProcessingTimer.elapsed() / 1000.0;
     if (mpHost->mTelnet.mGA_Driver) {
         mpLineEdit_networkLatency->setText(tr("N:%1 S:%2",
                                               // intentional comment to separate arguments
@@ -1195,7 +1193,7 @@ void TMainConsole::runTriggers(int line)
     mpHost->getLuaInterpreter()->set_lua_string(cmLuaLineVariable, mCurrentLine);
     mCurrentLine.append('\n');
 
-    if (mudlet::debugMode) {
+    if (mudlet::smDebugMode) {
         TDebug(Qt::darkGreen, Qt::black) << "new line arrived:" >> mpHost;
         TDebug(Qt::lightGray, Qt::black) << TDebug::csmContinue << mCurrentLine << "\n" >> mpHost;
     }
@@ -1216,32 +1214,36 @@ void TMainConsole::finalize()
 // to the TMap class...?
 bool TMainConsole::saveMap(const QString& location, int saveVersion)
 {
-    QDir dir_map;
-    QString filename_map;
-    QString directory_map = mudlet::getMudletPath(mudlet::profileMapsPath, mProfileName);
+    const QString filename_map = location.isEmpty() ?
+        mudlet::getMudletPath(mudlet::profileDateTimeStampedMapPathFileName, mProfileName, QDateTime::currentDateTime().toString(qsl("yyyy-MM-dd#HH-mm-ss"))) :
+        location;
 
-    if (location.isEmpty()) {
-        filename_map = mudlet::getMudletPath(mudlet::profileDateTimeStampedMapPathFileName, mProfileName, QDateTime::currentDateTime().toString(qsl("yyyy-MM-dd#HH-mm-ss")));
-    } else {
-        filename_map = location;
+    const QDir dir_map(mudlet::getMudletPath(mudlet::profileMapsPath, mProfileName));
+    if (!dir_map.exists() && !dir_map.mkpath(dir_map.path())) {
+        return false;
     }
 
-    if (!dir_map.exists(directory_map)) {
-        dir_map.mkpath(directory_map);
-    }
-    QFile file_map(filename_map);
-    if (file_map.open(QIODevice::WriteOnly)) {
-        QDataStream out(&file_map);
-        if (mudlet::scmRunTimeQtVersion >= QVersionNumber(5, 13, 0)) {
-            out.setVersion(mudlet::scmQDataStreamFormat_5_12);
-        }
-        mpHost->mpMap->serialize(out, saveVersion);
-        file_map.close();
-        mpHost->mpMap->mUnsavedMap = false;
-        return true;
+    QSaveFile file_map(filename_map);
+    if (!file_map.open(QIODevice::WriteOnly)) {
+        return false;
     }
 
-    return false;
+    QDataStream out(&file_map);
+    if (mudlet::scmRunTimeQtVersion >= QVersionNumber(5, 13, 0)) {
+        out.setVersion(mudlet::scmQDataStreamFormat_5_12);
+    }
+
+    bool saved = mpHost->mpMap->serialize(out, saveVersion);
+    if (saved && !file_map.commit()) {
+        qDebug() << "Error saving map: " << (file_map.error() == QFile::NoError ? "issue with serializing" : file_map.errorString());
+        saved = false;
+    }
+
+    if (saved) {
+        mpHost->mpMap->resetUnsaved();
+    }
+
+    return saved;
 }
 
 bool TMainConsole::loadMap(const QString& location)
@@ -1270,7 +1272,7 @@ bool TMainConsole::loadMap(const QString& location)
 
     qDebug() << "TMainConsole::loadMap() - restore map case 1.";
     pHost->mpMap->pushErrorMessagesToFile(tr("Pre-Map loading(1) report"), true);
-    QDateTime now(QDateTime::currentDateTime());
+    QDateTime const now(QDateTime::currentDateTime());
 
     bool result = false;
     if (pHost->mpMap->restore(location)) {
@@ -1334,11 +1336,11 @@ bool TMainConsole::importMap(const QString& location, QString* errMsg)
     // been logged...
     qDebug() << "TMainConsole::importingMap() - importing map case 1.";
     pHost->mpMap->pushErrorMessagesToFile(tr("Pre-Map importing(1) report"), true);
-    QDateTime now(QDateTime::currentDateTime());
+    QDateTime const now(QDateTime::currentDateTime());
 
     bool result = false;
 
-    QFileInfo fileInfo(location);
+    const QFileInfo fileInfo(location);
     QString filePathNameString;
     if (!fileInfo.filePath().isEmpty()) {
         if (fileInfo.isRelative()) {
@@ -1356,7 +1358,7 @@ bool TMainConsole::importMap(const QString& location, QString* errMsg)
     QFile file(filePathNameString);
     if (!file.exists()) {
         if (!errMsg) {
-            QString infoMsg = tr("[ ERROR ]  - Map file not found, path and name used was:\n"
+            const QString infoMsg = tr("[ ERROR ]  - Map file not found, path and name used was:\n"
                                  "%1.")
                                       .arg(filePathNameString);
             pHost->postMessage(infoMsg);
@@ -1371,7 +1373,7 @@ bool TMainConsole::importMap(const QString& location, QString* errMsg)
 
     if (file.open(QFile::ReadOnly | QFile::Text)) {
         if (!errMsg) {
-            QString infoMsg = tr("[ INFO ]  - Map file located and opened, now parsing it...");
+            const QString infoMsg = tr("[ INFO ]  - Map file located and opened, now parsing it...");
             pHost->postMessage(infoMsg);
         }
 
@@ -1381,7 +1383,7 @@ bool TMainConsole::importMap(const QString& location, QString* errMsg)
         pHost->mpMap->pushErrorMessagesToFile(tr(R"(Importing map(1) "%1" at %2 report)").arg(location, now.toString(Qt::ISODate)));
     } else {
         if (!errMsg) {
-            QString infoMsg = tr(R"([ INFO ]  - Map file located but it could not opened, please check permissions on:"%1".)").arg(filePathNameString);
+            const QString infoMsg = tr(R"([ INFO ]  - Map file located but it could not opened, please check permissions on:"%1".)").arg(filePathNameString);
             pHost->postMessage(infoMsg);
         } else {
             *errMsg = tr("loadMap: bad argument #1 value (filename used: \n"
@@ -1408,7 +1410,7 @@ void TMainConsole::slot_reloadMap(QList<QString> profilesList)
         return;
     }
 
-    QString infoMsg = tr("[ INFO ]  - Map reload request received from system...");
+    const QString infoMsg = tr("[ INFO ]  - Map reload request received from system...");
     pHost->postMessage(infoMsg);
 
     QString outcomeMsg;
@@ -1442,7 +1444,7 @@ void TMainConsole::showStatistics()
         return;
     }
 
-    QString header = qsl("%1\n").arg(tr(
+    const QString header = qsl("%1\n").arg(tr(
         "+--------------------------------------------------------------+\n"
         "|                      system statistics                       |\n"
         "+--------------------------------------------------------------+",
@@ -1501,7 +1503,7 @@ void TMainConsole::showStatistics()
     print(itemMsg, QColor(150, 120, 0), Qt::black);
 
     // Footer for the system's statistics information displayed in the console, it should be 64 'narrow' characters wide
-    QString footer = qsl("\n+--------------------------------------------------------------+\n");
+    const QString footer = qsl("\n+--------------------------------------------------------------+\n");
     mpHost->mpConsole->print(footer, QColor(150, 120, 0), Qt::black);
 
     mpHost->mLuaInterpreter.compileAndExecuteScript(QLatin1String("resetFormat();"));
