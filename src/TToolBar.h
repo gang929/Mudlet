@@ -22,15 +22,15 @@
  ***************************************************************************/
 
 
-#include "pre_guard.h"
 #include <QDockWidget>
 #include <QPointer>
-#include "post_guard.h"
 
 class Host;
 class TAction;
 class TFlipButton;
+
 class QGridLayout;
+class QMenu;
 
 
 class TToolBar : public QDockWidget
@@ -41,6 +41,8 @@ public:
     Q_DISABLE_COPY(TToolBar)
     TToolBar(Host*, TAction*, const QString&, QWidget* pW = nullptr);
     void addButton(TFlipButton* pW);
+    void addActionButtons(TAction* pAction);
+    void resetItemCount(const int initialOffset) { mItemCount = initialOffset; }
     void resizeEvent(QResizeEvent* e) override;
     void moveEvent(QMoveEvent* e) override;
     void mousePressEvent(QMouseEvent*) override;
@@ -55,13 +57,15 @@ public:
     TAction* mpTAction;
 
 private:
-    bool mVerticalOrientation;
+    void addActionToMenu(TAction* pAction, QMenu* pMenu);
+
+    bool mVerticalOrientation = false;
     QWidget* mpWidget;
     QPointer<Host> mpHost;
     QString mName;
-    bool mRecordMove;
-    QGridLayout* mpLayout;
-    int mItemCount;
+    bool mRecordMove = false;
+    QGridLayout* mpLayout = nullptr;
+    int mItemCount = 0;
 
 public slots:
     void slot_pressed(bool);

@@ -26,17 +26,13 @@
 #include "TRoom.h"
 
 #ifndef Q_MOC_RUN
-#include "pre_guard.h"
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/astar_search.hpp>
 #include <boost/graph/graphviz.hpp>
-#include "post_guard.h"
 #endif
 
-#include "pre_guard.h"
 #include <QDebug>
 #include <QString>
-#include "post_guard.h"
 
 #include <math.h> // for sqrt
 
@@ -68,25 +64,31 @@ class distance_heuristic : public boost::astar_heuristic<Graph, CostType>
 {
 public:
     typedef typename boost::graph_traits<Graph>::vertex_descriptor Vertex;
-    distance_heuristic(LocMap l, Vertex goal)
+    // Held by reference: a per-search copy (35MB on a 2.3M-room map) costs more than the search.
+    // Callers pass TMap::locations, which initGraph() only clear()s: it can't dangle, but goes stale
+    // across initGraph() (rooms renumbered), so never store a heuristic.
+    distance_heuristic(const LocMap& l, Vertex goal)
     : m_location(l)
     , m_goal(goal)
     {}
+
+    // A temporary would leave m_location dangling.
+    distance_heuristic(const LocMap&&, Vertex) = delete;
 
     CostType operator()(Vertex u)
     {
         if (m_location[m_goal].pR->getArea() != m_location[u].pR->getArea()) {
             return 1;
         }
-        CostType dx = m_location[m_goal].pR->x - m_location[u].pR->x;
-        CostType dy = m_location[m_goal].pR->y - m_location[u].pR->y;
-        CostType dz = m_location[m_goal].pR->z - m_location[u].pR->z;
+        CostType dx = m_location[m_goal].pR->x() - m_location[u].pR->x();
+        CostType dy = m_location[m_goal].pR->y() - m_location[u].pR->y();
+        CostType dz = m_location[m_goal].pR->z() - m_location[u].pR->z();
 
         return std::sqrt(dx * dx + dy * dy + dz * dz);
     }
 
 private:
-    LocMap m_location;
+    const LocMap& m_location;
     Vertex m_goal;
 };
 

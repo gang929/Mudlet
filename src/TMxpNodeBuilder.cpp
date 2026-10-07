@@ -23,19 +23,6 @@
 
 TMxpNodeBuilder::TMxpNodeBuilder(bool ignoreText)
 : mOptionIgnoreText(ignoreText)
-, mIsEndTag(false)
-, mIsEmptyTag(false)
-, mIsInsideTag(false)
-, mIsInsideAttr(false)
-, mReadingAttrValue(false)
-, mIsInsideSequence(false)
-, mIsQuotedSequence(false)
-, mOpeningQuote('\0')
-, mSequenceHasSpaces(false)
-, mHasSequence(false)
-, mIsInsideText(false)
-, mHasNode(false)
-, mIsText(false)
 {
 }
 
@@ -44,24 +31,25 @@ bool TMxpNodeBuilder::accept(char ch)
     if (mIsInsideTag) { // inside tag
         mCurrentText.clear();
         mIsText = false;
-
+        mRawTagContent += ch;
         if (!acceptTag(ch)) {
             return false;
-        } else {
-            mIsInsideTag = false;
-            return true;
         }
-    } else if (ch == '<') { // start tag
+        mIsInsideTag = false;
+        mRawTagContent.clear();
+        return true;
+    } else if (ch == '<') { // NOLINT(readability-else-after-return) start tag
         if (mIsInsideText) {
             mIsInsideText = false;
             mIsText = true;
             mHasNode = true;
             return true;
-        } else {              // second call
-            mHasNode = false; //mIsText = false
-            return acceptTag(ch);
         }
-    } else if (!mOptionIgnoreText) { // text
+        // second call
+        mHasNode = false; //mIsText = false
+        mRawTagContent.clear();
+        return acceptTag(ch);
+    } else if (!mOptionIgnoreText) { // NOLINT(readability-else-after-return) text
         mIsInsideText = true;
         mCurrentText.push_back(ch);
         return false;
@@ -79,12 +67,11 @@ bool TMxpNodeBuilder::acceptTag(char ch)
     if (mIsInsideAttr) {
         if (!acceptAttribute(ch)) {
             return false;
-        } else {
-            if (!mCurrentAttrName.empty()) {
-                processAttribute();
-            }
-            resetCurrentAttribute();
         }
+        if (!mCurrentAttrName.empty()) {
+            processAttribute();
+        }
+        resetCurrentAttribute();
     }
 
     if (QChar(ch).isSpace()) {
@@ -92,7 +79,12 @@ bool TMxpNodeBuilder::acceptTag(char ch)
     }
 
     if (ch == '<') { // reset
-        resetCurrentTag();
+        if (!mIsInsideTag) {
+            resetCurrentTag();
+        }
+        if (!mRawTagContent.empty() && mRawTagContent.back() == '<') {
+            mRawTagContent.pop_back();
+        }
         mIsInsideTag = true;
         return false;
     }
@@ -120,7 +112,7 @@ void TMxpNodeBuilder::processAttribute()
     if (mCurrentTagName.empty()) {
         mCurrentTagName = mCurrentAttrName;
     } else if (!mCurrentAttrName.empty()) {
-        mCurrentTagAttrs.append(MxpTagAttribute(mCurrentAttrName.c_str(), mCurrentAttrValue.c_str()));
+        mCurrentTagAttrs.append(MxpTagAttribute(TStringUtils::decodeBytes(mCurrentAttrName, mEncoding), TStringUtils::decodeBytes(mCurrentAttrValue, mEncoding)));
     }
 }
 void TMxpNodeBuilder::resetCurrentTag()
@@ -131,7 +123,7 @@ void TMxpNodeBuilder::resetCurrentTag()
     mIsInsideTag = false;
     mCurrentTagName.clear();
     mCurrentTagAttrs.clear();
-
+    mRawTagContent.clear();
     resetCurrentAttribute();
 }
 bool TMxpNodeBuilder::acceptAttribute(char ch)
@@ -148,9 +140,8 @@ bool TMxpNodeBuilder::acceptAttribute(char ch)
     if (ch == '=' && !mReadingAttrValue) {
         mReadingAttrValue = true;
         return false;
-    } else {
-        return true;
     }
+    return true;
 }
 void TMxpNodeBuilder::resetCurrentAttribute()
 {
@@ -175,7 +166,7 @@ bool TMxpNodeBuilder::acceptSequence(char ch, std::string& buffer)
             mIsQuotedSequence = true;
             mOpeningQuote = ch;
             return false;
-        } else if (mIsQuotedSequence && ch == mOpeningQuote) {
+        } else if (mIsQuotedSequence && ch == mOpeningQuote) { // NOLINT(readability-else-after-return)
             mHasSequence = true;
             return false;
         }
@@ -191,7 +182,7 @@ bool TMxpNodeBuilder::acceptSequence(char ch, std::string& buffer)
             mCurrentTagName.clear();
             resetCurrentAttribute();
             return true;
-        } else if (ch == '>' || ch == '=') {
+        } else if (ch == '>' || ch == '=') { // NOLINT(readability-else-after-return)
             return true;
         }
     }
@@ -230,4 +221,27 @@ void TMxpNodeBuilder::reset()
 {
     resetCurrentTag();
     mCurrentText.clear();
+}
+
+void TMxpNodeBuilder::resetForNewTag()
+{
+    reset();
+    mOptionIgnoreText = true;
+    mIsInsideTag = true;
+}
+
+const std::string& TMxpNodeBuilder::getPartialTagName() const
+{
+    if (!mCurrentTagName.empty()) {
+        return mCurrentTagName;
+    }
+
+    // Tag name hasn't been finalized yet - it's being accumulated as
+    // the first "attribute name" before processAttribute() promotes it
+    if (mIsInsideTag && mCurrentTagAttrs.empty() && !mReadingAttrValue) {
+        return mCurrentAttrName;
+    }
+
+    static const std::string empty;
+    return empty;
 }

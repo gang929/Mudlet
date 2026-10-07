@@ -18,16 +18,25 @@
  *   59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.             *
  ***************************************************************************/
 #include "TMxpSendTagHandler.h"
+#include "LuaLiteral.h"
 #include "TMxpClient.h"
 #include "TStringUtils.h"
 
 TMxpTagHandlerResult TMxpSendTagHandler::handleStartTag(TMxpContext& ctx, TMxpClient& client, MxpStartTag* tag)
 {
-    //    if (tag->hasAttr("EXPIRE") && tag->getAttr(0).isNamed("EXPIRE"))
-    //        return MXP_TAG_NOT_HANDLED;
+    mLastCaption.clear();
+    mCurrentTagContent.clear();
+    // <SEND .../> never gets an end tag, so must not start collecting
+    mInsideTag = !tag->isEmpty();
 
     QString href = extractHref(tag);
     QString hint = extractHint(tag);
+    QString expireName;
+
+    // Extract expire name if present
+    if (tag->hasAttribute(ATTR_EXPIRE)) {
+        expireName = tag->getAttributeValue(ATTR_EXPIRE);
+    }
 
     if (href.contains(TAG_CONTENT_PLACEHOLDER, Qt::CaseInsensitive) || hint.contains(TAG_CONTENT_PLACEHOLDER, Qt::CaseInsensitive)) {
         mIsHrefInContent = true;
@@ -44,7 +53,7 @@ TMxpTagHandlerResult TMxpSendTagHandler::handleStartTag(TMxpContext& ctx, TMxpCl
 
     // remove excess hints, but allow for a custom tooltip
     while (hints.size() > hrefs.size() + 1) {
-        hints.removeFirst();
+        hints.removeLast();
     }
 
     // <SEND HREF="PROBE SUSPENDERS30901|BUY SUSPENDERS30901" hint="Click to see command menu">30901</SEND>
@@ -54,20 +63,33 @@ TMxpTagHandlerResult TMxpSendTagHandler::handleStartTag(TMxpContext& ctx, TMxpCl
 
     // handle print to prompt feature PROMPT
     // <SEND "tell Zugg " PROMPT>Zugg</SEND>
-    QString command = tag->hasAttribute(ATTR_PROMPT) ? qsl("printCmdLine") : qsl("send");
+    mCommand = tag->hasAttribute(ATTR_PROMPT) ? qsl("printCmdLine") : qsl("send");
 
     for (int i = 0; i < hrefs.size(); i++) {
         hrefs[i] = ctx.getEntityResolver().interpolate(hrefs[i]);
-        hrefs[i] = qsl("%1([[%2]])").arg(command, hrefs[i]);
 
         if (i < hints.size()) {
             hints[i] = ctx.getEntityResolver().interpolate(hints[i]);
         }
     }
 
-    mLinkId = client.setLink(hrefs, hints);
+    mHrefs = hrefs;
+    QStringList actions;
+    for (const QString& command : std::as_const(hrefs)) {
+        actions << actionFor(command);
+    }
 
-    client.setLinkMode(true);
+    // Use the version of setLink that supports expire names
+    if (!expireName.isEmpty()) {
+        mLinkId = client.setLink(actions, hints, expireName);
+    } else {
+        mLinkId = client.setLink(actions, hints);
+    }
+
+    // Only set link mode if a link was actually created
+    if (mLinkId != 0) {
+        client.setLinkMode(true);
+    }
 
     return MXP_TAG_HANDLED;
 }
@@ -101,7 +123,8 @@ QString TMxpSendTagHandler::extractHint(MxpStartTag* tag)
 {
     if (tag->hasAttribute(ATTR_HINT)) {
         return tag->getAttributeValue(ATTR_HINT);
-    } else if (tag->getAttributesCount() > 1 && !tag->getAttribute(1).isNamed(ATTR_PROMPT) && !tag->getAttribute(1).isNamed(ATTR_EXPIRE)) {
+    }
+    if (tag->getAttributesCount() > 1 && !tag->getAttribute(1).isNamed(ATTR_PROMPT) && !tag->getAttribute(1).isNamed(ATTR_EXPIRE) && !tag->getAttribute(1).isNamed(ATTR_HREF)) {
         return tag->getAttrName(1);
     }
 
@@ -112,8 +135,15 @@ TMxpTagHandlerResult TMxpSendTagHandler::handleEndTag(TMxpContext& ctx, TMxpClie
 {
     Q_UNUSED(ctx)
     Q_UNUSED(tag)
-    if (mIsHrefInContent) {
-        updateHrefInLinks(client);
+
+    // Only process link-related logic if a link was actually created
+    if (mLinkId != 0) {
+        if (mIsHrefInContent) {
+            updateHrefInLinks(client);
+        }
+
+        mLastCaption = mCurrentTagContent.trimmed();
+        client.setCaptionForSendEvent(mLastCaption);
     }
 
     resetCurrentTagContent(client);
@@ -123,16 +153,26 @@ TMxpTagHandlerResult TMxpSendTagHandler::handleEndTag(TMxpContext& ctx, TMxpClie
 void TMxpSendTagHandler::resetCurrentTagContent(TMxpClient& client)
 {
     mIsHrefInContent = false;
+    mInsideTag = false;
     mCurrentTagContent.clear();
     client.setLinkMode(false);
+}
+
+QString TMxpSendTagHandler::actionFor(const QString& command) const
+{
+    return qsl("%1(%2)").arg(mCommand, LuaLiteral::quote(command));
 }
 
 void TMxpSendTagHandler::updateHrefInLinks(TMxpClient& client) const
 {
     QStringList *hrefs, *hints;
     if (client.getLink(mLinkId, &hrefs, &hints)) {
+        // The wrapped text goes into each command before it is quoted, so text
+        // written to close the Lua string stays inside it
         if (hrefs != nullptr) {
-            hrefs->replaceInStrings(TAG_CONTENT_PLACEHOLDER, mCurrentTagContent, Qt::CaseInsensitive);
+            for (int i = 0, total = qMin(hrefs->size(), mHrefs.size()); i < total; ++i) {
+                (*hrefs)[i] = actionFor(QString(mHrefs.at(i)).replace(TAG_CONTENT_PLACEHOLDER, mCurrentTagContent, Qt::CaseInsensitive));
+            }
         }
 
         if (hints != nullptr) {
@@ -142,7 +182,7 @@ void TMxpSendTagHandler::updateHrefInLinks(TMxpClient& client) const
 }
 void TMxpSendTagHandler::handleContent(char ch)
 {
-    if (mIsHrefInContent) {
+    if (mInsideTag) {
         mCurrentTagContent.append(ch);
     }
 }

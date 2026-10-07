@@ -4,6 +4,7 @@
 /***************************************************************************
  *   Copyright (C) 2008-2012 by Heiko Koehn - KoehnHeiko@googlemail.com    *
  *   Copyright (C) 2014 by Ahmed Charles - acharles@outlook.com            *
+ *   Copyright (C) 2024 by Stephen Lyons - slysven@virginmedia.com         *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
  *   it under the terms of the GNU General Public License as published by  *
@@ -25,11 +26,12 @@
 #include "Tree.h"
 
 
-#include "pre_guard.h"
 #include <QDebug>
+#include <QDebugStateSaver>
 #include <QPointer>
+#include <QString>
 #include <QTime>
-#include "post_guard.h"
+#include <QtGlobal>
 
 class Host;
 
@@ -41,6 +43,8 @@ class TTimer : public Tree<TTimer>
     friend class TimerUnit;
     friend class XMLexport;
     friend class XMLimport;
+    friend class DeleteItemCommand;
+    friend class EditorDeleteItemCommand;
 
 public:
     ~TTimer() override;
@@ -50,11 +54,13 @@ public:
     const QString& getName() const { return mName; }
     void setName(const QString& name);
     const QTime& getTime() const { return mTime; }
-    void compile();
     bool checkRestart();
     bool compileScript();
     void execute();
     void setTime(QTime time);
+    // Not part of setTime(): a new timer has no time yet, and whether it needs one depends on its
+    // parent, which drag and drop can change
+    void validateTime();
     const QString& getCommand() const { return mCommand; }
     void setCommand(const QString& cmd) { mCommand = cmd; }
     const QString& getScript() const { return mScript; }
@@ -65,8 +71,6 @@ public:
     void start();
     void enableTimer();
     void disableTimer();
-    void enableTimer(const QString&);
-    void disableTimer(const QString&);
     void enableTimer(int);
     void disableTimer(int);
     void killTimer();
@@ -98,38 +102,44 @@ public:
     // Override the Tree version as we need to insert the id number as a
     // property into the QTimer that mpQTimer points to as well:
     void setID(int) override;
+    QString packageName(TTimer* pTimer);
 
 
     // specifies whenever the payload is Lua code as a string
     // or a function
-    bool mRegisteredAnonymousLuaFunction;
-    bool exportItem;
-    bool mModuleMasterFolder;
+    bool mRegisteredAnonymousLuaFunction = false;
+    bool exportItem = true;
+    bool mModuleMasterFolder = false;
 
-    static const char* scmProperty_HostName;
     static const char* scmProperty_TTimerId;
 
     // temporary timers are single-shot by default, unless repeating is set
-    bool mRepeating;
+    bool mRepeating = false;
 
 private:
     TTimer() = default;
+    // A tempTimer() Lua function lives in the Lua registry, so such a timer's script is empty
+    bool hasPayload() const { return !mScript.isEmpty() || !mCommand.isEmpty() || mRegisteredAnonymousLuaFunction; }
+    // Hides the non-virtual Tree<TTimer>::activate(); Tree's call in setIsActive() skips the time
+    // validation, so setIsActive() validates for itself
+    bool activate();
+
     QString mName;
     QString mScript;
     QTime mTime;
     QString mCommand;
     QString mFuncName;
-    QPointer<Host> mpHost;
-    bool mNeedsToBeCompiled;
+    bool mNeedsToBeCompiled = true;
     QTimer* mpQTimer;
-    bool mModuleMember;
+    QPointer<Host> mpHost;
+    bool mModuleMember = false;
 };
 
 #ifndef QT_NO_DEBUG_STREAM
 inline QDebug& operator<<(QDebug& debug, const TTimer* timer)
 {
     QDebugStateSaver saver(debug);
-    Q_UNUSED(saver);
+    Q_UNUSED(saver)
     debug.nospace() << "TTimer("
                     << "name= " << timer->getName()
                     << " time= " << timer->getTime()

@@ -1,6 +1,6 @@
 id: org.mudlet.mudlet
 runtime: org.kde.Platform
-runtime-version: '5.15-23.08'
+runtime-version: '6.8'
 sdk: org.kde.Sdk
 command: mudlet
 rename-desktop-file: mudlet.desktop
@@ -162,6 +162,7 @@ modules:
       - luarocks install --tree="/app" lua-yajl YAJL_INCDIR="/app/include" YAJL_LIBDIR="/app/lib" LUA_INCDIR="/app/include"
       - luarocks install --tree="/app" luautf8
       - luarocks install --tree="/app" LuaFileSystem
+      - luarocks install --tree="/app" lpeg LUA_INCDIR="/app/include"
       - luarocks install --tree="/app" lua-zip ZIP_INCDIR="/app/include" ZIP_LIBDIR="/app/lib" LUA_INCDIR="/app/include"
       - luarocks install --tree="/app" LuaSQL-SQLite3 SQLITE_INCDIR="/app/include"
       - luarocks install --tree="/app" lrexlib-pcre PCRE_INCDIR="/app/include" PCRE_LIBDIR="/app/lib"

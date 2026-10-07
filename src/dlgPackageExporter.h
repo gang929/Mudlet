@@ -24,15 +24,23 @@
  ***************************************************************************/
 
 
-#include "Host.h"
-
-#include "pre_guard.h"
 #include <QDialog>
 #include <QFileInfo>
+#include <QPointer>
 #include <QTextEdit>
 #include <zip.h>
-#include "post_guard.h"
-#include <zip.h>
+
+#include <memory>
+
+class Host;
+class QCloseEvent;
+class QGroupBox;
+class TAction;
+class TAlias;
+class TKey;
+class TScript;
+class TTimer;
+class TTrigger;
 
 #if defined(LIBZIP_VERSION_MAJOR) && defined(LIBZIP_VERSION_MINOR) && ((LIBZIP_VERSION_MAJOR  > 1) || (LIBZIP_VERSION_MAJOR == 1) && (LIBZIP_VERSION_MINOR >= 7))
 // libzip 1.7.0 supports cancelling archiving in progress
@@ -54,6 +62,17 @@ public:
     Q_DISABLE_COPY(dlgPackageExporter)
     explicit dlgPackageExporter(QWidget* parent, Host*);
     ~dlgPackageExporter();
+
+    // Methods to preselect items when opened from trigger editor
+    void preselectTrigger(QTreeWidgetItem* item);
+    void preselectTimer(QTreeWidgetItem* item);
+    void preselectAlias(QTreeWidgetItem* item);
+    void preselectScript(QTreeWidgetItem* item);
+    void preselectAction(QTreeWidgetItem* item);
+    void preselectKey(QTreeWidgetItem* item);
+
+    // Set module creation mode
+    void setModuleCreationMode(bool isModule);
     void recurseTree(QTreeWidgetItem*, QList<QTreeWidgetItem*>&);
     void listTriggers();
     void recurseTriggers(TTrigger*, QTreeWidgetItem*);
@@ -67,24 +86,33 @@ public:
     void recurseActions(TAction*, QTreeWidgetItem*);
     void listTimers();
     void recurseTimers(TTimer*, QTreeWidgetItem*);
+    TTrigger* triggerOf(const QMap<QTreeWidgetItem*, int>&, QTreeWidgetItem*) const;
+    TTimer* timerOf(const QMap<QTreeWidgetItem*, int>&, QTreeWidgetItem*) const;
+    TAlias* aliasOf(const QMap<QTreeWidgetItem*, int>&, QTreeWidgetItem*) const;
+    TAction* actionOf(const QMap<QTreeWidgetItem*, int>&, QTreeWidgetItem*) const;
+    TScript* scriptOf(const QMap<QTreeWidgetItem*, int>&, QTreeWidgetItem*) const;
+    TKey* keyOf(const QMap<QTreeWidgetItem*, int>&, QTreeWidgetItem*) const;
     static void copy_directory(const QString &fromDir, const QString &toDir, bool overwrite);
-    QMap<QTreeWidgetItem*, TTrigger*> triggerMap;
-    QMap<QTreeWidgetItem*, TTrigger*> modTriggerMap;
-    QMap<QTreeWidgetItem*, TAlias*> aliasMap;
-    QMap<QTreeWidgetItem*, TAlias*> modAliasMap;
-    QMap<QTreeWidgetItem*, TScript*> scriptMap;
-    QMap<QTreeWidgetItem*, TScript*> modScriptMap;
-    QMap<QTreeWidgetItem*, TKey*> keyMap;
-    QMap<QTreeWidgetItem*, TKey*> modKeyMap;
-    QMap<QTreeWidgetItem*, TAction*> actionMap;
-    QMap<QTreeWidgetItem*, TAction*> modActionMap;
-    QMap<QTreeWidgetItem*, TTimer*> timerMap;
-    QMap<QTreeWidgetItem*, TTimer*> modTimerMap;
+    QMap<QTreeWidgetItem*, int> triggerMap;
+    QMap<QTreeWidgetItem*, int> modTriggerMap;
+    QMap<QTreeWidgetItem*, int> aliasMap;
+    QMap<QTreeWidgetItem*, int> modAliasMap;
+    QMap<QTreeWidgetItem*, int> scriptMap;
+    QMap<QTreeWidgetItem*, int> modScriptMap;
+    QMap<QTreeWidgetItem*, int> keyMap;
+    QMap<QTreeWidgetItem*, int> modKeyMap;
+    QMap<QTreeWidgetItem*, int> actionMap;
+    QMap<QTreeWidgetItem*, int> modActionMap;
+    QMap<QTreeWidgetItem*, int> timerMap;
+    QMap<QTreeWidgetItem*, int> modTimerMap;
     // This will hold the absolute pathFileName for the XML file that will
     // contain the Mudlet items to go into the package:
     QString mXmlPathFileName;
     QString mPlainDescription;
     QStringList mDescriptionImages;
+
+    // Module creation mode flag
+    bool mIsModuleCreationMode = false;
 
 public slots:
     void slot_addFiles();
@@ -94,6 +122,7 @@ private slots:
     void slot_addDependency();
     void slot_removeDependency();
     void slot_importIcon();
+    void slot_removeIcon();
     void slot_openPackageLocation();
     void slot_packageChanged(int);
     void slot_updateLocationPlaceholder();
@@ -103,6 +132,7 @@ private slots:
 
 protected:
     bool eventFilter(QObject* obj, QEvent* evt) override;
+    void closeEvent(QCloseEvent* event) override;
 
 private:
     void appendToDetails(const QString&, const QString&);
@@ -117,6 +147,7 @@ private:
     static std::pair<bool, QString> zipPackage(const QString& stagingDirName, const QString& packagePathFileName, const QString& xmlPathFileName, const QString& packageName, const QString& packageComment);
     static std::pair<bool, QString> copyAssetsToTmp(const QStringList& assetPaths, const QString& tempPath);
     QFileInfo copyIconToTmp(const QString& tempPath) const;
+    QString normalizedHelpUrl() const;
     void writeConfigFile(const QString& stagingDirName, const QFileInfo& iconFile, const QString& packageDescription);
     void exportXml(bool& isOk,
                    QList<QTreeWidgetItem*>& trigList,
@@ -134,8 +165,9 @@ private:
     QString copyNewImagesToTmp(const QString& tempPath) const;
     static void cleanupUnusedImages(const QString& tempPath, const QString& plainDescription);
     void checkToEnableExportButton();
+    void populateDependencies();
 
-    Ui::dlgPackageExporter* ui = nullptr;
+    std::unique_ptr<Ui::dlgPackageExporter> ui;
     QPointer<Host> mpHost;
     QTreeWidget* mpExportSelection = nullptr;
     QPointer<QPushButton> mExportButton;
@@ -159,6 +191,7 @@ private:
 
 signals:
     void signal_exportLocationChanged(const QString& location);
+    void packageExporterClosing(const QString& profileName);
 };
 
 class dlgPackageExporterDescription : public QTextEdit

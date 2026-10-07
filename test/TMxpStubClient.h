@@ -66,11 +66,16 @@ public:
     QString version = "Stub-1.0";
     bool linkMode;
 
+    QByteArray mEncoding = QByteArrayLiteral("UTF-8");
+    QByteArray getEncoding() const override { return mEncoding; }
+
     QString sentToServer;
 
     QString fgColor, bgColor;
 
     QStringList mHrefs, mHints;
+
+    QString mExpireName;
 
     QString mPublishedEntityName, mPublishedEntityValue;
 
@@ -186,12 +191,26 @@ public:
 
     int setLink(const QStringList& hrefs, const QStringList& hints) override
     {
-        qDebug().noquote() << qsl("setLink([%1], [%2])").arg(hrefs.join(", "), hints.join(", "));
         mHrefs = hrefs;
         mHints = hints;
 
         return 1;
     }
+
+    int setLink(const QStringList& hrefs, const QStringList& hints, const QString& expireName) override
+    {
+        mHrefs = hrefs;
+        mHints = hints;
+        mExpireName = expireName;
+
+        return 1;
+    }
+
+    void expireLinks(const QString& expireName) override
+    {
+        qDebug().noquote() << qsl("expireLinks([%1])").arg(expireName);
+    }
+
     bool getLink(int id, QStringList** href, QStringList** hint) override
     {
         *href = &mHrefs;
@@ -217,7 +236,57 @@ public:
         mPublishedEntityValue = value;
     }
 
-    void setVariable(const QString& name, const QString& value) override {}
+    QList<QPair<QString, QString>> mVariables;
+    void setVariable(const QString& name, const QString& value) override
+    {
+        mVariables.append({name, value});
+    }
+
+    // MXP Frame/Dest tracking
+    bool createMxpFrameCalled = false;
+    QString lastCreatedFrameName;
+    QMap<QString, QString> lastFrameAttributes;
+    
+    bool setMxpDestinationCalled = false;
+    QString lastDestinationName;
+    bool lastDestinationEol = false;
+    bool lastDestinationEof = false;
+    
+    bool clearMxpDestinationCalled = false;
+    
+    bool createMxpFrame(const QString& name, const QMap<QString, QString>& attributes) override
+    {
+        createMxpFrameCalled = true;
+        lastCreatedFrameName = name;
+        lastFrameAttributes = attributes;
+        return false;
+    }
+    
+    bool setMxpDestination(const QString& frameName, bool eol, bool eof) override
+    {
+        setMxpDestinationCalled = true;
+        lastDestinationName = frameName;
+        lastDestinationEol = eol;
+        lastDestinationEof = eof;
+        return false;
+    }
+    
+    void clearMxpDestination() override
+    {
+        clearMxpDestinationCalled = true;
+    }
+    
+    void resetMxpTracking()
+    {
+        createMxpFrameCalled = false;
+        lastCreatedFrameName.clear();
+        lastFrameAttributes.clear();
+        setMxpDestinationCalled = false;
+        lastDestinationName.clear();
+        lastDestinationEol = false;
+        lastDestinationEof = false;
+        clearMxpDestinationCalled = false;
+    }
 };
 
 #endif //MUDLET_TEST_TMXPSTUBCLIENT_H

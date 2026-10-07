@@ -25,11 +25,11 @@
 #include "TLinkStore.h"
 #include "TMxpClient.h"
 #include "TMxpEvent.h"
+#include "TMxpProcessor.h"
 
-#include "pre_guard.h"
 #include <QList>
 #include <QQueue>
-#include "post_guard.h"
+#include <QStack>
 
 class Host;
 class TMediaData;
@@ -47,7 +47,8 @@ public:
     explicit TMxpMudlet(Host* pHost)
     : mpHost(pHost)
     , mLinkMode(false)
-    {}
+    {
+    }
 
     QString getVersion() override;
 
@@ -72,7 +73,8 @@ public:
     const QColor& getBgColor() { return bgColors.last(); }
 
     // TODO: implement support for fonts?
-    void pushFont(const QString& fontFace, const QString& fontSize) override {
+    void pushFont(const QString& fontFace, const QString& fontSize) override
+    {
         Q_UNUSED(fontFace)
         Q_UNUSED(fontSize)
     }
@@ -82,6 +84,10 @@ public:
     int setLink(const QStringList& links, const QStringList& hints) override;
 
     bool getLink(int id, QStringList** links, QStringList** hints) override;
+
+    // EXPIRE tag support
+    int setLink(const QStringList& links, const QStringList& hints, const QString& expireName) override;
+    void expireLinks(const QString& expireName) override;
 
     void playMedia(TMediaData& mediaData) override;
     void stopMedia(TMediaData& mediaData) override;
@@ -99,28 +105,33 @@ public:
     void resetTextProperties() override;
 
     void setStyle(const QString& val) override { mxpStyle = val; }
-    QString getStyle() override { return mxpStyle;}
+    QString getStyle() override { return mxpStyle; }
 
-    void setFlag(const QString& elementName, const QMap<QString, QString>& values, const QString& content) override {
+    void setFlag(const QString& elementName, const QMap<QString, QString>& values, const QString& content) override
+    {
         Q_UNUSED(elementName)
         Q_UNUSED(values)
         Q_UNUSED(content)
         // TODO: raise mxp event
     }
 
-    void publishEntity(const QString& name, const QString& value) override {
+    void publishEntity(const QString& name, const QString& value) override
+    {
         Q_UNUSED(name)
         Q_UNUSED(value)
     }
 
-    void setVariable(const QString& name, const QString& value) override {
+    void setVariable(const QString& name, const QString& value) override
+    {
         Q_UNUSED(name)
         Q_UNUSED(value)
     }
 
-    TMxpTagHandlerResult tagHandled(MxpTag* tag, TMxpTagHandlerResult result) override;
+    bool startTagReceived(MxpStartTag* startTag) override;
 
-    void enqueueMxpEvent(MxpStartTag* tag);
+    TMxpTagHandlerResult tagHandled(MxpTag* tag, TMxpTagHandlerResult result, TMxpContext& context) override;
+
+    void enqueueMxpEvent(MxpStartTag* tag, const TMxpElement& element);
     TLinkStore& getLinkStore();
 
     QList<QColor> fgColors;
@@ -129,7 +140,28 @@ public:
     // Shouldn't be here, look for a better solution
     QQueue<TMxpEvent> mMxpEvents;
 
+    void setCaptionForSendEvent(const QString& caption) override;
+
+    int getWrapWidth() const override;
+
+    void insertText(const QString& text) override;
+
+    QStack<TMxpEvent> mPendingSendEvents;
+
+    // Get the encoding used by the connection
+    QByteArray getEncoding() const override;
+    bool shouldLockModeToSecure() const override;
+
+    // MXP Frame management (FRAME and DEST tag support)
+    bool createMxpFrame(const QString& name, const QMap<QString, QString>& attributes) override;
+    bool closeMxpFrame(const QString& name) override;
+    bool setMxpDestination(const QString& frameName, bool eol, bool eof) override;
+    void clearMxpDestination() override;
+    QString getMxpCurrentDestination() const override;
+
 private:
+    bool isTagAllowedInMode(const QString& tagName, TMXPMode mode) const;
+
     Host* mpHost;
     bool mLinkMode;
 };

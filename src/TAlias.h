@@ -4,7 +4,8 @@
 /***************************************************************************
  *   Copyright (C) 2008-2012 by Heiko Koehn - KoehnHeiko@googlemail.com    *
  *   Copyright (C) 2014 by Ahmed Charles - acharles@outlook.com            *
- *   Copyright (C) 2017-2022 by Stephen Lyons - slysven@virginmedia.com    *
+ *   Copyright (C) 2017-2022, 2026 by Stephen Lyons                        *
+ *                                               - slysven@virginmedia.com *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
  *   it under the terms of the GNU General Public License as published by  *
@@ -24,19 +25,22 @@
 
 
 #include "Tree.h"
+#include "utils.h" // For NameGroupMatches
 
-#include "pre_guard.h"
-#include <QApplication>
 #include <QDebug>
+#include <QDebugStateSaver>
 #include <QPointer>
 #include <QSharedPointer>
-#include "post_guard.h"
+#include <QString>
+#include <QVector>
+#include <QtGlobal>
 
-#include <pcre.h>
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <pcre2.h>
+#include <QCoreApplication>
 
 class Host;
 
-#define MAX_CAPTURE_GROUPS 33
 
 class TAlias : public Tree<TAlias>
 {
@@ -52,7 +56,6 @@ public:
     void compileRegex();
     QString getName() const { return mName; }
     void setName(const QString& name);
-    void compile();
     bool compileScript();
     void execute();
     QString getScript() const { return mScript; }
@@ -61,8 +64,13 @@ public:
     void setRegexCode(const QString&);
     void setCommand(const QString& command) { mCommand = command; }
     QString getCommand() const { return mCommand; }
+    QString packageName(TAlias* pAlias);
+    bool checkIfNew();
+    void unmarkAsNew();
 
-    bool match(const QString& toMatch);
+
+
+    bool match(const QByteArray& haystack);
     bool registerAlias();
 
     TAlias() = default;
@@ -70,7 +78,9 @@ public:
     QString mName;
     QString mCommand;
     QString mRegexCode;
-    QSharedPointer<pcre> mpRegex;
+    QSharedPointer<pcre2_code> mpRegex;
+    QSharedPointer<pcre2_match_data> mpMatchData;
+    bool mRegexJitCompiled = false;
     QString mScript;
     QPointer<Host> mpHost;
     bool mModuleMember = false;
@@ -78,6 +88,8 @@ public:
     QString mFuncName;
     bool exportItem = true;
     bool mRegisteredAnonymousLuaFunction = false;
+    QVector<NameGroupMatches> nameCaptures;
+    bool mIsNew = true;
 
 private:
     bool mNeedsToBeCompiled = true;
@@ -87,7 +99,7 @@ private:
 inline QDebug& operator<<(QDebug& debug, const TAlias* alias)
 {
     QDebugStateSaver saver(debug);
-    Q_UNUSED(saver);
+    Q_UNUSED(saver)
 
     if (!alias) {
         return debug << "TAlias(0x0) ";

@@ -4,21 +4,27 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened, edited]
 
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: ${{github.workflow}}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   danger:
+    # Skip release PRs (base main): their head is `development`, so every dev push
+    # would re-run danger and stamp a failing status onto each dev commit.
+    if: github.event.pull_request.base.ref != 'main'
     runs-on: ubuntu-latest
-    #if: github.event_name  == 'pull_request' # only run pull requests, no really
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout base branch for danger config
+      uses: actions/checkout@v7
       with:
-        ref: ${{github.event.pull_request.head.ref}}
-        repository: ${{github.event.pull_request.head.repo.full_name}}
-        fetch-depth: 0
-    - name: Use Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: "14.x"
-    - name: Install yarn dependencies
+        fetch-depth: 1
+    - name: Install dependencies and run danger
       run: |
         yarn add danger --dev
         yarn danger ci

@@ -24,13 +24,13 @@
  ***************************************************************************/
 
 
-#include "pre_guard.h"
 #include <QString>
-#include "post_guard.h"
 
+#include <algorithm>
 #include <iostream>
 #include <list>
 
+#include "utils.h"
 
 template <class T>
 class Tree
@@ -41,14 +41,17 @@ public:
     virtual ~Tree();
 
     T* getParent() const { return mpParent; }
-    std::list<T*>* getChildrenList() const;
+    std::list<Tree<T>*>* getChildrenList() const;
     std::list<T*> getAncestorList() const;
     bool hasChildren() const { return (!mpMyChildrenList->empty()); }
     int getChildCount() const { return mpMyChildrenList->size(); }
     int getID() const { return mID; }
     virtual void setID(const int id) { mID = id; }
-    void addChild(T* newChild, int parentPostion = -1, int parentPosition = -1);
-    bool popChild(T* removeChild);
+    // Enum-based API for clear insertion mode specification
+    void addChild(Tree<T>* newChild, TreeItemInsertMode mode, int position = 0);
+    // Legacy integer-based position API - delegates to enum-based version
+    void addChild(Tree<T>* newChild, int parentPostion = -1, int parentPosition = -1);
+    bool popChild(Tree<T>* removeChild);
     void setParent(T* parent);
     void enableFamily();
     void disableFamily();
@@ -64,12 +67,12 @@ public:
     bool ancestorsActive() const;
     QString& getError();
     void setError(QString);
-    bool state() const;
-/* No longer used - most cases were accessing the member directly
+    inline bool state() const;
+    /* No longer used - most cases were accessing the member directly
     QString getPackageName() const { return mPackageName; }
     void setPackageName(const QString& n) { mPackageName = n; }
 */
-/* Not used, the member was not either
+    /* Not used, the member was not either
     void setModuleName(const QString& n) { mModuleName = n; }
     QString getModuleName() const { return mModuleName; }
 */
@@ -84,13 +87,19 @@ public:
     }
 
     T* mpParent;
-    std::list<T*>* mpMyChildrenList;
+    // Not T*: a node adds itself to its parent's list from Tree's constructor, before its T
+    // subobject exists, so downcasting there is undefined behaviour.
+    std::list<Tree<T>*>* mpMyChildrenList;
     int mID;
     QString mPackageName;
-// Not used:    QString mModuleName;
+    // Not used:    QString mModuleName;
 
 protected:
-    virtual bool canBeActivated() const;
+    inline virtual bool canBeActivated() const;
+    // Every T destructor calls this once it has unregistered itself. Left to ~Tree(), a child would
+    // be torn down after its parent's T part has been destroyed, yet it still reaches that parent
+    // through T* (getParent(), popChild()), which is undefined behaviour.
+    void deleteChildren();
 
     bool mOK_init;
     bool mOK_code;
@@ -106,7 +115,7 @@ private:
 template <class T>
 Tree<T>::Tree()
 : mpParent(nullptr)
-, mpMyChildrenList( new std::list<T *> )
+, mpMyChildrenList(new std::list<Tree<T>*>)
 , mID(0)
 , mOK_init(true)
 , mOK_code(true)
@@ -118,9 +127,9 @@ Tree<T>::Tree()
 }
 
 template <class T>
-Tree<T>::Tree( T * pParent )
+Tree<T>::Tree(T* pParent)
 : mpParent(pParent)
-, mpMyChildrenList( new std::list<T *> )
+, mpMyChildrenList(new std::list<Tree<T>*>)
 , mID(0)
 , mOK_init(true)
 , mOK_code(true)
@@ -130,7 +139,7 @@ Tree<T>::Tree( T * pParent )
 , mFolder(false)
 {
     if (pParent) {
-        pParent->addChild(static_cast<T*>(this));
+        pParent->addChild(this);
     } else {
         mpParent = nullptr;
     }
@@ -139,14 +148,13 @@ Tree<T>::Tree( T * pParent )
 template <class T>
 Tree<T>::~Tree()
 {
-    while (!mpMyChildrenList->empty()) {
-        auto it = mpMyChildrenList->begin();
-        T* pChild = *it;
-        delete pChild;
-    }
+    // Each T destructor has already emptied it, so this is only a safety net
+    Q_ASSERT(mpMyChildrenList->empty());
+    deleteChildren();
     delete mpMyChildrenList;
+    mpMyChildrenList = nullptr;
     if (mpParent) {
-        mpParent->popChild(static_cast<T*>(this)); // tell parent about my death
+        mpParent->popChild(this);
         if (std::uncaught_exceptions()) {
             std::cout << "ERROR: Hook destructed during stack rewind because of an uncaught exception." << std::endl;
         }
@@ -154,12 +162,23 @@ Tree<T>::~Tree()
 }
 
 template <class T>
-void Tree<T>::setTemporary(const bool state) {
+void Tree<T>::deleteChildren()
+{
+    // Each child's destructor pops it from this list
+    while (!mpMyChildrenList->empty()) {
+        delete mpMyChildrenList->front();
+    }
+}
+
+template <class T>
+void Tree<T>::setTemporary(const bool state)
+{
     mTemporary = state;
 }
 
 template <class T>
-bool Tree<T>::isTemporary() const {
+bool Tree<T>::isTemporary() const
+{
     return mTemporary;
 }
 
@@ -194,20 +213,19 @@ bool Tree<T>::setIsActive(bool b)
     setShouldBeActive(b);
     if (b) {
         return activate();
-    } else {
-        mActive = false;
-        return false;
     }
+    mActive = false;
+    return false;
 }
 
 template <class T>
-inline bool Tree<T>::state() const
+bool Tree<T>::state() const
 {
     return (mOK_init && mOK_code);
 }
 
 template <class T>
-inline bool Tree<T>::canBeActivated() const
+bool Tree<T>::canBeActivated() const
 {
     return (shouldBeActive() && state());
 }
@@ -232,6 +250,10 @@ void Tree<T>::deactivate()
 template <class T>
 bool Tree<T>::isActive() const
 {
+    // Check if object is in a valid state (not being destroyed)
+    if (!mpMyChildrenList) {
+        return false;
+    }
     return (mActive && canBeActivated());
 }
 
@@ -253,21 +275,33 @@ void Tree<T>::disableFamily()
     }
 }
 
+// Enum-based addChild implementation
 template <class T>
-void Tree<T>::addChild(T* newChild, int parentPosition, int childPosition)
+void Tree<T>::addChild(Tree<T>* newChild, TreeItemInsertMode mode, int position)
 {
-    if ((parentPosition == -1) || (childPosition >= static_cast<int>(mpMyChildrenList->size()))) {
+    if (mode == TreeItemInsertMode::Append || position >= static_cast<int>(mpMyChildrenList->size())) {
         mpMyChildrenList->push_back(newChild);
     } else {
         // insert item at proper position
         int cnt = 0;
         for (auto it = mpMyChildrenList->begin(); it != mpMyChildrenList->end(); it++) {
-            if (cnt >= childPosition) {
+            if (cnt >= position) {
                 mpMyChildrenList->insert(it, newChild);
                 break;
             }
             cnt++;
         }
+    }
+}
+
+// Legacy integer-based addChild - delegates to enum-based version
+template <class T>
+void Tree<T>::addChild(Tree<T>* newChild, int parentPosition, int childPosition)
+{
+    if (parentPosition == -1 || childPosition == -1) {
+        addChild(newChild, TreeItemInsertMode::Append, 0);
+    } else {
+        addChild(newChild, TreeItemInsertMode::AtPosition, childPosition);
     }
 }
 
@@ -278,19 +312,18 @@ void Tree<T>::setParent(T* pParent)
 }
 
 template <class T>
-bool Tree<T>::popChild(T* pChild)
+bool Tree<T>::popChild(Tree<T>* pChild)
 {
-    for (auto it = mpMyChildrenList->begin(); it != mpMyChildrenList->end(); it++) {
-        if (*it == pChild) {
-            mpMyChildrenList->remove(pChild);
-            return true;
-        }
+    // erase(), not remove(): remove() rescans the whole list, and a folder pops every child as it is torn down
+    if (const auto it = std::find(mpMyChildrenList->begin(), mpMyChildrenList->end(), pChild); it != mpMyChildrenList->end()) {
+        mpMyChildrenList->erase(it);
+        return true;
     }
     return false;
 }
 
 template <class T>
-std::list<T*>* Tree<T>::getChildrenList() const
+std::list<Tree<T>*>* Tree<T>::getChildrenList() const
 {
     return mpMyChildrenList;
 }

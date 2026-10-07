@@ -23,9 +23,7 @@
  ***************************************************************************/
 
 
-#include "pre_guard.h"
 #include "ui_system_message_area.h"
-#include "post_guard.h"
 
 
 class dlgSystemMessageArea : public QWidget, public Ui::system_message_area
@@ -35,6 +33,9 @@ class dlgSystemMessageArea : public QWidget, public Ui::system_message_area
 public:
     Q_DISABLE_COPY(dlgSystemMessageArea)
     explicit dlgSystemMessageArea(QWidget*);
+
+private slots:
+    void slot_applyAppearance();
 };
 
 #endif // MUDLET_DLGSYSTEMMESSAGEAREA_H

@@ -1,8 +1,9 @@
 /***************************************************************************
  *   Copyright (C) 2008-2013 by Heiko Koehn - KoehnHeiko@googlemail.com    *
  *   Copyright (C) 2014 by Ahmed Charles - acharles@outlook.com            *
- *   Copyright (C) 2016-2018, 2020-2023 by Stephen Lyons                   *
+ *   Copyright (C) 2016-2018, 2020-2023, 2025-2026 by Stephen Lyons        *
  *                                               - slysven@virginmedia.com *
+ *   Copyright (C) 2025 by Lecker Kebap - Leris@mudlet.org                 *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
  *   it under the terms of the GNU General Public License as published by  *
@@ -23,26 +24,104 @@
 
 #include "dlgConnectionProfiles.h"
 
+#include <pugixml.hpp>
 
+#include "GMCPAuthenticator.h"
 #include "Host.h"
 #include "HostManager.h"
 #include "LuaInterface.h"
+#include "MudletApp.h"
 #include "TGameDetails.h"
 #include "XMLimport.h"
+#include "discord.h"
 #include "mudlet.h"
+#include "CredentialManager.h"
+#include "SecureStringUtils.h"
+#include "widgetutils.h"
+#include "utils.h"
 
-#include "pre_guard.h"
-#include <QtConcurrent>
+#include <QDataStream>
+#include <QSaveFile>
+#include <QtConcurrentRun>
+#include <QtMath>
 #include <QtUiTools>
+#include <QApplication>
 #include <QColorDialog>
 #include <QDir>
+#include <QFileInfo>
+#include <QPointer>
 #include <QRandomGenerator>
 #include <QSettings>
-#include "post_guard.h"
+#include <QSignalBlocker>
+#include <QTabBar>
+#include <QTime>
 #include <chrono>
 #include <sstream>
 
 using namespace std::chrono_literals;
+
+// Kept to a sub-set of ASCII because the profile name is also used as a
+// directory name on all supported OSes; parentheses are included so that
+// folders duplicated by a file manager (e.g. "profile (2)") work as-is:
+const QString dlgConnectionProfiles::scmAllowedProfileNameChars = qsl(". _()0123456789-#&aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ");
+
+// Returns the first character not permitted in a (new) profile name, or a
+// null QChar if all of them are acceptable. An embedded U+0000 is
+// indistinguishable from the all-clear sentinel, but a QLineEdit never lets
+// one through:
+QChar dlgConnectionProfiles::firstInvalidProfileNameChar(const QString& name)
+{
+    for (const QChar& c : name) {
+        if (!scmAllowedProfileNameChars.contains(c)) {
+            return c;
+        }
+    }
+    return {};
+}
+
+// Characters that make a name unusable no matter where it came from:
+// MudletApp::sanitizeForPath() silently rewrites them out of any path built from
+// the profile name, and CredentialManager::generateFilePath() refuses to
+// produce a path at all - so a profile named this way could never store or
+// retrieve its password. Mirrors the pattern used there:
+const QRegularExpression dlgConnectionProfiles::scmUnusableProfileNameChars{qsl(R"REGEX(\.\.|[/\\<>:"|?*\x00-\x1f])REGEX")};
+
+// Listing what is expected rather than what to watch out for keeps an
+// unrecognised file - a stored password, a character name the user typed - on
+// the side of asking. ProfileDeletionSafetyTest fails if the connection form
+// comes to write anything this does not name:
+const QStringList dlgConnectionProfiles::scmConnectionDetailFiles{qsl("url"), qsl("port"), qsl("ssl_tsl"), qsl("description"), qsl("website"), qsl("autologin"), qsl("autoreconnect")};
+
+const QString dlgConnectionProfiles::scmSelfTestProfile = qsl("Mudlet self-test");
+
+std::optional<QColor> getCustomColor(const QString& profileName);
+
+// A lone "." is made entirely of permitted characters, yet every path built
+// from it addresses the profiles directory rather than a profile of its own -
+// as does "..", which scmUnusableProfileNameChars already covers:
+bool dlgConnectionProfiles::profileNameUsableAsIs(const QString& name)
+{
+    return !name.isEmpty() && name != qsl(".") && !name.contains(scmUnusableProfileNameChars);
+}
+
+// Resolved textually rather than with QDir::canonicalPath() so that the answer
+// does not depend on the folder existing - a predefined game has none until it
+// is saved - and so that a symlinked profile folder still resolves.
+QString dlgConnectionProfiles::profileFolderPath(const QString& profilesPath, const QString& profile)
+{
+    // Must precede the parent check below, which QDir::cleanPath() would
+    // otherwise satisfy by collapsing "../profiles/Foo" straight back in:
+    if (profile.isEmpty() || profile.contains(QLatin1Char('/')) || profile.contains(QLatin1Char('\\'))) {
+        return {};
+    }
+
+    const QString profilesDir = QDir::cleanPath(profilesPath);
+    const QString candidate = QDir::cleanPath(qsl("%1/%2").arg(profilesDir, profile));
+    if (candidate == profilesDir || QFileInfo(candidate).path() != profilesDir) {
+        return {};
+    }
+    return candidate;
+}
 
 dlgConnectionProfiles::dlgConnectionProfiles(QWidget* parent)
 : QDialog(parent)
@@ -64,27 +143,15 @@ dlgConnectionProfiles::dlgConnectionProfiles(QWidget* parent)
     }
     QPixmap holdPixmap;
 
-#if (QT_VERSION) >= (QT_VERSION_CHECK(5, 15, 0))
     holdPixmap = notificationAreaIconLabelWarning->pixmap(Qt::ReturnByValue);
-#else
-    holdPixmap = *(this->notificationAreaIconLabelWarning->pixmap());
-#endif
     holdPixmap.setDevicePixelRatio(5.3);
     notificationAreaIconLabelWarning->setPixmap(holdPixmap);
 
-#if (QT_VERSION) >= (QT_VERSION_CHECK(5, 15, 0))
     holdPixmap = notificationAreaIconLabelError->pixmap(Qt::ReturnByValue);
-#else
-    holdPixmap = *(this->notificationAreaIconLabelError->pixmap());
-#endif
     holdPixmap.setDevicePixelRatio(5.3);
     notificationAreaIconLabelError->setPixmap(holdPixmap);
 
-#if (QT_VERSION) >= (QT_VERSION_CHECK(5, 15, 0))
     holdPixmap = notificationAreaIconLabelInformation->pixmap(Qt::ReturnByValue);
-#else
-    holdPixmap = *(notificationAreaIconLabelInformation->pixmap());
-#endif
     holdPixmap.setDevicePixelRatio(5.3);
     notificationAreaIconLabelInformation->setPixmap(holdPixmap);
 
@@ -92,15 +159,76 @@ dlgConnectionProfiles::dlgConnectionProfiles(QWidget* parent)
     // undefined. this is an undocumented qt bug, as it only shows on certain OS
     // and certain architectures.
 
-    profiles_tree_widget->setSelectionMode(QAbstractItemView::SingleSelection);
-    profiles_tree_widget->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(profiles_tree_widget, &QWidget::customContextMenuRequested, this, &dlgConnectionProfiles::slot_profileContextMenu);
+    listWidget_profiles->setSelectionMode(QAbstractItemView::SingleSelection);
+    listWidget_profiles->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(listWidget_profiles, &QWidget::customContextMenuRequested, this, &dlgConnectionProfiles::slot_profileContextMenu);
+
+    mpTabBar = new QTabBar(this);
+    // QTabWidget gives this dialog a second QTabBar, so this one needs a name
+    mpTabBar->setObjectName(qsl("gamesTabBar"));
+    //: Tab showing only the games the user already has profiles for
+    mpTabBar->insertTab(scmMyGamesTab, tr("My games"));
+    //: Tab showing every game Mudlet has a built-in profile for
+    mpTabBar->insertTab(scmAllGamesTab, tr("All games"));
+    mpTabBar->setExpanding(false);
+    mpTabBar->setAccessibleName(tr("games shown"));
+    mpTabBar->setAccessibleDescription(tr("Switch between showing only your own games and all of the games Mudlet knows about."));
+    verticalLayout_gamesList->insertWidget(0, mpTabBar);
+    setTabOrder(mpTabBar, listWidget_profiles);
+    // setTabOrder() drops the games list from the head of the focus chain; without this the name
+    // field opens focused, where typing a game's name renames a profile instead of picking that game
+    listWidget_profiles->setFocus();
+
+    if (!mudlet::self()->mOnlyShownPredefinedProfiles.isEmpty()) {
+        // dedicated single-game builds only ever show their own game(s), so
+        // there is nothing to switch between
+        mpTabBar->hide();
+    } else {
+        auto& settings = *MudletApp::getQSettings();
+        int initialTab = scmMyGamesTab;
+        if (settings.contains(qsl("connectionDialogActiveTab"))) {
+            initialTab = settings.value(qsl("connectionDialogActiveTab")).toInt() == scmAllGamesTab ? scmAllGamesTab : scmMyGamesTab;
+        } else if (settings.value(qsl("showOnlyMyProfiles"), false).toBool()) {
+            // migrate the retired "Show my profiles only" context menu filter,
+            // which the "My games" tab replaces
+            initialTab = scmMyGamesTab;
+            settings.setValue(qsl("connectionDialogActiveTab"), initialTab);
+        } else if (QDir(MudletApp::getMudletPath(enums::profilesPath)).entryList(QDir::Dirs | QDir::NoDotAndDotDot).isEmpty()) {
+            // a newcomer has no profiles yet, so show them the catalog
+            initialTab = scmAllGamesTab;
+        }
+        // the retired filter's setting is dropped even when it was false, so it
+        // cannot resurface should connectionDialogActiveTab ever go missing
+        settings.remove(qsl("showOnlyMyProfiles"));
+        mpTabBar->setCurrentIndex(initialTab);
+    }
+    // connected only after the initial tab is set, so that setting it is not
+    // mistaken for the user switching tabs
+    connect(mpTabBar, &QTabBar::currentChanged, this, &dlgConnectionProfiles::slot_activeTabChanged);
 
     QAbstractButton* abort = dialog_buttonbox->button(QDialogButtonBox::Cancel);
     connect_button = dialog_buttonbox->addButton(tr("Connect"), QDialogButtonBox::AcceptRole);
     connect_button->setAccessibleDescription(btn_connOrLoad_disabled_accessDesc);
     offline_button = dialog_buttonbox->addButton(tr("Offline"), QDialogButtonBox::AcceptRole);
     offline_button->setAccessibleDescription(btn_connOrLoad_disabled_accessDesc);
+
+    //: Button shown on first launch to skip the tutorial and show the full games list
+    mpSkipToGamesButton = new QPushButton(tr("Skip - show me the games list"), this);
+    mpSkipToGamesButton->setObjectName(qsl("skipToGamesButton"));
+    mpSkipToGamesButton->hide();
+    horizontalLayout_3->insertWidget(0, mpSkipToGamesButton);
+
+    connect(mpSkipToGamesButton, &QPushButton::clicked, this, &dlgConnectionProfiles::slot_skipToGamesList);
+
+    // Pressing Enter in the connection form must always mean "Connect". The
+    // tutorial invitation hides the Connect button on first show, which stops
+    // Qt's automatic default-button tracking from ever settling on it - Enter
+    // would then activate the first autoDefault button in the dialog, which
+    // happens to be Remove, silently deleting the profile being created:
+    remove_profile_button->setAutoDefault(false);
+    new_profile_button->setAutoDefault(false);
+    mpSkipToGamesButton->setAutoDefault(false);
+    connect_button->setDefault(true);
 
     // Test and set if needed mudlet::mIsIconShownOnDialogButtonBoxes - if there
     // is already a Qt provided icon on a predefined button, this is probably
@@ -109,18 +237,19 @@ dlgConnectionProfiles::dlgConnectionProfiles(QWidget* parent)
     // settings suggest it:
     mudlet::self()->mShowIconsOnDialogs = !abort->icon().isNull();
 
-    auto Welcome_text_template = tr("<p><center><big><b>Welcome to Mudlet!</b></big></center></p>"
-                                    "<p><center><b>Click on one of the games on the list to play.</b></center></p>"
-                                    "<p>To play a game not in the list, click on %1 "
-                                    "<span style=\" color:#555753;\">New</span>, fill in the <i>Profile Name</i>, "
-                                    "<i>Server address</i>, and <i>Port</i> fields in the <i>Required </i> area.</p>"
-                                    "<p>After that, click %2 <span style=\" color:#555753;\">Connect</span> "
-                                    "to play.</p>"
-                                    "<p>Have fun!</p><p align=\"right\"><span style=\" font-family:'Sans';\">The Mudlet Team </span>"
-                                    "<img src=\":/icons/mudlet_main_16px.png\"/></p>",
-                                    "Welcome message. Both %1 and %2 may be replaced by icons when this text is used.");
+    //: Welcome message shown on first launch, focused on starting the tutorial.
+    auto Welcome_text_template = tr("<p><center><img src=\"tutorialIcon\"/></center></p>"
+                                    "<p><center><big><b>Welcome to Mudlet!</b></big></center></p>"
+                                    "<p><center>Play a short guided adventure to learn<br>"
+                                    "how to navigate in games, use triggers, aliases, and scripting.</center></p>"
+                                    "<p><center><a href=\"mudlet-tutorial\">Start Tutorial</a></center></p>"
+                                    "<p align=\"right\"><span style=\" font-family:'Sans';\">The Mudlet Team </span>"
+                                    "<img src=\":/icons/mudlet_main_16px.png\"/></p>");
 
     auto pWelcome_document = new QTextDocument(this);
+    QPixmap tutorialIcon(qsl(":/icons/mudlet-tutorial.png"));
+    tutorialIcon = tutorialIcon.scaled(160, 40, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    pWelcome_document->addResource(QTextDocument::ImageResource, QUrl(qsl("tutorialIcon")), tutorialIcon);
 
     mpCopyProfile = new QAction(tr("Copy"), this);
     mpCopyProfile->setObjectName(qsl("copyProfile"));
@@ -130,51 +259,34 @@ dlgConnectionProfiles::dlgConnectionProfiles(QWidget* parent)
     copy_profile_toolbutton->addAction(mpCopyProfile);
     copy_profile_toolbutton->addAction(copyProfileSettings);
     copy_profile_toolbutton->setDefaultAction(mpCopyProfile);
-#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-    auto widgetList = mpCopyProfile->associatedWidgets();
-#else
-    // QAction::associatedWidgets() has been deprecated in Qt 6
+
     auto objectList = mpCopyProfile->associatedObjects();
     QList<QWidget*> widgetList;
-    for (auto pObjectItem : objectList) {
+    for (const auto pObjectItem : std::as_const(objectList)) {
         auto pWidgetItem = qobject_cast<QWidget*>(pObjectItem);
         if (pWidgetItem) {
             widgetList << pWidgetItem;
         }
     }
-#endif
+
     Q_ASSERT_X(!widgetList.isEmpty(), "dlgConnectionProfiles::dlgConnectionProfiles(...)", "A QWidget for mpCopyProfile QAction not found.");
     widgetList.first()->setAccessibleName(tr("copy profile"));
     widgetList.first()->setAccessibleDescription(tr("copy the entire profile to new one that will require a different new name."));
 
-#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-    widgetList = copyProfileSettings->associatedWidgets();
-#else
     objectList = copyProfileSettings->associatedObjects();
     widgetList.clear();
-    for (auto pObjectItem : objectList) {
+    for (const auto pObjectItem : std::as_const(objectList)) {
         auto pWidgetItem = qobject_cast<QWidget*>(pObjectItem);
         if (pWidgetItem) {
             widgetList << pWidgetItem;
         }
     }
-#endif
+
     Q_ASSERT_X(!widgetList.isEmpty(), "dlgConnectionProfiles::dlgConnectionProfiles(...)", "A QWidget for copyProfileSettings QAction not found.");
     widgetList.first()->setAccessibleName(tr("copy profile settings"));
     widgetList.first()->setAccessibleDescription(tr("copy the settings and some other parts of the profile to a new one that will require a different new name."));
 
     if (mudlet::self()->mShowIconsOnDialogs) {
-        // Since I've switched to allowing the possibility of theme replacement
-        // of icons we need a way to insert the current theme icons for
-        // "dialog-ok-apply" and "edit-copy" into the help message - this is
-        // awkward because Qt would normally expect to load them from a
-        // resource file but this is no good in this case as we only use the
-        // resource file if the icon is NOT supplied from the current theme.
-        // We can fix this with a bit of fancy editing of the text - replacing a
-        // particular sequence of characters with an image generated from the
-        // actual icon in use.
-        pWelcome_document->setHtml(qsl("<html><head/><body>%1</body></html>").arg(Welcome_text_template.arg(qsl("NEW_PROFILE_ICON"), qsl("CONNECT_PROFILE_ICON"))));
-
         // As we are repurposing the cancel to be a close button we do want to
         // change it anyhow:
         abort->setIcon(QIcon::fromTheme(qsl("dialog-close"), QIcon(qsl(":/icons/dialog-close.png"))));
@@ -190,31 +302,25 @@ dlgConnectionProfiles::dlgConnectionProfiles(QWidget* parent)
         copy_profile_toolbutton->setIcon(QIcon::fromTheme(qsl("edit-copy"), QIcon(qsl(":/icons/edit-copy.png"))));
         copy_profile_toolbutton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
         mpCopyProfile->setIcon(QIcon::fromTheme(qsl("edit-copy"), QIcon(qsl(":/icons/edit-copy.png"))));
-
-        QTextCursor cursor = pWelcome_document->find(qsl("NEW_PROFILE_ICON"), 0, QTextDocument::FindWholeWords);
-        // The indicated piece of marker text should be selected by the cursor
-        Q_ASSERT_X(
-                !cursor.isNull(), "dlgConnectionProfiles::dlgConnectionProfiles(...)", "NEW_PROFILE_ICON text marker not found in welcome_message text for when icons are shown on dialogue buttons");
-        // Remove the marker:
-        cursor.removeSelectedText();
-        // Insert the current icon image into the same place:
-        QImage const image_new(QPixmap(icon_new.pixmap(new_profile_button->iconSize())).toImage());
-        cursor.insertImage(image_new);
-        cursor.clearSelection();
-
-        cursor = pWelcome_document->find(qsl("CONNECT_PROFILE_ICON"), 0, QTextDocument::FindWholeWords);
-        Q_ASSERT_X(!cursor.isNull(),
-                   "dlgConnectionProfiles::dlgConnectionProfiles(...)",
-                   "CONNECT_PROFILE_ICON text marker not found in welcome_message text for when icons are shown on dialogue buttons");
-        cursor.removeSelectedText();
-        QImage const image_connect(QPixmap(icon_connect.pixmap(connect_button->iconSize())).toImage());
-        cursor.insertImage(image_connect);
-        cursor.clearSelection();
-    } else {
-        pWelcome_document->setHtml(qsl("<html><head/><body>%1</body></html>").arg(Welcome_text_template.arg(QString(), QString())));
     }
 
+    pWelcome_document->setHtml(qsl("<html><head/><body>%1</body></html>").arg(Welcome_text_template));
     welcome_message->setDocument(pWelcome_document);
+    welcome_message->setOpenLinks(false);
+    welcome_message->setOpenExternalLinks(false);
+
+    connect(welcome_message, &QTextBrowser::anchorClicked, this, [this](const QUrl& link) {
+        if (link.toString() == qsl("mudlet-tutorial")) {
+            mTutorialDismissed = true;
+            profile_name_entry->setText(qsl("Mudlet Tutorial"));
+            host_name_entry->setText(qsl("localhost"));
+            port_entry->setText(qsl("0"));
+            validName = true;
+            validUrl = true;
+            validPort = true;
+            loadProfile(true);
+        }
+    });
 
     mpAction_revealPassword = new QAction(this);
     mpAction_revealPassword->setCheckable(true);
@@ -222,7 +328,7 @@ dlgConnectionProfiles::dlgConnectionProfiles(QWidget* parent)
     slot_togglePasswordVisibility(false);
 
     character_password_entry->addAction(mpAction_revealPassword, QLineEdit::TrailingPosition);
-    if (mudlet::self()->storingPasswordsSecurely()) {
+    if (MudletApp::storingPasswordsSecurely()) {
         character_password_entry->setToolTip(utils::richText(tr("Characters password, stored securely in the computer's credential manager")));
     } else {
         character_password_entry->setToolTip(utils::richText(tr("Characters password. Note that the password is not encrypted in storage")));
@@ -236,20 +342,48 @@ dlgConnectionProfiles::dlgConnectionProfiles(QWidget* parent)
     connect(mpCopyProfile, &QAction::triggered, this, &dlgConnectionProfiles::slot_copyProfile);
     connect(copyProfileSettings, &QAction::triggered, this, &dlgConnectionProfiles::slot_copyOnlySettingsOfProfile);
     connect(remove_profile_button, &QAbstractButton::clicked, this, &dlgConnectionProfiles::slot_deleteProfile);
-    connect(profile_name_entry, &QLineEdit::textEdited, this, &dlgConnectionProfiles::slot_updateName);
+    connect(profile_name_entry, &QLineEdit::textChanged, this, &dlgConnectionProfiles::slot_updateName);
     connect(profile_name_entry, &QLineEdit::editingFinished, this, &dlgConnectionProfiles::slot_saveName);
     connect(host_name_entry, &QLineEdit::textChanged, this, &dlgConnectionProfiles::slot_updateUrl);
     connect(port_entry, &QLineEdit::textChanged, this, &dlgConnectionProfiles::slot_updatePort);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
+    connect(port_ssl_tsl, &QCheckBox::checkStateChanged, this, &dlgConnectionProfiles::slot_updateSslTslPort);
+    connect(autologin_checkBox, &QCheckBox::checkStateChanged, this, &dlgConnectionProfiles::slot_updateAutoConnect);
+    connect(auto_reconnect, &QCheckBox::checkStateChanged, this, &dlgConnectionProfiles::slot_updateAutoReconnect);
+#else
     connect(port_ssl_tsl, &QCheckBox::stateChanged, this, &dlgConnectionProfiles::slot_updateSslTslPort);
     connect(autologin_checkBox, &QCheckBox::stateChanged, this, &dlgConnectionProfiles::slot_updateAutoConnect);
     connect(auto_reconnect, &QCheckBox::stateChanged, this, &dlgConnectionProfiles::slot_updateAutoReconnect);
+#endif
     connect(login_entry, &QLineEdit::textEdited, this, &dlgConnectionProfiles::slot_updateLogin);
-    connect(character_password_entry, &QLineEdit::textEdited, this, &dlgConnectionProfiles::slot_updatePassword);
-    connect(mud_description_textedit, &QPlainTextEdit::textChanged, this, &dlgConnectionProfiles::slot_updateDescription);
-    connect(profiles_tree_widget, &QListWidget::currentItemChanged, this, &dlgConnectionProfiles::slot_itemClicked);
-    connect(profiles_tree_widget, &QListWidget::itemDoubleClicked, this, &dlgConnectionProfiles::accept);
+    // Use textChanged with timer debouncing to avoid saving on every keystroke
+    connect(character_password_entry, &QLineEdit::textChanged, this, &dlgConnectionProfiles::slot_passwordTextChanged);
 
-    connect(discord_optin_checkBox, &QCheckBox::stateChanged, this, &dlgConnectionProfiles::slot_updateDiscordOptIn);
+    // Listen for password migration completion to refresh the form
+    connect(mudlet::self(), &mudlet::signal_passwordsMigratedToSecure, this, [this]() {
+        // Refresh the current profile's password field after migration; this
+        // is not the user picking a game so keep the welcome message up
+        mProgrammaticProfileSelection = true;
+        slot_itemClicked(listWidget_profiles->currentItem());
+        mProgrammaticProfileSelection = false;
+    });
+
+    // Listen for character password migration completion to refresh the form
+    connect(mudlet::self(), &mudlet::signal_characterPasswordsMigrated, this, [this]() {
+        // Refresh the current profile's password field after migration; this
+        // is not the user picking a game so keep the welcome message up
+        mProgrammaticProfileSelection = true;
+        slot_itemClicked(listWidget_profiles->currentItem());
+        mProgrammaticProfileSelection = false;
+    });
+
+    connect(mud_description_textedit, &QPlainTextEdit::textChanged, this, &dlgConnectionProfiles::slot_updateDescription);
+    connect(listWidget_profiles, &QListWidget::currentItemChanged, this, &dlgConnectionProfiles::slot_itemClicked);
+    // clicking the item that is already current (a profile gets pre-selected
+    // before the dialog is shown) does not change the current item, so it
+    // still needs to reveal the connection details on a fresh install
+    connect(listWidget_profiles, &QListWidget::itemClicked, this, &dlgConnectionProfiles::revealConnectionDetails);
+    connect(listWidget_profiles, &QListWidget::itemDoubleClicked, this, &dlgConnectionProfiles::accept);
 
     // website_entry atm is only a label
     //connect(website_entry, SIGNAL(textEdited(const QString)), this, SLOT(slot_updateWebsite(const QString)));
@@ -270,7 +404,7 @@ dlgConnectionProfiles::dlgConnectionProfiles(QWidget* parent)
     mOKPalette.setColor(QPalette::Base, QColor(150, 255, 150, 50));
     mErrorPalette.setColor(QPalette::Base, QColor(255, 150, 150, 50));
 
-    profiles_tree_widget->setViewMode(QListView::IconMode);
+    listWidget_profiles->setViewMode(QListView::IconMode);
 
     btn_load_enabled_accessDesc = tr("Click to load but not connect the selected profile.");
     btn_connect_enabled_accessDesc = tr("Click to load and connect the selected profile.");
@@ -293,11 +427,65 @@ dlgConnectionProfiles::dlgConnectionProfiles(QWidget* parent)
     mSearchTextTimer.setSingleShot(true);
     QCoreApplication::instance()->installEventFilter(this);
     connect(&mSearchTextTimer, &QTimer::timeout, this, &dlgConnectionProfiles::slot_reenableAllProfileItems);
+
+    profile_history->view()->setTextElideMode(Qt::ElideNone);
 }
 
 dlgConnectionProfiles::~dlgConnectionProfiles()
 {
-    QCoreApplication::instance()->removeEventFilter(this);
+    // ~QDialog hides the dialog once this destructor is done, and the profile
+    // name field reacts to losing the focus by emitting editingFinished() into
+    // slot_saveName() when this object is no longer a valid receiver (#9574)
+    widgetutils::disconnectChildSignals(this);
+
+    if (mPasswordSaveTimer) {
+        mPasswordSaveTimer->stop();
+    }
+    mPendingPasswordSaveProfile.clear();
+
+    // Clear any pending operation flags
+    mKeychainOperationProfile.clear();
+    mPendingProfileLoad.clear();
+
+    // Check if QCoreApplication is still valid during shutdown
+    if (QCoreApplication::instance()) {
+        QCoreApplication::instance()->removeEventFilter(this);
+    }
+}
+
+// Restores the widgets that the first-launch tutorial invitation hides, so
+// every path out of the invitation (Skip button, New profile) leaves the
+// dialog in its regular state - bar the keyboard focus, which hiding those
+// widgets scatters and each caller has to claim for itself:
+void dlgConnectionProfiles::dismissTutorialInvitation()
+{
+    mTutorialDismissed = true;
+    if (!widget_topLeft->isHidden()) {
+        // the invitation is not up, so there is nothing to restore - and the
+        // resize below would make the dialog jump in size for no reason
+        return;
+    }
+    widget_topLeft->show();
+    welcome_message->hide();
+    tabWidget_connectionInfo->show();
+    informationArea->show();
+    mpSkipToGamesButton->hide();
+    connect_button->show();
+    offline_button->show();
+    // The invitation shrank the dialog to fit its short message; size the
+    // restored full interface from its own layout instead:
+    resize(sizeHint().expandedTo(minimumSize()));
+}
+
+void dlgConnectionProfiles::slot_skipToGamesList()
+{
+    dismissTutorialInvitation();
+    const auto items = findData(*listWidget_profiles, qsl("Mudlet Tutorial"), csmNameRole);
+    if (!items.isEmpty()) {
+        listWidget_profiles->setCurrentItem(items.first());
+    }
+    // Hiding the invitation passed the focus down the chain to the name field
+    listWidget_profiles->setFocus();
 }
 
 // the dialog can be accepted by pressing Enter on an qlineedit; this is a safeguard against it
@@ -305,17 +493,127 @@ dlgConnectionProfiles::~dlgConnectionProfiles()
 void dlgConnectionProfiles::accept()
 {
     if (validName && validUrl && validPort) {
-        setVisible(false);
-        // This is needed to make the above take effect as fast as possible:
-        qApp->processEvents();
-        loadProfile(true);
-        QDialog::accept();
+        // Hiding the dialog is left to ensurePasswordLoadedThenConnect(): a load that has to wait
+        // for the keychain keeps it on screen instead
+        ensurePasswordLoadedThenConnect(true);
     }
+}
+
+void dlgConnectionProfiles::slot_load()
+{
+    ensurePasswordLoadedThenConnect(false);
+}
+
+void dlgConnectionProfiles::ensurePasswordLoadedThenConnect(bool alsoConnect)
+{
+    const QString profile_name = profile_name_entry->text().trimmed();
+
+    if (profile_name.isEmpty()) {
+        QDialog::accept();
+        return;
+    }
+
+    // Check if we have any pending keychain operations for this profile
+    if (hasPendingKeychainOperation(profile_name)) {
+        // Queue the profile loading until keychain completes
+        mPendingConnect = alsoConnect;
+        mPendingProfileLoad = profile_name;
+        // That read can be sitting behind a system prompt for as long as the user takes to
+        // answer it: a hidden dialog would leave nothing on screen to explain the wait
+        showKeychainWait();
+        return; // Will be handled by keychain callback
+    }
+
+    // No pending keychain operations, proceed immediately
+    setVisible(false);
+    // This is needed to make the above take effect as fast as possible:
+    qApp->processEvents();
+
+    loadProfile(alsoConnect);
+    QDialog::accept();
+}
+
+void dlgConnectionProfiles::showKeychainWait()
+{
+    mKeychainWaitShown = true;
+    connect_button->setEnabled(false);
+    offline_button->setEnabled(false);
+    // Picking another profile now would be ignored - slot_loadPasswordAsync() returns while a read
+    // is in flight - and would leave the queued load pointing at the profile that was left behind.
+    // A disabled list gets no key events either, so the type-to-search stops with it.
+    listWidget_profiles->setEnabled(false);
+    // An edit would run validateProfile(), which hands Connect and Offline back and clears the
+    // notice below, and what the queued load reads from these fields is what they held at Connect
+    tabWidget_connectionInfo->setEnabled(false);
+    profileAdminArea->setEnabled(false);
+    //: Shown in the connection dialog while the profile's password is being fetched from the system keychain
+    showNotification(tr("Waiting for the keychain..."), notificationAreaIconLabelInformation);
+}
+
+void dlgConnectionProfiles::clearKeychainWait()
+{
+    if (!mKeychainWaitShown) {
+        return;
+    }
+
+    mKeychainWaitShown = false;
+    clearNotificationArea();
+    // the wait only ever took away buttons that a profile passing validation had enabled
+    const bool profileIsUsable = validName && validUrl && validPort;
+    connect_button->setEnabled(profileIsUsable);
+    offline_button->setEnabled(profileIsUsable);
+    listWidget_profiles->setEnabled(true);
+    tabWidget_connectionInfo->setEnabled(true);
+    profileAdminArea->setEnabled(true);
+}
+
+bool dlgConnectionProfiles::completePendingProfileLoad(const QString& profileName)
+{
+    if (mPendingProfileLoad.isEmpty() || mPendingProfileLoad != profileName) {
+        return false;
+    }
+
+    qDebug() << "dlgConnectionProfiles: Password load completed, proceeding with pending connection for" << profileName;
+
+    const bool shouldConnect = mPendingConnect;
+    // cleared before the load, as the processEvents() below can deliver the answer of another
+    // read, which must not find it still queued and run it a second time
+    mPendingProfileLoad.clear();
+    mPendingConnect = false;
+
+    // the dialog stayed up while the keychain was busy, so this is where the wait ends and the
+    // dialog goes away
+    clearKeychainWait();
+    setVisible(false);
+    // This is needed to make the above take effect as fast as possible - the profile load below
+    // is synchronous, so without this the hidden dialog is still on screen throughout it:
+    qApp->processEvents();
+
+    loadProfile(shouldConnect);
+    QDialog::accept();
+    return true;
+}
+
+// Nothing is queued for the profile whose read answered: drop whatever is, rather than let a
+// later read connect out of nowhere, and hand the dialog its buttons back so Connect can be
+// pressed again
+void dlgConnectionProfiles::abandonPendingProfileLoad()
+{
+    mPendingProfileLoad.clear();
+    mPendingConnect = false;
+    clearKeychainWait();
+}
+
+bool dlgConnectionProfiles::hasPendingKeychainOperation(const QString& profile_name) const
+{
+    // Only a read of this profile's own password is worth waiting for: queued behind another
+    // profile's, the load would be dropped when that read answers
+    return !profile_name.isEmpty() && mKeychainOperationProfile == profile_name;
 }
 
 void dlgConnectionProfiles::slot_updateDescription()
 {
-    QListWidgetItem* pItem = profiles_tree_widget->currentItem();
+    QListWidgetItem* pItem = listWidget_profiles->currentItem();
 
     if (pItem) {
         const QString description = mud_description_textedit->toPlainText();
@@ -327,7 +625,7 @@ void dlgConnectionProfiles::slot_updateDescription()
 
 void dlgConnectionProfiles::indicatePackagesInstallOnConnect(QStringList packages)
 {
-    if (!packages.length()) {
+    if (packages.isEmpty()) {
         return;
     }
 
@@ -338,10 +636,10 @@ void dlgConnectionProfiles::indicatePackagesInstallOnConnect(QStringList package
     packageInfoLayout->setContentsMargins(8, 8, 8, 8);
     packageGroupBox->setStyleSheet("QGroupBox:title { padding-left: 8px; }");
 
-    for (const QString &package : packages) {
+    for (const QString& package : packages) {
         QFileInfo fileInfo(package);
         QString packageName = fileInfo.baseName();
-        QLabel *packageLabel = new QLabel(packageName);
+        QLabel* packageLabel = new QLabel(packageName);
         packageInfoLayout->addWidget(packageLabel);
     }
 
@@ -351,7 +649,7 @@ void dlgConnectionProfiles::indicatePackagesInstallOnConnect(QStringList package
 // Not used:
 //void dlgConnectionProfiles::slot_updateWebsite(const QString& url)
 //{
-//    QListWidgetItem* pItem = profiles_tree_widget->currentItem();
+//    QListWidgetItem* pItem = listWidget_profiles->currentItem();
 //    if (pItem) {
 //        writeProfileData(pItem->data(csmNameRole).toString(), qsl("website"), url);
 //    }
@@ -359,68 +657,103 @@ void dlgConnectionProfiles::indicatePackagesInstallOnConnect(QStringList package
 
 void dlgConnectionProfiles::slot_updatePassword(const QString& pass)
 {
-    QListWidgetItem* pItem = profiles_tree_widget->currentItem();
+    QListWidgetItem* pItem = listWidget_profiles->currentItem();
     if (!pItem) {
         return;
     }
 
-    if (mudlet::self()->storingPasswordsSecurely()) {
-        writeSecurePassword(pItem->data(csmNameRole).toString(), pass);
+    const QString profileName = pItem->data(csmNameRole).toString();
+
+    if (MudletApp::storingPasswordsSecurely()) {
+        if (pass.trimmed().isEmpty()) {
+            // If password is empty, remove it from secure storage
+            deleteSecurePassword(profileName);
+        } else {
+            // Store the password securely
+            writeSecurePassword(profileName, pass);
+        }
     } else {
-        writeProfileData(pItem->data(csmNameRole).toString(), qsl("password"), pass);
+        auto result = MudletApp::writeProfileData(profileName, qsl("password"), pass);
+        if (!result.first) {
+            qWarning().noquote().nospace() << "dlgConnectionProfiles::slot_updatePassword() ERROR - failed to save password for profile \"" << profileName << "\": " << result.second;
+        }
     }
 }
 
-void dlgConnectionProfiles::writeSecurePassword(const QString& profile, const QString& pass) const
+void dlgConnectionProfiles::writeSecurePassword(const QString& profile, const QString& pass)
 {
-    auto* job = new QKeychain::WritePasswordJob(qsl("Mudlet profile"));
-    job->setAutoDelete(false);
-    job->setInsecureFallback(false);
+    // Validate that we have a password to store
+    if (pass.trimmed().isEmpty()) {
+        qDebug() << "dlgConnectionProfiles: Skipping storage of empty password for profile" << profile;
+        return;
+    }
 
-    job->setKey(profile);
-    job->setTextData(pass);
-    job->setProperty("profile", profile);
+    // Use async API for QtKeychain integration with file fallback
+    auto* credManager = new CredentialManager(this);
+    QPointer<dlgConnectionProfiles> safeThis = this;
 
-    connect(job, &QKeychain::WritePasswordJob::finished, this, &dlgConnectionProfiles::slot_passwordSaved);
+    credManager->storePassword(profile, "character", pass, [credManager, profile, safeThis](bool success, const QString& errorMessage) {
+        if (success) {
+            qDebug() << "dlgConnectionProfiles: Successfully stored password for profile" << profile;
+            // The store reports success even if other accounts can still read the file, so check separately,
+            // asking the manager that did this store so the answer is about this password.
+            const QString unprotectedPath = credManager->unprotectedSecretPath();
 
-    job->start();
+            if (!unprotectedPath.isEmpty() && safeThis) {
+                //: Shown in the connection dialog when a password was saved but its file could not be made unreadable to other users of the computer. %1 is a profile name.
+                safeThis->showNotification(tr("The password for '%1' was saved, but other accounts on this computer can still read it.").arg(profile), safeThis->notificationAreaIconLabelWarning);
+            }
+        } else {
+            qWarning() << "dlgConnectionProfiles: Failed to store password for profile" << profile << ":" << errorMessage;
+        }
+
+        // Clean up the credential manager
+        credManager->deleteLater();
+    });
 }
 
-void dlgConnectionProfiles::deleteSecurePassword(const QString& profile) const
+void dlgConnectionProfiles::deleteSecurePassword(const QString& profile)
 {
-    auto* job = new QKeychain::DeletePasswordJob(qsl("Mudlet profile"));
-    job->setAutoDelete(false);
-    job->setInsecureFallback(false);
+    // Use async API for QtKeychain integration with file fallback
+    auto* credManager = new CredentialManager(this);
 
-    job->setKey(profile);
-    job->setProperty("profile", profile);
+    credManager->removePassword(profile, "character", [credManager, profile](bool success, const QString& errorMessage) {
+        if (success) {
+            qDebug() << "dlgConnectionProfiles: Successfully removed password for profile" << profile;
+        } else {
+            qWarning() << "dlgConnectionProfiles: Failed to remove password for profile" << profile << ":" << errorMessage;
+        }
 
-    connect(job, &QKeychain::WritePasswordJob::finished, this, &dlgConnectionProfiles::slot_passwordDeleted);
-
-    job->start();
+        // Clean up the credential manager
+        credManager->deleteLater();
+    });
 }
 
 void dlgConnectionProfiles::slot_updateLogin(const QString& login)
 {
-    QListWidgetItem* pItem = profiles_tree_widget->currentItem();
+    QListWidgetItem* pItem = listWidget_profiles->currentItem();
     if (pItem) {
-        writeProfileData(pItem->data(csmNameRole).toString(), qsl("login"), login);
+        const QString profileName = pItem->data(csmNameRole).toString();
+        auto result = MudletApp::writeProfileData(profileName, qsl("login"), login);
+        if (!result.first) {
+            qWarning().noquote().nospace() << "dlgConnectionProfiles::slot_updateLogin() ERROR - failed to save character name for profile \"" << profileName << "\": " << result.second;
+            // Could optionally show user notification here
+        }
     }
 }
 
 void dlgConnectionProfiles::slot_updateUrl(const QString& url)
 {
     if (url.isEmpty()) {
-        validUrl = false;
-        offline_button->setEnabled(false);
-        connect_button->setEnabled(false);
-        offline_button->setAccessibleDescription(btn_connOrLoad_disabled_accessDesc);
-        connect_button->setAccessibleDescription(btn_connOrLoad_disabled_accessDesc);
+        // Nothing to write out, but the buttons and the notification area still
+        // have to be brought up to date - and Offline stays available, as
+        // opening a profile does not need a server address
+        validateProfile();
         return;
     }
 
     if (validateProfile()) {
-        QListWidgetItem* pItem = profiles_tree_widget->currentItem();
+        QListWidgetItem* pItem = listWidget_profiles->currentItem();
         if (!pItem) {
             return;
         }
@@ -430,7 +763,7 @@ void dlgConnectionProfiles::slot_updateUrl(const QString& url)
 
 void dlgConnectionProfiles::slot_updateAutoConnect(int state)
 {
-    QListWidgetItem* pItem = profiles_tree_widget->currentItem();
+    QListWidgetItem* pItem = listWidget_profiles->currentItem();
     if (!pItem) {
         return;
     }
@@ -439,37 +772,11 @@ void dlgConnectionProfiles::slot_updateAutoConnect(int state)
 
 void dlgConnectionProfiles::slot_updateAutoReconnect(int state)
 {
-    QListWidgetItem* pItem = profiles_tree_widget->currentItem();
+    QListWidgetItem* pItem = listWidget_profiles->currentItem();
     if (!pItem) {
         return;
     }
     writeProfileData(pItem->data(csmNameRole).toString(), qsl("autoreconnect"), QString::number(state));
-}
-
-// This gets called when the QCheckBox that it is connect-ed to gets its
-// checked state set programmatically AS WELL as when the user clicks on it:
-void dlgConnectionProfiles::slot_updateDiscordOptIn(int state)
-{
-    QListWidgetItem* pItem = profiles_tree_widget->currentItem();
-    if (!pItem) {
-        return;
-    }
-    writeProfileData(pItem->data(csmNameRole).toString(), qsl("discordserveroptin"), QString::number(state));
-
-    // in case the user is already connected, pull up stored GMCP data
-    auto& hostManager = mudlet::self()->getHostManager();
-    auto pHost = hostManager.getHost(profile_name_entry->text());
-    if (!pHost) {
-        return;
-    }
-
-    if (state == Qt::Checked) {
-        pHost->mDiscordDisableServerSide = false;
-        pHost->mTelnet.requestDiscordInfo();
-    } else {
-        pHost->mDiscordDisableServerSide = true;
-        pHost->clearDiscordData();
-    }
 }
 
 void dlgConnectionProfiles::slot_updatePort(const QString& ignoreBlank)
@@ -477,20 +784,12 @@ void dlgConnectionProfiles::slot_updatePort(const QString& ignoreBlank)
     const QString port = port_entry->text().trimmed();
 
     if (ignoreBlank.isEmpty()) {
-        validPort = false;
-        if (offline_button) {
-            offline_button->setEnabled(false);
-            offline_button->setAccessibleDescription(btn_connOrLoad_disabled_accessDesc);
-        }
-        if (connect_button) {
-            connect_button->setEnabled(false);
-            connect_button->setAccessibleDescription(btn_connOrLoad_disabled_accessDesc);
-        }
+        validateProfile();
         return;
     }
 
     if (validateProfile()) {
-        QListWidgetItem* pItem = profiles_tree_widget->currentItem();
+        QListWidgetItem* pItem = listWidget_profiles->currentItem();
         if (!pItem) {
             return;
         }
@@ -501,7 +800,7 @@ void dlgConnectionProfiles::slot_updatePort(const QString& ignoreBlank)
 void dlgConnectionProfiles::slot_updateSslTslPort(int state)
 {
     if (validateProfile()) {
-        QListWidgetItem* pItem = profiles_tree_widget->currentItem();
+        QListWidgetItem* pItem = listWidget_profiles->currentItem();
         if (!pItem) {
             return;
         }
@@ -517,7 +816,7 @@ void dlgConnectionProfiles::slot_updateName(const QString& newName)
 
 void dlgConnectionProfiles::slot_saveName()
 {
-    QListWidgetItem* pItem = profiles_tree_widget->currentItem();
+    QListWidgetItem* pItem = listWidget_profiles->currentItem();
     const QString newProfileName = profile_name_entry->text().trimmed();
     const QString newProfileHost = host_name_entry->text().trimmed();
     const QString newProfilePort = port_entry->text().trimmed();
@@ -529,30 +828,152 @@ void dlgConnectionProfiles::slot_saveName()
     }
 
     const QString currentProfileEditName = pItem->data(csmNameRole).toString();
-    const int row = mProfileList.indexOf(currentProfileEditName);
-    if ((row >= 0) && (row < mProfileList.size())) {
-        mProfileList[row] = newProfileName;
-    } else {
-        mProfileList << newProfileName;
-    }
-
     // don't do anything if this was just a normal click, and not an edit of any sort
     if (currentProfileEditName == newProfileName) {
         return;
     }
 
-    if (mudlet::self()->storingPasswordsSecurely()) {
+    // Check for orphaned keychain entries when creating a new profile with a name
+    // that doesn't exist as a directory but might have keychain entries from
+    // a previously deleted profile (deleted outside Mudlet interface)
+    if (MudletApp::storingPasswordsSecurely() && currentProfileEditName == tr("new profile name") && !QDir(MudletApp::getMudletPath(enums::profileHomePath, newProfileName)).exists()) {
+        // Check if there are orphaned keychain entries for this profile name
+        // Use QPointer to safely detect if dialog or credManager is destroyed during async operations
+        // Create CredentialManager without a parent to avoid destruction when dialog closes
+        QPointer<dlgConnectionProfiles> safeThis = this;
+        QPointer<CredentialManager> safeCredManager = new CredentialManager(nullptr);
+
+        safeCredManager->retrievePassword(
+                newProfileName,
+                "character",
+                [safeThis, safeCredManager, currentProfileEditName, newProfileName, newProfileHost, newProfilePort, newProfileSslTsl](
+                        bool foundCharacterEntry, const QString& characterPassword, const QString& errorMessage) {
+                    Q_UNUSED(characterPassword)
+                    Q_UNUSED(errorMessage)
+
+                    // Check if credManager was destroyed
+                    if (!safeCredManager) {
+                        qWarning() << "dlgConnectionProfiles: CredentialManager destroyed during keychain operation, aborting";
+                        return;
+                    }
+
+                    // Check if dialog was destroyed during async operation
+                    if (!safeThis) {
+                        qWarning() << "dlgConnectionProfiles: Dialog destroyed during keychain operation, aborting";
+                        safeCredManager->deleteLater();
+                        return;
+                    }
+
+                    safeCredManager->retrievePassword(
+                            newProfileName,
+                            "proxy",
+                            [safeThis, safeCredManager, currentProfileEditName, newProfileName, newProfileHost, newProfilePort, newProfileSslTsl, foundCharacterEntry](
+                                    bool foundProxyEntry, const QString& proxyPassword, const QString& errorMessage) {
+                                Q_UNUSED(proxyPassword)
+                                Q_UNUSED(errorMessage)
+
+                                // Check if credManager was destroyed
+                                if (!safeCredManager) {
+                                    qWarning() << "dlgConnectionProfiles: CredentialManager destroyed during keychain operation, aborting";
+                                    return;
+                                }
+
+                                // Check if dialog was destroyed during async operation
+                                if (!safeThis) {
+                                    qWarning() << "dlgConnectionProfiles: Dialog destroyed during keychain operation, aborting";
+                                    safeCredManager->deleteLater();
+                                    return;
+                                }
+
+                                // Define a helper lambda to continue after cleanup is done
+                                // CredentialManager only supports one operation at a time, so we must chain removals
+                                // Captures QPointers to safely detect if dialog or credManager has been destroyed
+                                // -- each must be checked for null before use
+                                auto continueAfterCleanup = [safeThis, safeCredManager, currentProfileEditName, newProfileName, newProfileHost, newProfilePort, newProfileSslTsl]() {
+                                    // Clean up credManager if still valid
+                                    if (safeCredManager) {
+                                        safeCredManager->deleteLater();
+                                    }
+
+                                    // Final safety check before accessing dialog members
+                                    if (!safeThis) {
+                                        qWarning() << "dlgConnectionProfiles: Dialog destroyed before continueProfileSave, aborting";
+                                        return;
+                                    }
+
+                                    // Find the current item by the old profile name instead of using a captured pointer
+                                    auto items = safeThis->findData(*safeThis->listWidget_profiles, currentProfileEditName, csmNameRole);
+                                    if (items.isEmpty()) {
+                                        qWarning() << "dlgConnectionProfiles: Could not find profile item for" << currentProfileEditName << "after async operation";
+                                        return;
+                                    }
+
+                                    safeThis->continueProfileSave(items.first(), newProfileName, newProfileHost, newProfilePort, newProfileSslTsl);
+                                };
+
+                                // If we found any orphaned entries, clean them up (chained to avoid lost callbacks)
+                                if (foundCharacterEntry && foundProxyEntry) {
+                                    // Both need cleanup - chain them
+                                    safeCredManager->removePassword(newProfileName, "character", [safeCredManager, newProfileName, continueAfterCleanup](bool success, const QString& errorMessage) {
+                                        if (!success) {
+                                            qWarning() << "dlgConnectionProfiles: Failed to clean up orphaned character password for" << newProfileName << ":" << errorMessage;
+                                        }
+                                        // Check credManager before chaining next operation
+                                        if (!safeCredManager) {
+                                            qWarning() << "dlgConnectionProfiles: CredentialManager destroyed, cannot clean up proxy password";
+                                            continueAfterCleanup();
+                                            return;
+                                        }
+                                        // Now clean up proxy (chained)
+                                        safeCredManager->removePassword(newProfileName, "proxy", [newProfileName, continueAfterCleanup](bool proxySuccess, const QString& proxyError) {
+                                            if (!proxySuccess) {
+                                                qWarning() << "dlgConnectionProfiles: Failed to clean up orphaned proxy password for" << newProfileName << ":" << proxyError;
+                                            }
+                                            continueAfterCleanup();
+                                        });
+                                    });
+                                } else if (foundCharacterEntry) {
+                                    safeCredManager->removePassword(newProfileName, "character", [newProfileName, continueAfterCleanup](bool success, const QString& errorMessage) {
+                                        if (!success) {
+                                            qWarning() << "dlgConnectionProfiles: Failed to clean up orphaned character password for" << newProfileName << ":" << errorMessage;
+                                        }
+                                        continueAfterCleanup();
+                                    });
+                                } else if (foundProxyEntry) {
+                                    safeCredManager->removePassword(newProfileName, "proxy", [newProfileName, continueAfterCleanup](bool success, const QString& errorMessage) {
+                                        if (!success) {
+                                            qWarning() << "dlgConnectionProfiles: Failed to clean up orphaned proxy password for" << newProfileName << ":" << errorMessage;
+                                        }
+                                        continueAfterCleanup();
+                                    });
+                                } else {
+                                    // No cleanup needed
+                                    continueAfterCleanup();
+                                }
+                            });
+                });
+
+        return; // Exit here - continueProfileSave will be called from the callback
+    }
+
+    if (MudletApp::storingPasswordsSecurely()) {
         migrateSecuredPassword(currentProfileEditName, newProfileName);
     }
 
+    continueProfileSave(pItem, newProfileName, newProfileHost, newProfilePort, newProfileSslTsl);
+}
+
+void dlgConnectionProfiles::continueProfileSave(QListWidgetItem* pItem, const QString& newProfileName, const QString& newProfileHost, const QString& newProfilePort, const int newProfileSslTsl)
+{
+    const QString currentProfileEditName = pItem->data(csmNameRole).toString();
     setItemName(pItem, newProfileName);
 
-    const QDir currentPath(mudlet::getMudletPath(mudlet::profileHomePath, currentProfileEditName));
+    const QDir currentPath(MudletApp::getMudletPath(enums::profileHomePath, currentProfileEditName));
     const QDir dir;
 
     if (currentPath.exists()) {
         // CHECKME: previous code specified a path ending in a '/'
-        QDir parentpath(mudlet::getMudletPath(mudlet::profilesPath));
+        QDir parentpath(MudletApp::getMudletPath(enums::profilesPath));
         if (!parentpath.rename(currentProfileEditName, newProfileName)) {
             notificationArea->show();
             notificationAreaIconLabelWarning->show();
@@ -561,7 +982,7 @@ void dlgConnectionProfiles::slot_saveName()
             notificationAreaMessageBox->show();
             notificationAreaMessageBox->setText(tr("Could not rename your profile data on the computer."));
         }
-    } else if (!dir.mkpath(mudlet::getMudletPath(mudlet::profileHomePath, newProfileName))) {
+    } else if (!dir.mkpath(MudletApp::getMudletPath(enums::profileHomePath, newProfileName))) {
         notificationArea->show();
         notificationAreaIconLabelWarning->show();
         notificationAreaIconLabelError->hide();
@@ -581,7 +1002,7 @@ void dlgConnectionProfiles::slot_saveName()
     slot_updateSslTslPort(newProfileSslTsl);
 
     // if this was a previously deleted profile, restore it
-    auto& settings = *mudlet::self()->mpSettings;
+    auto& settings = *MudletApp::getQSettings();
     auto deletedDefaultMuds = settings.value(qsl("deletedDefaultMuds"), QStringList()).toStringList();
     if (deletedDefaultMuds.contains(newProfileName)) {
         deletedDefaultMuds.removeOne(newProfileName);
@@ -589,12 +1010,12 @@ void dlgConnectionProfiles::slot_saveName()
         // run fillout_form to re-create the default profile icon and description
         fillout_form();
         // and re-select the profile since focus is lost
-        auto pRestoredItems = findData(*profiles_tree_widget, newProfileName, csmNameRole);
-        Q_ASSERT_X(pRestoredItems.count() == 1, "dlgConnectionProfiles::slot_saveName", "Couldn't find exactly 1 restored profile to select");
+        auto pRestoredItems = findData(*listWidget_profiles, newProfileName, csmNameRole);
+        Q_ASSERT_X(pRestoredItems.count() == 1, "dlgConnectionProfiles::continueProfileSave", "Couldn't find exactly 1 restored profile to select");
 
         // As we are using QAbstractItemView::SingleSelection this will
         // automatically unselect the previous item:
-        profiles_tree_widget->setCurrentItem(pRestoredItems.first());
+        listWidget_profiles->setCurrentItem(pRestoredItems.first());
         slot_itemClicked(pRestoredItems.first());
     } else {
         setItemName(pItem, newProfileName);
@@ -602,34 +1023,80 @@ void dlgConnectionProfiles::slot_saveName()
     }
 }
 
+bool dlgConnectionProfiles::showingOnlyMyProfiles() const
+{
+    // the tab bar is hidden for dedicated single-game builds, which list their
+    // own game(s) unfiltered
+    return !mpTabBar->isHidden() && mpTabBar->currentIndex() == scmMyGamesTab;
+}
+
+void dlgConnectionProfiles::slot_activeTabChanged(const int index)
+{
+    MudletApp::getQSettings()->setValue(qsl("connectionDialogActiveTab"), index);
+
+    const auto* pCurrentItem = listWidget_profiles->currentItem();
+    const QString previousSelection = pCurrentItem ? pCurrentItem->data(csmNameRole).toString() : QString();
+
+    fillout_form();
+
+    if (previousSelection.isEmpty()) {
+        return;
+    }
+    // keep the same game selected if the newly shown tab also lists it,
+    // otherwise the automatic selection made by fillout_form() stands
+    const auto pPreviousItems = findData(*listWidget_profiles, previousSelection, csmNameRole);
+    if (!pPreviousItems.isEmpty()) {
+        listWidget_profiles->setCurrentItem(pPreviousItems.first());
+    }
+}
+
+// On a fresh install with no saved profiles the dialog shows the welcome
+// message in place of the connection details; swap them back in and undo the
+// shrink that was applied to fit the welcome message.
+void dlgConnectionProfiles::revealConnectionDetails()
+{
+    if (mProgrammaticProfileSelection || welcome_message->isHidden()) {
+        return;
+    }
+    welcome_message->hide();
+    tabWidget_connectionInfo->show();
+    informationArea->show();
+    if (mDialogHeightBeforeShrink > height()) {
+        resize(width(), mDialogHeightBeforeShrink);
+    }
+}
+
 void dlgConnectionProfiles::slot_addProfile()
 {
     profile_name_entry->setReadOnly(false);
     // while normally handled by fillout_form, due to it's asynchronous nature it is better UX to reset it here
-    character_password_entry->setText(QString());
+    // Block signals to prevent triggering password save for the previously selected profile
+    {
+        const QSignalBlocker blocker(character_password_entry);
+        character_password_entry->setText(QString());
+    }
+    dismissTutorialInvitation();
     fillout_form();
-    welcome_message->hide();
-
-    informationalArea->show();
-    tabWidget_connectionInfo->show();
+    revealConnectionDetails();
 
     const QString newname = tr("new profile name");
 
-    auto pItem = new QListWidgetItem();
+    auto pItem = new (std::nothrow) QListWidgetItem();
     if (!pItem) {
         return;
     }
     setItemName(pItem, newname);
+    // without an icon the item is an invisible blank in the list
+    pItem->setIcon(customIcon(newname, std::nullopt));
 
-    profiles_tree_widget->addItem(pItem);
-
-    // insert newest entry on top of the list as the general sorting
-    // is always newest item first -> fillout->form() filters
-    // this is more practical for the user as they use the same profile most of the time
+    // insert the new entry at the top of the list - appending would bury it
+    // at the bottom, below all the predefined games
+    listWidget_profiles->insertItem(0, pItem);
 
     // As we are using QAbstractItemView::SingleSelection this will
-    // automatically unselect the previous item:
-    profiles_tree_widget->setCurrentItem(pItem);
+    // automatically unselect the previous item, and auto-scroll brings the
+    // new item into view:
+    listWidget_profiles->setCurrentItem(pItem);
 
     profile_name_entry->setText(newname);
     profile_name_entry->setFocus();
@@ -647,60 +1114,181 @@ void dlgConnectionProfiles::slot_addProfile()
     connect_button->setAccessibleDescription(btn_connOrLoad_disabled_accessDesc);
 }
 
-// enables the deletion button once the correct text (profile name) is entered
-void dlgConnectionProfiles::slot_deleteProfileCheck(const QString& text)
+void dlgConnectionProfiles::showRemovalProblem(const QString& message)
 {
-    const QString profile = profiles_tree_widget->currentItem()->data(csmNameRole).toString();
-    if (profile != text) {
-        delete_button->setEnabled(false);
-    } else {
-        delete_button->setEnabled(true);
-        delete_button->setFocus();
-    }
+    showNotification(message, notificationAreaIconLabelWarning);
 }
 
-// actually performs the deletion once the correct text has been entered
-void dlgConnectionProfiles::slot_reallyDeleteProfile()
+void dlgConnectionProfiles::showRemovalNotice(const QString& message)
 {
-    const QString profile = profiles_tree_widget->currentItem()->data(csmNameRole).toString();
-    reallyDeleteProfile(profile);
+    showNotification(message, notificationAreaIconLabelInformation);
+}
+
+void dlgConnectionProfiles::showNotification(const QString& message, QLabel* pIcon)
+{
+    notificationArea->show();
+    for (auto* pCandidate : {notificationAreaIconLabelWarning, notificationAreaIconLabelError, notificationAreaIconLabelInformation}) {
+        pCandidate->setVisible(pCandidate == pIcon);
+    }
+    notificationAreaMessageBox->show();
+    notificationAreaMessageBox->setText(message);
+}
+
+// Kept out of slot_itemClicked() because a removal has to refresh the button
+// without that whole selection path, which ignores a repeat of the same profile
+void dlgConnectionProfiles::updateRemoveButtonState(const QString& profile)
+{
+    if (HostManager::self()->getHost(profile)) {
+        remove_profile_button->setEnabled(false);
+        remove_profile_button->setToolTip(utils::richText(tr("A profile that is in use cannot be removed")));
+        return;
+    }
+
+    if (!profileRemovable(profile)) {
+        remove_profile_button->setEnabled(false);
+        //: %1 is a game name, e.g. Achaea, that has never been played and so has no profile to remove
+        remove_profile_button->setToolTip(utils::richText(tr("Nothing has been saved for %1 yet, so there is nothing to remove").arg(profile)));
+        return;
+    }
+
+    remove_profile_button->setEnabled(true);
+    remove_profile_button->setToolTip(QString());
+}
+
+// "Remove" deletes a profile's own data, and the games catalog goes on offering
+// a pre-installed game either way - so on one that has never been played there
+// is nothing a removal could do. Everything else in the list can be taken out
+// of it: a profile of the user's own, saved or not yet, and the self-test
+// entry, which is listed without data of its own and removed to dismiss it.
+bool dlgConnectionProfiles::profileRemovable(const QString& profile) const
+{
+    const QString profileFolder = profileFolderPath(MudletApp::getMudletPath(enums::profilesPath), profile);
+    if (!profileFolder.isEmpty() && QDir(profileFolder).exists()) {
+        return true;
+    }
+    return profile == scmSelfTestProfile || TGameDetails::findGame(profile) == TGameDetails::scmDefaultGames.end();
 }
 
 void dlgConnectionProfiles::reallyDeleteProfile(const QString& profile)
 {
-    QDir dir(mudlet::getMudletPath(mudlet::profileHomePath, profile));
-    dir.removeRecursively();
-
-    // record the deleted default profile so it does not get re-created in the future
-    auto& settings = *mudlet::self()->mpSettings;
-    auto deletedDefaultMuds = settings.value(qsl("deletedDefaultMuds"), QStringList()).toStringList();
-    if (!deletedDefaultMuds.contains(profile)) {
-        deletedDefaultMuds.append(profile);
+    const QString profilesPath = MudletApp::getMudletPath(enums::profilesPath);
+    const QString profileFolder = profileFolderPath(profilesPath, profile);
+    if (profileFolder.isEmpty()) {
+        qWarning().nospace() << "dlgConnectionProfiles::reallyDeleteProfile(\"" << profile << "\") ERROR - refusing to delete: that name does not address a folder inside \"" << profilesPath << "\".";
+        // rebuild the list first: it re-selects a profile, and that clears the
+        // notification area on its way through validateProfile()
+        fillout_form();
+        //: %1 is a profile name that does not name a folder of its own, so there is nothing that could be removed for it
+        showRemovalProblem(tr("'%1' has no profile folder of its own, so there is nothing to remove.").arg(profile));
+        return;
     }
-    settings.setValue(qsl("deletedDefaultMuds"), deletedDefaultMuds);
+
+    QDir dir(profileFolder);
+    // QDir::removeRecursively() calls a folder that was never there a success,
+    // which for a catalog game nobody has played would leave the removal
+    // claiming to have done something
+    const bool anythingSaved = dir.exists();
+    if (anythingSaved && !dir.removeRecursively()) {
+        // the profile is still on disk, so its password and its list entry stay:
+        // removing either would strand the data that is left
+        qWarning().nospace() << "dlgConnectionProfiles::reallyDeleteProfile(\"" << profile << "\") ERROR - could not completely remove \"" << profileFolder << "\".";
+        fillout_form();
+        //: %1 is a profile name. Shown when some of the profile's files could not be deleted, e.g. because another program has them open
+        showRemovalProblem(tr("Could not remove everything belonging to '%1'. Close it if it is open elsewhere, check that you may write to its folder, and try again.").arg(profile));
+        return;
+    }
+
+    // Clean up keychain entries for the deleted profile
+    // Note: CredentialManager only supports one operation at a time, so we must
+    // chain the operations - the second removal starts only after the first completes.
+    // This prevents lost callbacks from aborting in-progress keychain operations.
+    // Crash prevention comes from parentless CredentialManager + QPointer guards.
+    // Create CredentialManager without a parent to avoid destruction when dialog closes
+    if (MudletApp::storingPasswordsSecurely()) {
+        QPointer<CredentialManager> safeCredManager = new CredentialManager(nullptr);
+
+        // Clean up character password entry first, then chain proxy cleanup
+        safeCredManager->removePassword(profile, "character", [safeCredManager, profile](bool success, const QString& errorMessage) {
+            if (!success) {
+                qWarning() << "dlgConnectionProfiles: Failed to clean up character password for deleted profile" << profile << ":" << errorMessage;
+            }
+
+            // Check if credManager was destroyed before chaining next operation
+            if (!safeCredManager) {
+                qWarning() << "dlgConnectionProfiles: CredentialManager destroyed, cannot clean up proxy password";
+                return;
+            }
+
+            // Now clean up proxy password entry (chained after character password removal completes)
+            safeCredManager->removePassword(profile, "proxy", [safeCredManager, profile](bool proxySuccess, const QString& proxyErrorMessage) {
+                if (!proxySuccess) {
+                    qWarning() << "dlgConnectionProfiles: Failed to clean up proxy password for deleted profile" << profile << ":" << proxyErrorMessage;
+                }
+
+                // Clean up the credential manager after both operations complete (if still valid)
+                if (safeCredManager) {
+                    safeCredManager->deleteLater();
+                }
+            });
+        });
+    }
+
+    // only the self-test entry needs its removal recorded: fillout_form() lists
+    // it without profile data of its own, so nothing else would keep it away.
+    // continueProfileSave() clears the entry on profile re-creation
+    if (profile == scmSelfTestProfile) {
+        auto& settings = *MudletApp::getQSettings();
+        auto deletedDefaultMuds = settings.value(qsl("deletedDefaultMuds"), QStringList()).toStringList();
+        if (!deletedDefaultMuds.contains(profile)) {
+            deletedDefaultMuds.append(profile);
+            settings.setValue(qsl("deletedDefaultMuds"), deletedDefaultMuds);
+        }
+    }
 
     fillout_form();
-    profiles_tree_widget->setFocus();
+    listWidget_profiles->setFocus();
+    if (auto* pCurrentItem = listWidget_profiles->currentItem()) {
+        updateRemoveButtonState(pCurrentItem->data(csmNameRole).toString());
+    }
+    if (!findData(*listWidget_profiles, profile, csmNameRole).isEmpty()) {
+        // the catalog still offers the game, so the list itself shows no sign
+        // of what just happened
+        if (anythingSaved) {
+            //: %1 is a game name, e.g. Achaea
+            showRemovalNotice(tr("Removed everything saved for '%1'. The game itself stays in the list, ready to play again.").arg(profile));
+        } else {
+            //: %1 is a game name, e.g. Achaea, that has never been played and so has nothing saved to remove
+            showRemovalNotice(tr("Nothing has been saved for '%1' yet, so there was nothing to remove.").arg(profile));
+        }
+    }
 }
 
 // called when the 'delete' button is pressed, raises a dialog to confirm deletion
 // if this profile has been used
 void dlgConnectionProfiles::slot_deleteProfile()
 {
-    if (!profiles_tree_widget->currentItem()) {
+    if (!listWidget_profiles->currentItem()) {
         return;
     }
 
-    const QString profile = profiles_tree_widget->currentItem()->data(csmNameRole).toString();
+    const QString profile = listWidget_profiles->currentItem()->data(csmNameRole).toString();
     const QStringList& onlyShownPredefinedProfiles{mudlet::self()->mOnlyShownPredefinedProfiles};
     if (!onlyShownPredefinedProfiles.isEmpty() && onlyShownPredefinedProfiles.contains(profile)) {
         // Do NOT allow deletion of the prioritised predefined MUD:
         return;
     }
 
-    const QDir profileDirContents(mudlet::getMudletPath(mudlet::profileXmlFilesPath, profile));
-    if (!profileDirContents.exists() || profileDirContents.isEmpty()) {
-        // shortcut - don't show profile deletion confirmation if there is no data to delete
+    const QDir profileDir(MudletApp::getMudletPath(enums::profileHomePath, profile));
+    bool nothingToLose = !profileDir.exists() || profileDir.entryList(QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot).isEmpty();
+    if (nothingToLose) {
+        for (const QString& fileName : profileDir.entryList(QDir::Files | QDir::Hidden)) {
+            if (!scmConnectionDetailFiles.contains(fileName)) {
+                nothingToLose = false;
+                break;
+            }
+        }
+    }
+    if (nothingToLose) {
         reallyDeleteProfile(profile);
         return;
     }
@@ -708,29 +1296,47 @@ void dlgConnectionProfiles::slot_deleteProfile()
     QUiLoader loader;
 
     QFile file(qsl(":/ui/delete_profile_confirmation.ui"));
-    file.open(QFile::ReadOnly);
+    if (!file.open(QFile::ReadOnly)) {
+        qWarning() << "dlgConnectionProfiles: failed to open UI file for reading:" << file.errorString();
+        return;
+    }
 
     auto* delete_profile_dialog = dynamic_cast<QDialog*>(loader.load(&file, this));
     file.close();
 
     if (!delete_profile_dialog) {
+        qWarning() << "dlgConnectionProfiles::slot_deleteProfile() ERROR - the deletion confirmation did not load as a dialog.";
+        //: %1 is a profile name. Shown when the dialog asking the user to confirm a removal could not be built
+        showRemovalProblem(tr("Could not open the confirmation, so '%1' has not been removed.").arg(profile));
         return;
     }
 
-    delete_profile_lineedit = delete_profile_dialog->findChild<QLineEdit*>(qsl("delete_profile_lineedit"));
-    delete_button = delete_profile_dialog->findChild<QPushButton*>(qsl("delete_button"));
-    auto* cancel_button = delete_profile_dialog->findChild<QPushButton*>(qsl("cancel_button"));
+    auto* nameEntry = delete_profile_dialog->findChild<QLineEdit*>(qsl("delete_profile_lineedit"));
+    auto* deleteButton = delete_profile_dialog->findChild<QPushButton*>(qsl("delete_button"));
+    auto* cancelButton = delete_profile_dialog->findChild<QPushButton*>(qsl("cancel_button"));
 
-    if (!delete_profile_lineedit || !delete_button || !cancel_button) {
+    if (!nameEntry || !deleteButton || !cancelButton) {
+        qWarning() << "dlgConnectionProfiles::slot_deleteProfile() ERROR - the deletion confirmation is missing one of its widgets.";
+        showRemovalProblem(tr("Could not open the confirmation, so '%1' has not been removed.").arg(profile));
+        delete delete_profile_dialog;
         return;
     }
 
-    connect(delete_profile_lineedit, &QLineEdit::textChanged, this, &dlgConnectionProfiles::slot_deleteProfileCheck);
-    connect(delete_profile_dialog, &QDialog::accepted, this, &dlgConnectionProfiles::slot_reallyDeleteProfile);
+    // The confirmation is not modal, so by the time it is answered the selection
+    // may have moved on, or a second confirmation may be open alongside it:
+    connect(nameEntry, &QLineEdit::textChanged, delete_profile_dialog, [deleteButton, profile](const QString& text) {
+        deleteButton->setEnabled(text == profile);
+        if (deleteButton->isEnabled()) {
+            deleteButton->setFocus();
+        }
+    });
+    connect(delete_profile_dialog, &QDialog::accepted, this, [this, profile]() {
+        reallyDeleteProfile(profile);
+    });
 
-    delete_profile_lineedit->setPlaceholderText(profile);
-    delete_profile_lineedit->setFocus();
-    delete_button->setEnabled(false);
+    nameEntry->setPlaceholderText(profile);
+    nameEntry->setFocus();
+    deleteButton->setEnabled(false);
     delete_profile_dialog->setWindowTitle(tr("Deleting '%1'").arg(profile));
     delete_profile_dialog->setAttribute(Qt::WA_DeleteOnClose);
 
@@ -740,14 +1346,12 @@ void dlgConnectionProfiles::slot_deleteProfile()
 
 QString dlgConnectionProfiles::readProfileData(const QString& profile, const QString& item) const
 {
-    QFile file(mudlet::getMudletPath(mudlet::profileDataItemPath, profile, item));
+    QFile file(MudletApp::getMudletPath(enums::profileDataItemPath, profile, item));
     const bool success = file.open(QIODevice::ReadOnly);
     QString ret;
     if (success) {
         QDataStream ifs(&file);
-        if (mudlet::scmRunTimeQtVersion >= QVersionNumber(5, 13, 0)) {
-            ifs.setVersion(mudlet::scmQDataStreamFormat_5_12);
-        }
+        ifs.setVersion(QDataStream::Qt_5_12);
         ifs >> ret;
         file.close();
     }
@@ -755,50 +1359,75 @@ QString dlgConnectionProfiles::readProfileData(const QString& profile, const QSt
     return ret;
 }
 
+// A new item here may need adding to scmConnectionDetailFiles above. Unlike
+// MudletApp::writeProfileData() this does not create the profile's folder, so a
+// write before there is one is quietly dropped.
 QPair<bool, QString> dlgConnectionProfiles::writeProfileData(const QString& profile, const QString& item, const QString& what)
 {
-    QSaveFile file(mudlet::getMudletPath(mudlet::profileDataItemPath, profile, item));
+    QSaveFile file(MudletApp::getMudletPath(enums::profileDataItemPath, profile, item));
     if (file.open(QIODevice::WriteOnly | QIODevice::Unbuffered)) {
         QDataStream ofs(&file);
-        if (mudlet::scmRunTimeQtVersion >= QVersionNumber(5, 13, 0)) {
-            ofs.setVersion(mudlet::scmQDataStreamFormat_5_12);
-        }
+        ofs.setVersion(QDataStream::Qt_5_12);
         ofs << what;
         if (!file.commit()) {
-            qDebug().noquote().nospace() << "dlgConnectionProfiles::writeProfileData(...) ERROR - writing profile: \"" << profile << "\", item: \"" << item << "\", reason: \"" << file.errorString() << "\".";
+            qDebug().noquote().nospace() << "dlgConnectionProfiles::writeProfileData(...) ERROR - writing profile: \"" << profile << "\", item: \"" << item << "\", reason: \"" << file.errorString()
+                                         << "\".";
         }
     }
 
     if (file.error() == QFileDevice::NoError) {
         return {true, QString()};
-    } else {
-        return {false, file.errorString()};
     }
+    return {false, file.errorString()};
 }
 
 QString dlgConnectionProfiles::getDescription(const QString& profile_name) const
 {
-    auto itDetails = TGameDetails::findGame(profile_name);
-    if (itDetails != TGameDetails::scmDefaultGames.constEnd()) {
-        if (!(*itDetails).description.isEmpty()) {
-            return (*itDetails).description;
+    QString profileDesc = readProfileData(profile_name, qsl("description"));
+
+    if (profileDesc.isEmpty()) {
+        auto itDetails = TGameDetails::findGame(profile_name);
+        if (itDetails != TGameDetails::scmDefaultGames.constEnd()) {
+            if (!(*itDetails).description.isEmpty()) {
+                return (*itDetails).description;
+            }
         }
     }
 
-    // Else, if there isn't a predefined text, return whatever the user might
-    // have stored:
-    return readProfileData(profile_name, qsl("description"));
+    return profileDesc;
 }
 
 void dlgConnectionProfiles::slot_itemClicked(QListWidgetItem* pItem)
 {
     if (!pItem) {
+        qDebug() << "dlgConnectionProfiles::slot_itemClicked() called with null item";
         return;
     }
 
-    slot_togglePasswordVisibility(false);
+    // on a fresh install picking a game has to swap the welcome message for
+    // the connection details, just as creating a new profile does
+    revealConnectionDetails();
 
     const QString profile_name = pItem->data(csmNameRole).toString();
+
+    // Prevent rapid duplicate clicks on the same profile
+    static QString lastProfileClicked;
+    static QTime lastClickTime;
+
+    // Never debounce the dialog's own selection: fillout_form() blanks the details first, so skipping
+    // a repeat would leave them empty with a profile highlighted
+    if (!mProgrammaticProfileSelection && profile_name == lastProfileClicked && lastClickTime.isValid() && lastClickTime.msecsTo(QTime::currentTime()) < 100) {
+        return;
+    }
+
+    lastProfileClicked = profile_name;
+    lastClickTime = QTime::currentTime();
+
+    slot_togglePasswordVisibility(false);
+
+    welcome_message->hide();
+    tabWidget_connectionInfo->show();
+    informationArea->show();
 
     profile_name_entry->setText(profile_name);
 
@@ -834,19 +1463,24 @@ void dlgConnectionProfiles::slot_itemClicked(QListWidgetItem* pItem)
     // because there isn't one in storage yet. It'll be copied over into the widget
     // by the copy method
     if (!mCopyingProfile) {
-        character_password_entry->setText(QString());
-        if (mudlet::self()->storingPasswordsSecurely()) {
-            loadSecuredPassword(profile_name, [this, profile_name](const QString& password) {
-                if (!password.isEmpty()) {
-                    character_password_entry->setText(password);
-                } else {
-                    character_password_entry->setText(readProfileData(profile_name, qsl("password")));
-                }
-            });
-
-        } else {
-            character_password_entry->setText(readProfileData(profile_name, qsl("password")));
+        // Cancel any pending password save from the previous profile to prevent
+        // cross-profile password corruption when rapidly switching profiles
+        if (mPasswordSaveTimer) {
+            mPasswordSaveTimer->stop();
         }
+        mPendingPasswordSaveProfile.clear();
+
+        // Block signals when clearing to prevent triggering a save for the wrong profile
+        {
+            const QSignalBlocker blocker(character_password_entry);
+            character_password_entry->setText(QString());
+        }
+        // Schedule password loading asynchronously to avoid event loop issues
+        auto* timer = new QTimer(this);
+        timer->setSingleShot(true);
+        timer->setProperty("profileName", profile_name);
+        connect(timer, &QTimer::timeout, this, &dlgConnectionProfiles::slot_loadPasswordAsync);
+        timer->start(0ms);
     }
 
     val = readProfileData(profile_name, qsl("login"));
@@ -869,19 +1503,6 @@ void dlgConnectionProfiles::slot_itemClicked(QListWidgetItem* pItem)
     mDiscordApplicationId = readProfileData(profile_name, qsl("discordApplicationId"));
     mDiscordInviteURL = readProfileData(profile_name, qsl("discordInviteURL"));
 
-    // val will be null if this is the first time the profile has been read
-    // since an update to a Mudlet version supporting Discord - so a toint()
-    // will return 0 - which just happens to be Qt::Unchecked() but let's not
-    // rely on that...
-    val = readProfileData(profile_name, qsl("discordserveroptin"));
-    if ((!val.isEmpty()) && val.toInt() == Qt::Checked) {
-        discord_optin_checkBox->setChecked(true);
-    } else {
-        discord_optin_checkBox->setChecked(false);
-    }
-
-    updateDiscordStatus();
-
     mud_description_textedit->setPlainText(getDescription(profile_name));
 
     val = readProfileData(profile_name, qsl("website"));
@@ -898,13 +1519,15 @@ void dlgConnectionProfiles::slot_itemClicked(QListWidgetItem* pItem)
 
     profile_history->clear();
 
-    QDir dir(mudlet::getMudletPath(mudlet::profileXmlFilesPath, profile_name));
+    QDir dir(MudletApp::getMudletPath(enums::profileXmlFilesPath, profile_name));
     dir.setSorting(QDir::Time);
-    const QStringList entries = dir.entryList(QDir::Files | QDir::NoDotAndDotDot, QDir::Time);
+    // Only offer real profile saves (*.xml) as history entries; leftover QSaveFile
+    // temporaries from an interrupted save (e.g. "....xml.AbCdEf") must not be loadable
+    const QStringList entries = dir.entryList(QStringList{qsl("*.xml")}, QDir::Files | QDir::NoDotAndDotDot, QDir::Time);
 
     for (const auto& entry : entries) {
-        QRegularExpression const rx(qsl("(\\d+)\\-(\\d+)\\-(\\d+)#(\\d+)\\-(\\d+)\\-(\\d+).xml"));
-        QRegularExpressionMatch const match = rx.match(entry);
+        const QRegularExpression rx(qsl("(\\d+)\\-(\\d+)\\-(\\d+)#(\\d+)\\-(\\d+)\\-(\\d+).xml"));
+        const QRegularExpressionMatch match = rx.match(entry);
 
         if (match.capturedStart() != -1) {
             QString day;
@@ -924,7 +1547,6 @@ void dlgConnectionProfiles::slot_itemClicked(QListWidgetItem* pItem)
                 year = match.captured(3);
             }
 
-
             QDateTime datetime;
             datetime.setTime(QTime(hour.toInt(), minute.toInt(), second.toInt()));
             datetime.setDate(QDate(year.toInt(), month.toInt(), day.toInt()));
@@ -932,10 +1554,9 @@ void dlgConnectionProfiles::slot_itemClicked(QListWidgetItem* pItem)
         } else if (entry == QLatin1String("autosave.xml")) {
             const QFileInfo fileInfo(dir, entry);
             auto lastModified = fileInfo.lastModified();
-            profile_history->addItem(QIcon::fromTheme(qsl("document-save"), QIcon(qsl(":/icons/document-save.png"))),
-                                     mudlet::self()->getUserLocale().toString(lastModified, mDateTimeFormat),
-                                     QVariant(entry));
-        } else {
+            profile_history->addItem(
+                    QIcon::fromTheme(qsl("document-save"), QIcon(qsl(":/icons/document-save.png"))), mudlet::self()->getUserLocale().toString(lastModified, mDateTimeFormat), QVariant(entry));
+        } else if (entry.endsWith(QLatin1String(".xml"), Qt::CaseInsensitive)) {
             profile_history->addItem(entry, QVariant(entry)); // if it has a custom name, use it as it is
         }
     }
@@ -944,7 +1565,12 @@ void dlgConnectionProfiles::slot_itemClicked(QListWidgetItem* pItem)
 
     const QString profileLoadedMessage = tr("This profile is currently loaded - close it before changing the connection parameters.");
 
-    if (mudlet::self()->getHostManager().getHost(profile_name)) {
+    updateRemoveButtonState(profile_name);
+
+    if (HostManager::self()->getHost(profile_name)) {
+        connect_button->setEnabled(false);
+        offline_button->setEnabled(false);
+
         profile_name_entry->setReadOnly(true);
         host_name_entry->setReadOnly(true);
         port_entry->setReadOnly(true);
@@ -982,91 +1608,79 @@ void dlgConnectionProfiles::slot_itemClicked(QListWidgetItem* pItem)
     }
 }
 
-void dlgConnectionProfiles::updateDiscordStatus()
-{
-    auto discordLoaded = mudlet::self()->mDiscord.libraryLoaded();
-
-    if (!discordLoaded) {
-        discord_optin_checkBox->setEnabled(false);
-        discord_optin_checkBox->setChecked(false);
-        discord_optin_checkBox->setToolTip(utils::richText(tr("Discord integration not available on this platform")));
-    } else if (mDiscordApplicationId.isEmpty() && !mudlet::self()->mDiscord.gameIntegrationSupported(host_name_entry->text().trimmed()).first) {
-        // Disable discord support if it is not recognised by name and a
-        // Application Id has not been previously entered:
-        discord_optin_checkBox->setEnabled(false);
-        discord_optin_checkBox->setChecked(false);
-        discord_optin_checkBox->setToolTip(utils::richText(tr("Discord integration not supported by game")));
-    } else {
-        discord_optin_checkBox->setEnabled(true);
-        discord_optin_checkBox->setToolTip(utils::richText(tr("Check to enable Discord integration")));
-    }
-}
-
 // (re-)creates the dialogs profile list
 void dlgConnectionProfiles::fillout_form()
 {
-    profiles_tree_widget->clear();
+    listWidget_profiles->clear();
     profile_name_entry->clear();
     host_name_entry->clear();
     port_entry->clear();
 
-    mProfileList = QDir(mudlet::getMudletPath(mudlet::profilesPath)).entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    mProfileList = QDir(MudletApp::getMudletPath(enums::profilesPath)).entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    // mProfileList gains non-disk entries (e.g. the QT_DEBUG-only self-test
+    // profile) further down, so capture whether the user has any saved
+    // profiles while it still only holds the on-disk ones:
+    const bool noSavedProfiles = mProfileList.isEmpty();
 
-    if (mProfileList.isEmpty()) {
-        welcome_message->show();
+    if (noSavedProfiles) {
+        // remember the height so revealConnectionDetails() can undo the
+        // shrink below, but not when the welcome message is already up as the
+        // dialog is then already shrunken
+        if (!mDialogHeightBeforeShrink || welcome_message->isHidden()) {
+            mDialogHeightBeforeShrink = height();
+        }
+        // hide before show: with both visible for a moment the layout grows
+        // the dialog to fit them together and it never shrinks back
         tabWidget_connectionInfo->hide();
-        informationalArea->hide();
-
-// collapse the width as the default is too big and set the height to a reasonable default
-// to fit all of the 'Welcome' message
-#if defined(Q_OS_MACOS)
-        // macOS requires 15px more width to get 3 columns of MUD listings in
-        resize(minimumSize().width() + 15, 300);
-#else
-        resize(minimumSize().width(), 300);
-#endif
+        informationArea->hide();
+        welcome_message->show();
     } else {
         welcome_message->hide();
 
         tabWidget_connectionInfo->show();
-        informationalArea->show();
+        informationArea->show();
     }
 
-    profiles_tree_widget->setIconSize(QSize(120, 30));
-    QString description;
+    listWidget_profiles->setIconSize(QSize(120, 30));
     QListWidgetItem* pItem;
 
-    auto& settings = *mudlet::self()->mpSettings;
-    auto deletedDefaultMuds = settings.value(qsl("deletedDefaultMuds"), QStringList()).toStringList();
     const QStringList& onlyShownPredefinedProfiles{mudlet::self()->mOnlyShownPredefinedProfiles};
+    const bool showOnlyMyProfiles = showingOnlyMyProfiles();
+    const auto deletedDefaultMuds = MudletApp::getQSettings()->value(qsl("deletedDefaultMuds"), QStringList()).toStringList();
     if (onlyShownPredefinedProfiles.isEmpty()) {
         const auto defaultGames = TGameDetails::keys();
+        // "My games" only lists games with profile data on disk; "All games"
+        // must keep offering every pre-installed game, even ones whose profile
+        // was just deleted. The self-test entry is the exception: it is a
+        // testing aid rather than a game, and is offered even without profile
+        // data on disk, so dismissing it has to keep it out of both tabs -
+        // which is all deletedDefaultMuds records
         for (auto& game : defaultGames) {
-            if (!deletedDefaultMuds.contains(game)) {
-                pItem = new QListWidgetItem();
-                auto details = TGameDetails::findGame(game);
-                setupMudProfile(pItem, game, (*details).description, (*details).icon);
+            if (game == scmSelfTestProfile && deletedDefaultMuds.contains(game)) {
+                continue;
             }
+            if (showOnlyMyProfiles && !mProfileList.contains(game, Qt::CaseInsensitive)) {
+                continue;
+            }
+            pItem = new QListWidgetItem();
+            auto details = TGameDetails::findGame(game);
+            setupMudProfile(pItem, game, (*details).description, (*details).icon);
         }
 
 #if defined(QT_DEBUG)
-        const QString mudServer = qsl("Mudlet self-test");
-        if (!deletedDefaultMuds.contains(mudServer) && !mProfileList.contains(mudServer)) {
-            mProfileList.append(mudServer);
-            pItem = new QListWidgetItem();
-            // Can't use setupMudProfile(...) here as we do not set the icon in the same way:
-            setItemName(pItem, mudServer);
-
-            profiles_tree_widget->addItem(pItem);
-            description = getDescription(qsl("mudlet.org"));
-            if (!description.isEmpty()) {
-                pItem->setToolTip(utils::richText(description));
+        if (!deletedDefaultMuds.contains(scmSelfTestProfile) && !mProfileList.contains(scmSelfTestProfile)) {
+            mProfileList.append(scmSelfTestProfile);
+            // "All games" already listed it from TGameDetails above, only
+            // "My games" is still missing an entry:
+            if (findData(*listWidget_profiles, scmSelfTestProfile, csmNameRole).isEmpty()) {
+                pItem = new QListWidgetItem();
+                setupMudProfile(pItem, scmSelfTestProfile, getDescription(qsl("mudlet.org")), QString());
             }
         }
 #endif
     } else {
-        pItem = new QListWidgetItem();
         for (const QString& onlyShownPredefinedProfile : onlyShownPredefinedProfiles) {
+            pItem = new QListWidgetItem();
             auto details = TGameDetails::findGame(onlyShownPredefinedProfile);
             setupMudProfile(pItem, onlyShownPredefinedProfile, (*details).description, (*details).icon);
         }
@@ -1079,18 +1693,23 @@ void dlgConnectionProfiles::fillout_form()
     int toselectRow = -1;
     int test_profile_row = -1;
     int predefined_profile_row = -1;
+    int firstOnDiskProfileRow = -1;
     bool firstMudletLaunch = true;
 
-    for (int i = 0; i < profiles_tree_widget->count(); i++) {
-        const auto profile = profiles_tree_widget->item(i);
+    for (int i = 0; i < listWidget_profiles->count(); i++) {
+        const auto profile = listWidget_profiles->item(i);
         const auto profileName = profile->data(csmNameRole).toString();
-        if (profileName == qsl("Mudlet self-test")) {
+        if (profileName == scmSelfTestProfile) {
             test_profile_row = i;
         }
-        const auto fileinfo = QFileInfo(mudlet::getMudletPath(mudlet::profileXmlFilesPath, profileName));
+        // The self-test entry can be in mProfileList without a folder on disk
+        if (firstOnDiskProfileRow == -1 && profileName != scmSelfTestProfile && mProfileList.contains(profileName, Qt::CaseInsensitive)) {
+            firstOnDiskProfileRow = i;
+        }
+        const auto fileinfo = QFileInfo(MudletApp::getMudletPath(enums::profileXmlFilesPath, profileName));
         if (fileinfo.exists()) {
             firstMudletLaunch = false;
-            QDateTime const profile_lastRead = fileinfo.lastModified();
+            const QDateTime profile_lastRead = fileinfo.lastModified();
             // Since Qt 5.x null QTimes and QDateTimes are invalid - and might not
             // work as expected - so test for validity of the test_date value as well
             if ((!test_date.isValid()) || profile_lastRead > test_date) {
@@ -1106,12 +1725,18 @@ void dlgConnectionProfiles::fillout_form()
 
     if (firstMudletLaunch) {
         if (onlyShownPredefinedProfiles.isEmpty()) {
-            // Select a random pre-defined profile to give all MUDs a fair go first time
-            // make sure not to select the test_profile though
-            if (profiles_tree_widget->count() > 1) {
-                while (toselectRow == -1 || toselectRow == test_profile_row) {
-                    toselectRow = QRandomGenerator::global()->bounded(profiles_tree_widget->count());
+            // Select the tutorial profile on first launch
+            for (int i = 0; i < listWidget_profiles->count(); i++) {
+                if (listWidget_profiles->item(i)->data(csmNameRole).toString() == qsl("Mudlet Tutorial")) {
+                    toselectRow = i;
+                    break;
                 }
+            }
+            if (listWidget_profiles->count() == 1 && test_profile_row != 0) {
+                // The "My games" tab can show a single profile that has not been
+                // saved to its XML yet, so select it to fill in its details
+                // instead of leaving the form blank with a game highlighted
+                toselectRow = 0;
             }
         } else if (predefined_profile_row >= 0) {
             // If the user is starting one of a MUD's "dedicated" Mudlet versions then
@@ -1120,19 +1745,72 @@ void dlgConnectionProfiles::fillout_form()
         }
     }
 
-    if (toselectRow != -1) {
-        profiles_tree_widget->setCurrentRow(toselectRow);
+    if (toselectRow == -1 && firstOnDiskProfileRow != -1) {
+        // Profiles never connected have no dated save to pick from, and the fallbacks above cover only
+        // the tutorial, a lone row or a dedicated build's game. With nothing picked, QAbstractItemView makes
+        // its first row current but not selected on focus, and the details fill from it with Connect
+        // enabled while nothing looks picked. So pick the first row with a profile folder (never self-test).
+        toselectRow = firstOnDiskProfileRow;
     }
 
-    updateDiscordStatus();
+    if (toselectRow != -1) {
+        // this automatic selection must not be taken for the user picking a
+        // game, which would dismiss the welcome message shown above
+        mProgrammaticProfileSelection = true;
+        listWidget_profiles->setCurrentRow(toselectRow);
+        mProgrammaticProfileSelection = false;
+    }
+
+    // Dedicated single-game builds go straight to their game's profile instead
+    // of the Mudlet tutorial invitation, and someone with a history of using
+    // Mudlet gets the games list rather than a beginner's invitation - the same
+    // call the UI tour makes:
+    if (firstMudletLaunch && noSavedProfiles && !mTutorialDismissed && onlyShownPredefinedProfiles.isEmpty() && !mudlet::self()->experiencedMudletPlayer()) {
+        // Hide the profile list and show only the tutorial-focused welcome
+        widget_topLeft->hide();
+        welcome_message->show();
+        tabWidget_connectionInfo->hide();
+        informationArea->hide();
+        connect_button->hide();
+        offline_button->hide();
+        mpSkipToGamesButton->show();
+        if (isVisible()) {
+            fitWelcomeMessageToContents();
+        } else {
+            mFitWelcomeMessagePending = true;
+        }
+    }
+}
+
+// A dialog that has not been up yet has no laid-out widgets to measure, so a
+// first launch takes its invitation sizing from here instead. It has to happen
+// before QDialog::showEvent(), which centres the dialog on its parent for the
+// size it has at that moment.
+void dlgConnectionProfiles::showEvent(QShowEvent* pEvent)
+{
+    if (mFitWelcomeMessagePending) {
+        mFitWelcomeMessagePending = false;
+        fitWelcomeMessageToContents();
+    }
+    QDialog::showEvent(pEvent);
+}
+
+// A QTextBrowser reports the same size hint whatever it holds, so shrinking the
+// dialog around the invitation with adjustSize() alone cuts off its last line
+// and leaves a scrollbar. Give it a floor its own text fits into first.
+void dlgConnectionProfiles::fitWelcomeMessageToContents()
+{
+    auto* pDocument = welcome_message->document();
+    pDocument->setTextWidth(welcome_message->viewport()->width());
+    welcome_message->setMinimumHeight(qCeil(pDocument->size().height()) + 2 * welcome_message->frameWidth());
+    adjustSize();
 }
 
 void dlgConnectionProfiles::setProfileIcon() const
 {
     const QStringList defaultGames = TGameDetails::keys();
 
-    for (int i = 0; i < mProfileList.size(); i++) {
-        const QString& profileName = mProfileList.at(i);
+    for (const QString& profileName : mProfileList) {
         if (profileName.isEmpty()) {
             continue;
         }
@@ -1156,7 +1834,7 @@ void dlgConnectionProfiles::setProfileIcon() const
 
 bool dlgConnectionProfiles::hasCustomIcon(const QString& profileName) const
 {
-    return QFileInfo::exists(mudlet::getMudletPath(mudlet::profileDataItemPath, profileName, qsl("profileicon")));
+    return QFileInfo::exists(MudletApp::getMudletPath(enums::profileDataItemPath, profileName, qsl("profileicon")));
 }
 
 void dlgConnectionProfiles::loadCustomProfile(const QString& profileName) const
@@ -1164,19 +1842,44 @@ void dlgConnectionProfiles::loadCustomProfile(const QString& profileName) const
     auto pItem = new QListWidgetItem();
     setItemName(pItem, profileName);
 
-    setCustomIcon(profileName, pItem);
-    auto description = getDescription(profileName);
-    if (!description.isEmpty()) {
-        pItem->setToolTip(utils::richText(description));
-    }
-    profiles_tree_widget->addItem(pItem);
+    const bool iconLoaded = setCustomIcon(profileName, pItem);
+    setItemTooltip(pItem, getDescription(profileName), iconLoaded);
+    listWidget_profiles->addItem(pItem);
 }
 
-void dlgConnectionProfiles::setCustomIcon(const QString& profileName, QListWidgetItem* profile) const
+// hasCustomIcon() only checks the file exists, so an empty or non-image one still reaches here
+bool dlgConnectionProfiles::setCustomIcon(const QString& profileName, QListWidgetItem* profile) const
 {
-    auto profileIconPath = mudlet::getMudletPath(mudlet::profileDataItemPath, profileName, qsl("profileicon"));
-    auto icon = QIcon(QPixmap(profileIconPath).scaled(QSize(120, 30), Qt::IgnoreAspectRatio, Qt::SmoothTransformation).copy());
-    profile->setIcon(icon);
+    const auto profileIconPath = MudletApp::getMudletPath(enums::profileDataItemPath, profileName, qsl("profileicon"));
+    const QPixmap pixmap(profileIconPath);
+    if (pixmap.isNull()) {
+        qWarning() << profileName << "has an icon file that could not be read:" << profileIconPath;
+        profile->setIcon(customIcon(profileName, getCustomColor(profileName)));
+        return false;
+    }
+
+    profile->setIcon(QIcon(pixmap.scaled(QSize(120, 30), Qt::IgnoreAspectRatio, Qt::SmoothTransformation).copy()));
+    return true;
+}
+
+// The list draws an entry as its icon alone, so one whose icon failed gets a name plate instead
+// of an invisible row, and its tooltip says why
+void dlgConnectionProfiles::setItemTooltip(QListWidgetItem* pItem, const QString& description, const bool iconLoaded) const
+{
+    QStringList lines;
+    if (!description.isEmpty()) {
+        // Plain text going into a rich-text tooltip: unescaped markup would be acted on and could
+        // swallow the warning line below
+        lines << description.toHtmlEscaped();
+    }
+    if (!iconLoaded) {
+        //: Tooltip line on an entry in the connection dialog's games list whose icon file is present but cannot be read, so a plate with the entry's name is drawn in its place
+        lines << tr("This entry's artwork could not be read, so its name is shown instead.");
+    }
+    if (!lines.isEmpty()) {
+        // The wrapper makes Qt::mightBeRichText() pick rich text whatever the description holds
+        pItem->setToolTip(utils::richText(lines.join(qsl("<br>"))));
+    }
 }
 
 // When a profile is renamed, migrate password storage to the new profile
@@ -1185,41 +1888,16 @@ void dlgConnectionProfiles::migrateSecuredPassword(const QString& oldProfile, co
     const auto& password = character_password_entry->text().trimmed();
 
     deleteSecurePassword(oldProfile);
-    writeSecurePassword(newProfile, password);
-}
 
-template <typename L>
-void dlgConnectionProfiles::loadSecuredPassword(const QString& profile, L callback)
-{
-    // character_password_entry
-
-    auto* job = new QKeychain::ReadPasswordJob(qsl("Mudlet profile"));
-    job->setAutoDelete(false);
-    job->setInsecureFallback(false);
-
-    job->setKey(profile);
-
-    connect(job, &QKeychain::ReadPasswordJob::finished, this, [=](QKeychain::Job* task) {
-        if (task->error()) {
-            const auto error = task->errorString();
-            if (error != qsl("Entry not found") && error != qsl("No match")) {
-                qDebug().nospace().noquote() << "dlgConnectionProfiles::loadSecuredPassword() ERROR - could not retrieve secure password for \"" << profile << "\", error is: " << error << ".";
-            }
-
-        }
-
-        auto readJob = static_cast<QKeychain::ReadPasswordJob*>(task);
-        callback(readJob->textData());
-
-        task->deleteLater();
-    });
-
-    job->start();
+    // Only store the password if it's not empty
+    if (!password.isEmpty()) {
+        writeSecurePassword(newProfile, password);
+    }
 }
 
 std::optional<QColor> getCustomColor(const QString& profileName)
 {
-    auto profileColorPath = mudlet::getMudletPath(mudlet::profileDataItemPath, profileName, qsl("profilecolor"));
+    auto profileColorPath = MudletApp::getMudletPath(enums::profileDataItemPath, profileName, qsl("profilecolor"));
     if (QFileInfo::exists(profileColorPath)) {
         QFile file(profileColorPath);
         if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
@@ -1241,13 +1919,40 @@ void dlgConnectionProfiles::generateCustomProfile(const QString& profileName) co
     auto pItem = new QListWidgetItem();
     setItemName(pItem, profileName);
     pItem->setIcon(customIcon(profileName, getCustomColor(profileName)));
-    profiles_tree_widget->addItem(pItem);
+    listWidget_profiles->addItem(pItem);
+}
+
+// fillout_form() destroys and rebuilds every item, so callers that have let the
+// event loop run cannot hold on to one.
+void dlgConnectionProfiles::setIconOfListedProfile(const QString& profileName, const QIcon& icon) const
+{
+    const auto pItems = findData(*listWidget_profiles, profileName, csmNameRole);
+    if (pItems.isEmpty()) {
+        return;
+    }
+    pItems.first()->setIcon(icon);
+}
+
+// Empty when nothing is selected. The context-menu actions re-check rather than
+// trust slot_profileContextMenu(): menu.exec() runs a nested event loop, and the
+// profile-copy completion handler calls fillout_form() from it, which can clear
+// the selection - or leave a different profile current, in which case the action
+// still mis-targets. Only the crash of acting on nothing is handled here.
+QString dlgConnectionProfiles::selectedProfileName() const
+{
+    const auto* pItem = listWidget_profiles->currentItem();
+    return pItem ? pItem->data(csmNameRole).toString() : QString();
 }
 
 void dlgConnectionProfiles::slot_profileContextMenu(QPoint pos)
 {
-    const QPoint globalPos = profiles_tree_widget->mapToGlobal(pos);
-    auto profileName = profiles_tree_widget->currentItem()->data(csmNameRole).toString();
+    // "My games" on a fresh install lists nothing, so nothing is current
+    const auto profileName = selectedProfileName();
+    if (profileName.isEmpty()) {
+        return;
+    }
+
+    const QPoint globalPos = listWidget_profiles->mapToGlobal(pos);
 
     QMenu menu;
     if (hasCustomIcon(profileName)) {
@@ -1271,13 +1976,21 @@ void dlgConnectionProfiles::slot_profileContextMenu(QPoint pos)
 
 void dlgConnectionProfiles::slot_setCustomIcon()
 {
-    auto profileName = profiles_tree_widget->currentItem()->data(csmNameRole).toString();
+    const auto profileName = selectedProfileName();
+    if (profileName.isEmpty()) {
+        return;
+    }
 
-    const QString imageLocation = QFileDialog::getOpenFileName(
-            this, tr("Select custom image for profile (should be 120x30)"), QStandardPaths::writableLocation(QStandardPaths::HomeLocation), tr("Images (%1)").arg(qsl("*.png *.gif *.jpg")));
+    QSettings& settings = *MudletApp::getQSettings();
+    QString lastDir = settings.value("lastFileDialogLocation", QDir::homePath()).toString();
+
+    const QString imageLocation = QFileDialog::getOpenFileName(this, tr("Select custom image for profile (should be 120x30)"), lastDir, tr("Images (%1)").arg(qsl("*.png *.gif *.jpg")));
     if (imageLocation.isEmpty()) {
         return;
     }
+
+    lastDir = QFileInfo(imageLocation).absolutePath();
+    settings.setValue("lastFileDialogLocation", lastDir);
 
     const bool success = mudlet::self()->setProfileIcon(profileName, imageLocation).first;
     if (!success) {
@@ -1285,54 +1998,46 @@ void dlgConnectionProfiles::slot_setCustomIcon()
     }
 
     auto icon = QIcon(QPixmap(imageLocation).scaled(QSize(120, 30), Qt::IgnoreAspectRatio, Qt::SmoothTransformation).copy());
-    profiles_tree_widget->currentItem()->setIcon(icon);
+    // the file dialog ran a nested event loop, so the current item may have moved
+    setIconOfListedProfile(profileName, icon);
 }
 void dlgConnectionProfiles::slot_setCustomColor()
 {
-    auto profileName = profiles_tree_widget->currentItem()->data(csmNameRole).toString();
+    const auto profileName = selectedProfileName();
+    if (profileName.isEmpty()) {
+        return;
+    }
     QColor color = QColorDialog::getColor(getCustomColor(profileName).value_or(QColor(255, 255, 255)));
     if (color.isValid()) {
-        auto profileColorPath = mudlet::getMudletPath(mudlet::profileDataItemPath, profileName, qsl("profilecolor"));
+        auto profileColorPath = MudletApp::getMudletPath(enums::profileDataItemPath, profileName, qsl("profilecolor"));
         QSaveFile file(profileColorPath);
-        file.open(QIODevice::WriteOnly | QIODevice::Text);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            qWarning() << "dlgConnectionProfiles: failed to open profile color file for writing:" << file.errorString();
+            return;
+        }
         auto colorName = color.name();
         file.write(colorName.toUtf8(), colorName.length());
         if (!file.commit()) {
             qDebug() << "dlgConnectionProfiles::slot_setCustomColor: error saving custom icon color: " << file.errorString();
         }
-        profiles_tree_widget->currentItem()->setIcon(customIcon(profileName, {color}));
+        setIconOfListedProfile(profileName, customIcon(profileName, {color}));
     }
 }
 void dlgConnectionProfiles::slot_resetCustomIcon()
 {
-    auto profileName = profiles_tree_widget->currentItem()->data(csmNameRole).toString();
+    const auto profileName = selectedProfileName();
+    if (profileName.isEmpty()) {
+        return;
+    }
 
     const bool success = mudlet::self()->resetProfileIcon(profileName).first;
     if (!success) {
         return;
     }
 
-    auto currentRow = profiles_tree_widget->currentRow();
+    auto currentRow = listWidget_profiles->currentRow();
     fillout_form();
-    profiles_tree_widget->setCurrentRow(currentRow);
-}
-
-void dlgConnectionProfiles::slot_passwordSaved(QKeychain::Job* job)
-{
-    if (job->error()) {
-        qWarning().nospace().noquote() << "dlgslot_passwordSaved:slot_passwordSaved(...) ERROR - could not save password for \"" << job->property("profile").toString() << "\"; error was: \"" << job->errorString() << "\".";
-    }
-
-    job->deleteLater();
-}
-
-void dlgConnectionProfiles::slot_passwordDeleted(QKeychain::Job* job)
-{
-    if (job->error()) {
-        qWarning() << "dlgConnectionProfiles::slot_passwordDeleted(...) ERROR - could not delete password for: \"" << job->property("profile").toString() << "\"; error was: \"" << job->errorString() << "\".";
-    }
-
-    job->deleteLater();
+    listWidget_profiles->setCurrentRow(currentRow);
 }
 
 void dlgConnectionProfiles::slot_cancel()
@@ -1350,35 +2055,67 @@ void dlgConnectionProfiles::slot_copyProfile()
     QString oldname;
     QListWidgetItem* pItem;
     const auto oldPassword = character_password_entry->text();
+    const CopiedProfileData data = captureProfileData();
 
     if (!copyProfileWidget(profile_name, oldname, pItem)) {
         mCopyingProfile = false;
         return;
     }
 
-    // copy the folder on-disk
-    const QDir dir(mudlet::getMudletPath(mudlet::profileHomePath, oldname));
+    // A default profile (one of the predefined games) only exists in memory, so
+    // there is no folder to copy on-disk. Persist the displayed connection data
+    // into the new profile the same way saving a profile does, so the copy is
+    const QDir dir(MudletApp::getMudletPath(enums::profileHomePath, oldname));
     if (!dir.exists()) {
-        mCopyingProfile = false;
+        saveDefaultProfileCopy(profile_name, data, oldPassword);
         return;
     }
 
     QApplication::setOverrideCursor(Qt::BusyCursor);
     mpCopyProfile->setText(tr("Copying..."));
     mpCopyProfile->setEnabled(false);
-    auto future = QtConcurrent::run(dlgConnectionProfiles::copyFolder, mudlet::getMudletPath(mudlet::profileHomePath, oldname), mudlet::getMudletPath(mudlet::profileHomePath, profile_name));
-    auto watcher = new QFutureWatcher<bool>;
-    connect(watcher, &QFutureWatcher<bool>::finished, this, [=]() {
-        mProfileList << profile_name;
-        slot_itemClicked(pItem);
-        // Clear the Discord optin on the copied profile - just because the source
-        // one may have had it enabled does not mean we can assume the new one would
-        // want it set:
-        discord_optin_checkBox->setChecked(false);
+    auto future = QtConcurrent::run(dlgConnectionProfiles::copyFolder, MudletApp::getMudletPath(enums::profileHomePath, oldname), MudletApp::getMudletPath(enums::profileHomePath, profile_name));
+    auto watcher = new QFutureWatcher<bool>(this);
+    connect(watcher, &QFutureWatcher<bool>::finished, this, [this, profile_name, oldPassword, watcher]() {
+        if (!mProfileList.contains(profile_name)) {
+            mProfileList << profile_name;
+        }
+
+        // The copy takes every file in the profile directory, and the saved sign-in's record is one
+        // of them now that it lives there. Its token is not: that is filed under the profile it was
+        // saved for, so the copy would carry an account and a provider with nothing behind them and
+        // ask the game to sign that account in again. A copy starts with no saved sign-in, which is
+        // what it had before the record moved out of the credential store.
+        QFile::remove(GMCPAuthenticator::savedSignInRecordPath(profile_name));
+
+        // The dialog stays usable while the copy runs, and switching the games
+        // tab calls fillout_form(), which destroys every item - including the
+        // one made for this copy. Hence look it up by name rather than hold it.
+        auto pCopiedItems = findData(*listWidget_profiles, profile_name, csmNameRole);
+        if (pCopiedItems.isEmpty()) {
+            // that rebuild scanned the profiles directory before the copy
+            // landed in it
+            fillout_form();
+            pCopiedItems = findData(*listWidget_profiles, profile_name, csmNameRole);
+        }
+        if (!pCopiedItems.isEmpty()) {
+            auto* pCopiedItem = pCopiedItems.first();
+            if (listWidget_profiles->currentItem() == pCopiedItem) {
+                slot_itemClicked(pCopiedItem);
+            } else {
+                // reaches slot_itemClicked() through currentItemChanged
+                listWidget_profiles->setCurrentItem(pCopiedItem);
+            }
+        }
 
         // restore the password, which won't be copied by the disk copy if stored in the credential manager
-        character_password_entry->setText(oldPassword);
-        if (mudlet::self()->storingPasswordsSecurely()) {
+        // Temporarily block textChanged signal to avoid triggering save on programmatic setText
+        {
+            const QSignalBlocker blocker(character_password_entry);
+            character_password_entry->setText(oldPassword);
+        }
+
+        if (MudletApp::storingPasswordsSecurely() && !oldPassword.trimmed().isEmpty()) {
             writeSecurePassword(profile_name, oldPassword);
         }
         mCopyingProfile = false;
@@ -1386,8 +2123,88 @@ void dlgConnectionProfiles::slot_copyProfile()
         mpCopyProfile->setEnabled(true);
         QApplication::restoreOverrideCursor();
         validateProfile();
+        watcher->deleteLater();
     });
     watcher->setFuture(future);
+}
+
+dlgConnectionProfiles::CopiedProfileData dlgConnectionProfiles::captureProfileData() const
+{
+    return {host_name_entry->text(), port_entry->text(), port_ssl_tsl->isChecked() ? Qt::Checked : Qt::Unchecked, login_entry->text(), website_entry->text(), mud_description_textedit->toPlainText()};
+}
+
+// Copying a default profile (one of the predefined games) has nothing to copy
+// on-disk, because such profiles only exist in memory until saved. Create the
+// new profile's folder and persist the captured connection data, so the copy is
+// a faithful, functional profile that survives reopening the connection screen.
+// url/port/SSL go through the same writers used when saving a profile; the
+// remaining fields are written directly.
+void dlgConnectionProfiles::saveDefaultProfileCopy(const QString& profileName, const CopiedProfileData& data, const QString& oldPassword)
+{
+    const QDir dir;
+    if (!dir.mkpath(MudletApp::getMudletPath(enums::profileHomePath, profileName))) {
+        notificationArea->show();
+        notificationAreaIconLabelWarning->show();
+        notificationAreaIconLabelError->hide();
+        notificationAreaIconLabelInformation->hide();
+        notificationAreaMessageBox->show();
+        notificationAreaMessageBox->setText(tr("Could not create the new profile folder on your computer."));
+        mCopyingProfile = false;
+        return;
+    }
+
+    mProfileList << profileName;
+    // keep the copying flag up to the end: it stops the re-selection below
+    // from blanking the password field and stops validateProfile() from
+    // flagging the half-filled intermediate states
+    mCopyingProfile = true;
+
+    // the copy now exists on disk, so rebuilding the list shows it like any
+    // other saved profile - on a fresh install this also swaps the welcome
+    // message for the connection details, which would otherwise leave the
+    // copy invisible - then select it and fill in its details
+    fillout_form();
+    const auto pCopiedItems = findData(*listWidget_profiles, profileName, csmNameRole);
+    if (!pCopiedItems.isEmpty()) {
+        listWidget_profiles->setCurrentItem(pCopiedItems.first());
+    }
+
+    {
+        const QSignalBlocker nameBlocker(profile_name_entry);
+        const QSignalBlocker urlBlocker(host_name_entry);
+        const QSignalBlocker portBlocker(port_entry);
+        const QSignalBlocker sslBlocker(port_ssl_tsl);
+        const QSignalBlocker loginBlocker(login_entry);
+        profile_name_entry->setText(profileName);
+        host_name_entry->setText(data.host);
+        port_entry->setText(data.port);
+        port_ssl_tsl->setChecked(data.sslTsl == Qt::Checked);
+        login_entry->setText(data.login);
+        website_entry->setText(data.website);
+        website_entry->setVisible(!data.website.isEmpty());
+        mud_description_textedit->setPlainText(data.description);
+    }
+    slot_updateUrl(data.host);
+    slot_updatePort(data.port);
+    slot_updateSslTslPort(data.sslTsl);
+    if (!data.login.isEmpty()) {
+        writeProfileData(profileName, qsl("login"), data.login);
+    }
+    if (!data.website.isEmpty()) {
+        writeProfileData(profileName, qsl("website"), data.website);
+    }
+    if (!data.description.isEmpty()) {
+        writeProfileData(profileName, qsl("description"), data.description);
+    }
+    {
+        const QSignalBlocker blocker(character_password_entry);
+        character_password_entry->setText(oldPassword);
+    }
+    if (MudletApp::storingPasswordsSecurely() && !oldPassword.trimmed().isEmpty()) {
+        writeSecurePassword(profileName, oldPassword);
+    }
+    mCopyingProfile = false;
+    validateProfile();
 }
 
 void dlgConnectionProfiles::slot_copyOnlySettingsOfProfile()
@@ -1395,20 +2212,27 @@ void dlgConnectionProfiles::slot_copyOnlySettingsOfProfile()
     QString profile_name;
     QString oldname;
     QListWidgetItem* pItem;
+    const auto oldPassword = character_password_entry->text();
+    const CopiedProfileData data = captureProfileData();
     if (!copyProfileWidget(profile_name, oldname, pItem)) {
         return;
     }
+    const QDir oldProfileDir(MudletApp::getMudletPath(enums::profileHomePath, oldname));
+    if (!oldProfileDir.exists()) {
+        saveDefaultProfileCopy(profile_name, data, oldPassword);
+        return;
+    }
 
-    const QDir newProfileDir(mudlet::getMudletPath(mudlet::profileHomePath, profile_name));
+    const QDir newProfileDir(MudletApp::getMudletPath(enums::profileHomePath, profile_name));
     newProfileDir.mkpath(newProfileDir.path());
     if (!newProfileDir.exists()) {
         return;
     }
 
     // copy relevant profile files
-    for (const QString file : {"url", "port", "password", "login", "description"}) {
-        auto filePath = qsl("%1/%2").arg(mudlet::getMudletPath(mudlet::profileHomePath, oldname), file);
-        auto newFilePath = qsl("%1/%2").arg(mudlet::getMudletPath(mudlet::profileHomePath, profile_name), file);
+    for (const QString& file : {qsl("url"), qsl("port"), qsl("password"), qsl("login"), qsl("description")}) {
+        auto filePath = qsl("%1/%2").arg(MudletApp::getMudletPath(enums::profileHomePath, oldname), file);
+        auto newFilePath = qsl("%1/%2").arg(MudletApp::getMudletPath(enums::profileHomePath, profile_name), file);
         QFile::copy(filePath, newFilePath);
     }
 
@@ -1416,10 +2240,6 @@ void dlgConnectionProfiles::slot_copyOnlySettingsOfProfile()
 
     mProfileList << profile_name;
     slot_itemClicked(pItem);
-    // Clear the Discord optin on the copied profile - just because the source
-    // one may have had it enabled does not mean we can assume the new one would
-    // want it set:
-    discord_optin_checkBox->setChecked(false);
 }
 
 bool dlgConnectionProfiles::copyProfileWidget(QString& profile_name, QString& oldname, QListWidgetItem*& pItem) const
@@ -1445,16 +2265,16 @@ bool dlgConnectionProfiles::copyProfileWidget(QString& profile_name, QString& ol
         profile_name = profile_name2;
     }
 
-    pItem = new QListWidgetItem();
+    pItem = new (std::nothrow) QListWidgetItem();
     if (!pItem) {
         return false;
     }
     setItemName(pItem, profile_name);
 
     // add the new widget in
-    profiles_tree_widget->addItem(pItem);
+    listWidget_profiles->addItem(pItem);
     pItem->setIcon(customIcon(profile_name, std::nullopt));
-    profiles_tree_widget->setCurrentItem(pItem);
+    listWidget_profiles->setCurrentItem(pItem);
 
     profile_name_entry->setText(profile_name);
     profile_name_entry->setFocus();
@@ -1468,10 +2288,12 @@ bool dlgConnectionProfiles::copyProfileWidget(QString& profile_name, QString& ol
 
 void dlgConnectionProfiles::copyProfileSettingsOnly(const QString& oldname, const QString& newname)
 {
-    const QDir oldProfiledir(mudlet::getMudletPath(mudlet::profileXmlFilesPath, oldname));
-    const QDir newProfiledir(mudlet::getMudletPath(mudlet::profileXmlFilesPath, newname));
+    const QDir oldProfiledir(MudletApp::getMudletPath(enums::profileXmlFilesPath, oldname));
+    const QDir newProfiledir(MudletApp::getMudletPath(enums::profileXmlFilesPath, newname));
     newProfiledir.mkpath(newProfiledir.absolutePath());
-    QStringList entries = oldProfiledir.entryList(QDir::Files | QDir::NoDotAndDotDot, QDir::Time);
+    // Only copy from a real profile save (*.xml): the newest file of any name could
+    // be a leftover QSaveFile temporary from an interrupted save (e.g. "....xml.AbCdEf")
+    QStringList entries = oldProfiledir.entryList(QStringList{qsl("*.xml")}, QDir::Files | QDir::NoDotAndDotDot, QDir::Time);
     if (entries.empty()) {
         return;
     }
@@ -1538,15 +2360,6 @@ void dlgConnectionProfiles::saveProfileCopy(const QDir& newProfiledir, const pug
     }
 }
 
-void dlgConnectionProfiles::slot_load()
-{
-    setVisible(false);
-    // This is needed to make the above take effect as fast as possible:
-    qApp->processEvents();
-    loadProfile(false);
-    QDialog::accept();
-}
-
 void dlgConnectionProfiles::loadProfile(bool alsoConnect)
 {
     const QString profile_name = profile_name_entry->text().trimmed();
@@ -1555,62 +2368,34 @@ void dlgConnectionProfiles::loadProfile(bool alsoConnect)
         return;
     }
 
-    HostManager& hostManager = mudlet::self()->getHostManager();
-    Host* pHost = hostManager.getHost(profile_name);
-    if (pHost) {
-        if (alsoConnect) {
-            pHost->mTelnet.connectIt(pHost->getUrl(), pHost->getPort());
-        }
-        QDialog::accept();
-        return;
-    }
-    // load an old profile if there is any
-    // PLACEMARKER: Host creation (1) - normal case
-    if (hostManager.addHost(profile_name, port_entry->text().trimmed(), QString(), QString())) {
-        pHost = hostManager.getHost(profile_name);
-        if (!pHost) {
-            return;
-        }
-    } else {
-        return;
-    }
+    // Check if the host already exists before calling mudlet::loadProfile()
+    Host* pHostBeforeLoad = HostManager::self()->getHost(profile_name);
+    bool hostExistedBefore = (pHostBeforeLoad != nullptr);
 
-    const QString folder(mudlet::getMudletPath(mudlet::profileXmlFilesPath, profile_name));
-    QDir dir(folder);
-    dir.setSorting(QDir::Time);
-    QStringList entries = dir.entryList(QDir::Files, QDir::Time);
-    // pre-install packages when loading this profile for the first time
-    bool preInstallPackages = false;
-    pHost->hideMudletsVariables();
-    if (entries.isEmpty()) {
-        preInstallPackages = true;
-        pHost->mLoadedOk = true;
-    } else {
-        QFile file(qsl("%1%2").arg(folder, profile_history->itemData(profile_history->currentIndex()).toString()));
-        file.open(QFile::ReadOnly | QFile::Text);
-        XMLimport importer(pHost);
-
-        qDebug() << "[LOADING PROFILE]:" << file.fileName();
-        if (auto [success, message] = importer.importPackage(&file, nullptr); !success) {
-            //: %1 is the path and file name (i.e. the location) of the problem fil
-            pHost->postMessage(tr("[ ERROR ] - Something went wrong loading your Mudlet profile and it could not be loaded.\n"
-                "Try loading an older version in 'Connect - Options - Profile history' or double-check that %1 looks correct.").arg(file.fileName()));
-
-            qDebug().nospace().noquote() << "dlgConnectionProfiles::loadProfile(" << alsoConnect << ") ERROR - loading \"" << file.fileName() << "\" failed, reason: \"" << message << "\".";
-        } else {
-            pHost->mLoadedOk = true;
-        }
-
-        pHost->refreshPackageFonts();
-
-        // Is this a new profile created through 'copy profile (settings only)'? install default packages into it
-        if (entries.size() == 1 && entries.first() == QLatin1String("Copied profile (settings only).xml")) {
-            preInstallPackages = true;
-        }
-    }
+    Host* pHost = mudlet::self()->loadProfile(profile_name, alsoConnect, profile_history->currentData().toString());
 
     // overwrite the generic profile with user supplied name, url and login information
     if (pHost) {
+        Host* pActiveHost = mudlet::self()->getActiveHost();
+
+        if (pActiveHost && pActiveHost->getName() == profile_name) {
+            // Skip reconnect if mudlet::loadProfile already connected for existing hosts
+            if (alsoConnect && hostExistedBefore) {
+                QDialog::accept();
+                return;
+            }
+            // Reconnect to the active profile
+            pActiveHost->mTelnet.reconnect();
+            QDialog::accept();
+            return;
+        }
+
+        // Skip signal emission if mudlet::loadProfile already handled the connection
+        if (alsoConnect && hostExistedBefore) {
+            QDialog::accept();
+            return;
+        }
+
         pHost->setName(profile_name);
 
         if (!host_name_entry->text().trimmed().isEmpty()) {
@@ -1629,9 +2414,11 @@ void dlgConnectionProfiles::loadProfile(bool alsoConnect)
 
         if (!character_password_entry->text().trimmed().isEmpty()) {
             pHost->setPass(character_password_entry->text().trimmed());
-        } else {
-            slot_updatePassword(pHost->getPass());
         }
+        // Note: If password field is empty, we don't call slot_updatePassword() because:
+        // 1. The host's password was already loaded via Host::loadSecuredPassword()
+        // 2. Calling slot_updatePassword with empty password would delete the stored password
+        // 3. slot_updatePassword reads profile from list widget which could mismatch
 
         if (!login_entry->text().trimmed().isEmpty()) {
             pHost->setLogin(login_entry->text().trimmed());
@@ -1640,26 +2427,22 @@ void dlgConnectionProfiles::loadProfile(bool alsoConnect)
         }
 
         // This settings also need to be configured, note that the only time not to
-        // save the setting is on profile loading:
-        pHost->mTelnet.setEncoding(readProfileData(profile_name, qsl("encoding")).toUtf8(), false);
+        // save the setting is on profile loading. Only override the default UTF-8
+        // encoding if a saved encoding exists:
+        const QByteArray savedEncoding = readProfileData(profile_name, qsl("encoding")).toUtf8();
+        if (!savedEncoding.isEmpty()) {
+            pHost->mTelnet.setEncoding(savedEncoding, false);
+        }
         // Needed to ensure setting is correct on start-up:
         pHost->setWideAmbiguousEAsianGlyphs(pHost->getWideAmbiguousEAsianGlyphsControlState());
         pHost->setAutoReconnect(auto_reconnect->isChecked());
 
         // This also writes the value out to the profile's base directory:
-        mudlet::self()->mDiscord.setApplicationID(pHost, mDiscordApplicationId);
+        Discord::self()->setApplicationID(pHost, mDiscordApplicationId);
     }
 
-    if (preInstallPackages) {
-        mudlet::self()->setupPreInstallPackages(pHost->getUrl().toLower());
-        pHost->setupIreDriverBugfix();
-    }
-
-    mudlet::self()->updateMultiViewControls();
-
-    emit mudlet::self()->signal_hostCreated(pHost, hostManager.getHostCount());
-    emit mudlet::self()->signal_adjustAccessibleNames();
     emit signal_load_profile(profile_name, alsoConnect);
+    QDialog::accept();
 }
 
 bool dlgConnectionProfiles::validateProfile()
@@ -1671,27 +2454,56 @@ bool dlgConnectionProfiles::validateProfile()
         return true;
     }
 
+    // The form is locked while the dialog waits for the keychain, so nothing in it has changed
+    // since it was last validated - but a field losing the focus as it is locked still asks, and
+    // an answer would hand Connect and Offline back and clear the notice in the middle of the wait
+    if (mKeychainWaitShown) {
+        return validName && validUrl && validPort;
+    }
+
     validName = true, validPort = true, validUrl = true;
 
     clearNotificationArea();
 
-    QListWidgetItem* pItem = profiles_tree_widget->currentItem();
+    QListWidgetItem* pItem = listWidget_profiles->currentItem();
 
     if (pItem) {
         QString name = profile_name_entry->text().trimmed();
-        const QString allowedChars = qsl(". _0123456789-#&aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ");
 
-        for (int i = 0; i < name.size(); ++i) {
-            if (!allowedChars.contains(name.at(i))) {
-                notificationAreaIconLabelWarning->show();
-                notificationAreaMessageBox->setText(
-                        qsl("%1\n%2\n%3\n").arg(notificationAreaMessageBox->text(), tr("The %1 character is not permitted. Use one of the following:").arg(name.at(i)), allowedChars));
-                name.replace(name.at(i--), QString());
-                profile_name_entry->setText(name);
-                validName = false;
-                valid = false;
-                break;
-            }
+        // Only check the characters of a new or edited name: a profile folder
+        // already on disk may have been created outside of Mudlet (e.g. by a
+        // file manager copying a folder) with characters we would not permit
+        // for a new name - such a profile must still be loadable. Comparing
+        // against the trimmed item name covers folders with leading/trailing
+        // whitespace too, as the entered name always arrives trimmed. Names
+        // the rest of Mudlet cannot work with get no exemption: renaming them
+        // is worse for the user than a profile whose password never saves.
+        // "." and ".." name something that exists without being a profile, so
+        // the exemption needs a folder that is genuinely the profile's own.
+        const QString selectedName = pItem->data(csmNameRole).toString();
+        const QString selectedFolder = profileFolderPath(MudletApp::getMudletPath(enums::profilesPath), selectedName);
+        const bool nameIsFolderOnDisk = (name == selectedName.trimmed()) && !selectedFolder.isEmpty() && QDir(selectedFolder).exists();
+        const bool nameUnchangedAndOnDisk = nameIsFolderOnDisk && profileNameUsableAsIs(name);
+        const QChar invalidChar = nameUnchangedAndOnDisk ? QChar() : firstInvalidProfileNameChar(name);
+        if (!invalidChar.isNull()) {
+            notificationAreaIconLabelWarning->show();
+            notificationAreaMessageBox->setText(
+                    qsl("%1\n%2\n%3\n").arg(notificationAreaMessageBox->text(), tr("The %1 character is not permitted. Use one of the following:").arg(invalidChar), scmAllowedProfileNameChars));
+            name.remove(invalidChar);
+            profile_name_entry->setText(name);
+            validName = false;
+            valid = false;
+        } else if (!nameIsFolderOnDisk && !name.isEmpty() && !profileNameUsableAsIs(name)) {
+            // Nothing to strip here, unlike the branch above: the characters
+            // are all permitted, it is the whole name that cannot be a folder
+            notificationAreaIconLabelWarning->show();
+            notificationAreaMessageBox->setText(
+                    qsl("%1\n%2\n")
+                            .arg(notificationAreaMessageBox->text(),
+                                 //: Shown when a profile name would not name a folder of its own. Keep the quoted dots as they are, they are literal characters the user typed
+                                 tr("A profile name cannot be \".\" or contain \"..\", as those refer to other folders on your computer. Please pick a different name.")));
+            validName = false;
+            valid = false;
         }
 
         // see if there is an edit that already uses a similar name
@@ -1753,6 +2565,12 @@ bool dlgConnectionProfiles::validateProfile()
         check.setHost(url);
 
         if (url.isEmpty()) {
+            notificationAreaIconLabelWarning->show();
+            notificationAreaMessageBox->setText(
+                    qsl("%1\n%2\n\n")
+                            .arg(notificationAreaMessageBox->text(),
+                                 //: Shown in the connection dialog when a profile has no game server address. "Offline" is the dialog's own button and should be translated the same way it is
+                                 tr("Please enter the address of the game server to connect to it. Without one this profile can still be opened with the Offline button.")));
             host_name_entry->setPalette(mErrorPalette);
             validUrl = false;
             valid = false;
@@ -1766,26 +2584,26 @@ bool dlgConnectionProfiles::validateProfile()
             valid = false;
         }
 
-        if (url.indexOf(QRegularExpression(qsl("^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$")), 0) != -1) {
-            if (port_ssl_tsl->isChecked()) {
-                notificationAreaIconLabelError->show();
-                notificationAreaMessageBox->setText(
-                        qsl("%1\n%2\n\n%3").arg(notificationAreaMessageBox->text(), tr("Please enter the URL or IP address of the Game server."), check.errorString()));
-                host_name_entry->setPalette(mErrorPalette);
-                validUrl = false;
-                valid = false;
-            }
-        }
-
-        if (url.indexOf(QRegularExpression(qsl("^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$")), 0) != -1) {
-            if (port_ssl_tsl->isChecked()) {
-                notificationAreaIconLabelError->show();
-                notificationAreaMessageBox->setText(
-                        qsl("%1\n%2\n\n%3").arg(notificationAreaMessageBox->text(), tr("SSL connections require the URL of the Game server."), check.errorString()));
-                host_name_entry->setPalette(mErrorPalette);
-                validUrl = false;
-                valid = false;
-            }
+        // Need to reject raw IP addresses (of either version 4 or 6 type) as
+        // it is very unlikely that the Security Certificates include them as
+        // a Host Name.
+        if (port_ssl_tsl->isChecked() && (cTelnet::isRawIPv4Address(url) || cTelnet::isRawIPv6Address(url))) {
+            notificationAreaIconLabelError->show();
+            // As the only tags are not on the first line the default
+            // Qt::AutoFormat won't detect that rich-text is present in this text!
+            notificationAreaMessageBox->setTextFormat(Qt::RichText);
+            /*: Please use two line-feeds after the first line so the second
+ line can be italicised and spaced out - if appropriate for
+ the locale.*/
+            notificationAreaMessageBox->setText(qsl("%1%2\n\n%3")
+                                                        .arg(!notificationAreaMessageBox->text().isEmpty() ? notificationAreaMessageBox->text().append(QChar::LineFeed) : QString(),
+                                                             tr("Please enter the URL of the Game server.\n\n"
+                                                                "<i>SSL/TLS connections require a URL, as an IP address is not a suitable "
+                                                                "identifier for the certification of the Game Server.</i>"),
+                                                             check.errorString()));
+            host_name_entry->setPalette(mErrorPalette);
+            validUrl = false;
+            valid = false;
         }
 
         if (valid) {
@@ -1807,23 +2625,31 @@ bool dlgConnectionProfiles::validateProfile()
                 connect_button->setAccessibleDescription(btn_connect_enabled_accessDesc);
             }
             return true;
-        } else {
-            if (!notificationAreaMessageBox->text().isEmpty()) {
-                notificationArea->show();
-                notificationAreaMessageBox->show();
-            }
-            if (offline_button) {
-                offline_button->setEnabled(false);
-                offline_button->setToolTip(utils::richText(tr("Please set a valid profile name, game server address and the game port before loading.")));
-                offline_button->setAccessibleDescription(btn_connOrLoad_disabled_accessDesc);
-            }
-            if (connect_button) {
-                connect_button->setEnabled(false);
-                connect_button->setToolTip(utils::richText(tr("Please set a valid profile name, game server address and the game port before connecting.")));
-                connect_button->setAccessibleDescription(btn_connOrLoad_disabled_accessDesc);
-            }
-            return false;
         }
+        if (!notificationAreaMessageBox->text().isEmpty()) {
+            notificationArea->show();
+            notificationAreaMessageBox->show();
+        }
+        // Opening a profile needs nothing but a name that can be a folder of
+        // its own: Mudlet already opens a profile with no server address
+        // (--profile <name> --offline does), and a profile kept for package
+        // development, log reading or one whose url file was lost never has
+        // one. Refusing those left them listed under My games and unreachable,
+        // with nothing said - a disabled button cannot explain itself, as Qt
+        // does not deliver a tooltip to one. What is missing is in the
+        // notification area above instead.
+        if (offline_button) {
+            const bool nameUsable = validName && !name.isEmpty();
+            offline_button->setEnabled(nameUsable);
+            offline_button->setToolTip(utils::richText(nameUsable ? tr("Load profile without connecting.") : tr("Please set a valid profile name before loading.")));
+            offline_button->setAccessibleDescription(nameUsable ? btn_load_enabled_accessDesc : btn_connOrLoad_disabled_accessDesc);
+        }
+        if (connect_button) {
+            connect_button->setEnabled(false);
+            connect_button->setToolTip(utils::richText(tr("Please set a valid profile name, game server address and the game port before connecting.")));
+            connect_button->setAccessibleDescription(btn_connOrLoad_disabled_accessDesc);
+        }
+        return false;
     }
     return false;
 }
@@ -1841,16 +2667,16 @@ bool dlgConnectionProfiles::copyFolder(const QString& sourceFolder, const QStrin
         destDir.mkdir(destFolder);
     }
     QStringList files = sourceDir.entryList(QDir::Files);
-    for (int i = 0; i < files.count(); i++) {
-        const QString srcName = sourceFolder + QDir::separator() + files[i];
-        const QString destName = destFolder + QDir::separator() + files[i];
+    for (const QString& file : std::as_const(files)) {
+        const QString srcName = sourceFolder + QDir::separator() + file;
+        const QString destName = destFolder + QDir::separator() + file;
         QFile::copy(srcName, destName);
     }
     files.clear();
     files = sourceDir.entryList(QDir::AllDirs | QDir::NoDotAndDotDot);
-    for (int i = 0; i < files.count(); i++) {
-        const QString srcName = sourceFolder + QDir::separator() + files[i];
-        const QString destName = destFolder + QDir::separator() + files[i];
+    for (const QString& file : std::as_const(files)) {
+        const QString srcName = sourceFolder + QDir::separator() + file;
+        const QString destName = destFolder + QDir::separator() + file;
         copyFolder(srcName, destName);
     }
     return true;
@@ -1895,8 +2721,8 @@ QList<QListWidgetItem*> dlgConnectionProfiles::findData(const QListWidget& listW
 QList<int> dlgConnectionProfiles::findProfilesBeginningWith(const QString& what) const
 {
     QList<int> results;
-    for (int index = 0, total = profiles_tree_widget->count(); index < total; ++index) {
-        if (profiles_tree_widget->item(index)->data(csmNameRole).toString().startsWith(what, Qt::CaseInsensitive)) {
+    for (int index = 0, total = listWidget_profiles->count(); index < total; ++index) {
+        if (listWidget_profiles->item(index)->data(csmNameRole).toString().startsWith(what, Qt::CaseInsensitive)) {
             results.append(index);
         }
     }
@@ -1917,53 +2743,53 @@ void dlgConnectionProfiles::setItemName(QListWidgetItem* pI, const QString& name
 
 void dlgConnectionProfiles::setupMudProfile(QListWidgetItem* pItem, const QString& mudServer, const QString& serverDescription, const QString& iconFileName)
 {
-    pItem = new QListWidgetItem();
     setItemName(pItem, mudServer);
 
-    profiles_tree_widget->addItem(pItem);
-    if (!hasCustomIcon(mudServer)) {
-        QPixmap const pixmap(iconFileName);
-        if (pixmap.isNull()) {
+    listWidget_profiles->addItem(pItem);
+    // Only the "Mudlet self-test" entry has no catalog artwork, and it is deliberately kept out of
+    // players' way (https://github.com/Mudlet/Mudlet/issues/6443), so a blank row is fine. Named
+    // artwork that won't load gets a name plate and a warning, as nothing else would show it is broken
+    bool iconLoaded = true;
+    if (hasCustomIcon(mudServer)) {
+        iconLoaded = setCustomIcon(mudServer, pItem);
+    } else if (!iconFileName.isEmpty()) {
+        if (const QPixmap pixmap(iconFileName); pixmap.isNull()) {
             qWarning() << mudServer << "doesn't have a valid icon";
-            return;
-        }
-        if (pixmap.width() != 120) {
+            iconLoaded = false;
+            pItem->setIcon(customIcon(mudServer, getCustomColor(mudServer)));
+        } else if (pixmap.width() != 120) {
             pItem->setIcon(pixmap.scaled(QSize(120, 30), Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
         } else {
             pItem->setIcon(QIcon(iconFileName));
         }
-    } else {
-        setCustomIcon(mudServer, pItem);
     }
-    if (!serverDescription.isEmpty()) {
-        pItem->setToolTip(utils::richText(serverDescription));
-    }
+    setItemTooltip(pItem, serverDescription, iconLoaded);
 }
 
 QIcon dlgConnectionProfiles::customIcon(const QString& text, const std::optional<QColor>& backgroundColor) const
 {
     QPixmap background(120, 30);
 
-    QColor const color = backgroundColor.value_or(mCustomIconColors.at(static_cast<int>((qHash(text) * 8131) % mCustomIconColors.count())));
+    const QColor color = backgroundColor.value_or(mCustomIconColors.at(static_cast<int>((qHash(text) * 8131) % mCustomIconColors.count())));
     background.fill(color);
 
     // Set to one larger than wanted so that do loop can contain the decrementor
     int fontSize = 30;
     QFont font(qsl("Bitstream Vera Sans Mono"), fontSize, QFont::Normal);
     // For an icon of size 120x30 allow 89x29 for the text:
-    QRect const textRectangle(0, 0, 89, 29);
+    const QRect textRectangle(0, 0, 89, 29);
     QRect testRect;
     // Really long names will be drawn very small (font size 6) with the ends clipped off:
     do {
         font.setPointSize(--fontSize);
-        QFontMetrics const metrics(font);
+        const QFontMetrics metrics(font);
         testRect = metrics.boundingRect(textRectangle, Qt::AlignCenter | Qt::TextWordWrap, text);
     } while (fontSize > 6 && !textRectangle.contains(testRect));
 
     { // Enclosed in braces to limit lifespan of QPainter:
         QPainter painter(&background);
         painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
-        QPixmap const pixmap(qsl(":/icons/mudlet_main_32px.png"));
+        const QPixmap pixmap(qsl(":/icons/mudlet_main_32px.png"));
         painter.drawPixmap(QRect(5, 5, 20, 20), pixmap);
         if (color.lightness() > 127) {
             painter.setPen(Qt::black);
@@ -1987,21 +2813,18 @@ void dlgConnectionProfiles::clearNotificationArea()
 
 void dlgConnectionProfiles::slot_reenableAllProfileItems()
 {
-    for (int i = 0, total = profiles_tree_widget->count(); i < total; ++i) {
-        profiles_tree_widget->item(i)->setFlags(profiles_tree_widget->item(i)->flags() | Qt::ItemIsEnabled);
+    for (int i = 0, total = listWidget_profiles->count(); i < total; ++i) {
+        listWidget_profiles->item(i)->setFlags(listWidget_profiles->item(i)->flags() | Qt::ItemIsEnabled);
     }
 }
 
 bool dlgConnectionProfiles::eventFilter(QObject* obj, QEvent* event)
 {
-    if (obj == profiles_tree_widget && event->type() == QEvent::KeyPress) {
+    if (obj == listWidget_profiles && event->type() == QEvent::KeyPress) {
         QKeyEvent* keyEvent = static_cast<QKeyEvent*>(event);
         switch (keyEvent->key()) {
-            // Process all the keys that could be used in a profile name
-            // fortunately we limit this to a sub-set of ASCII because we also use
-            // it for a directory name - based on "allowedChars" list in
-            // validateProfile() i.e.:
-            // ". _0123456789-#&aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ"
+            // Process all the keys that could be used in a profile name,
+            // i.e. the "scmAllowedProfileNameChars" list
         default:
             // For other keys handle them as normal:
             return QObject::eventFilter(obj, event);
@@ -2029,6 +2852,8 @@ bool dlgConnectionProfiles::eventFilter(QObject* obj, QEvent* event)
         case Qt::Key_Minus:
         case Qt::Key_NumberSign:
         case Qt::Key_Ampersand:
+        case Qt::Key_ParenLeft:
+        case Qt::Key_ParenRight:
         case Qt::Key_A:
         case Qt::Key_B:
         case Qt::Key_C:
@@ -2099,15 +2924,207 @@ void dlgConnectionProfiles::addLetterToProfileSearch(const int key)
         return;
     }
 
-    for (int i = 0, total = profiles_tree_widget->count(); i < total; ++i) {
-        auto flags = profiles_tree_widget->item(i)->flags();
+    for (int i = 0, total = listWidget_profiles->count(); i < total; ++i) {
+        auto flags = listWidget_profiles->item(i)->flags();
         if (indexes.isEmpty() || !indexes.contains(i)) {
             flags &= ~Qt::ItemIsEnabled;
         } else {
             flags |= Qt::ItemIsEnabled;
         }
-        profiles_tree_widget->item(i)->setFlags(flags);
+        listWidget_profiles->item(i)->setFlags(flags);
     }
 
-    profiles_tree_widget->setCurrentRow(indexes.first());
+    listWidget_profiles->setCurrentRow(indexes.first());
+}
+
+void dlgConnectionProfiles::slot_loadPasswordAsync()
+{
+    if (!sender()) {
+        return;
+    }
+
+    // Get the profile name from the timer's property
+    QTimer* timer = qobject_cast<QTimer*>(sender());
+    if (!timer) {
+        return;
+    }
+
+    const QString profile_name = timer->property("profileName").toString();
+
+    // Prevent duplicate password loading operations for the same profile
+    if (!mKeychainOperationProfile.isEmpty()) {
+        return;
+    }
+
+    if (profile_name.isEmpty()) {
+        return;
+    }
+
+    // Clean up the timer
+    timer->deleteLater();
+
+    // Check if this dialog is still valid and the profile is still selected
+    if (listWidget_profiles->currentItem() == nullptr) {
+        return;
+    }
+
+    const QString currentProfileName = listWidget_profiles->currentItem()->data(csmNameRole).toString();
+
+    if (currentProfileName != profile_name) {
+        // Selection has changed, ignore this async load
+        return;
+    }
+
+    // If secure storage is enabled, try keychain first, then fallback to QSettings
+    if (MudletApp::storingPasswordsSecurely()) {
+        mKeychainOperationProfile = profile_name;
+        auto* credManager = new CredentialManager(this);
+        credManager->retrievePassword(
+                profile_name,
+                "character",
+                [this, credManager, profile_name](bool success, const QString& retrievedPassword, const QString& errorMessage, bool) {
+                    passwordRetrieved(profile_name, success, retrievedPassword, errorMessage);
+
+                    credManager->deleteLater();
+                },
+                this,
+                [this, profile_name](bool success, const QString& retrievedPassword, const QString& errorMessage) {
+                    passwordArrivedLate(profile_name, success, retrievedPassword, errorMessage);
+                });
+    } else {
+        // Secure storage disabled, use QSettings directly
+        loadPasswordFromSettings(profile_name);
+
+        // Check if there's a pending connection waiting
+        if (!completePendingProfileLoad(profile_name)) {
+            abandonPendingProfileLoad();
+        }
+    }
+}
+
+void dlgConnectionProfiles::passwordRetrieved(const QString& profileName, bool success, const QString& password, const QString& errorMessage)
+{
+    const bool profileStillSelected = listWidget_profiles->currentItem() && listWidget_profiles->currentItem()->data(csmNameRole).toString() == profileName;
+
+    // Clear the operation flag first
+    mKeychainOperationProfile.clear();
+
+    // Check if profile selection has changed while we were waiting
+    if (profileStillSelected) {
+        if (success) {
+            // Keychain operation succeeded - set the password (even if empty)
+            // Temporarily block textChanged signal to avoid triggering save on programmatic setText
+            {
+                const QSignalBlocker blocker(character_password_entry);
+                character_password_entry->setText(password);
+            }
+
+            if (password.isEmpty()) {
+                qDebug() << "dlgConnectionProfiles: Keychain returned empty password for" << profileName;
+            } else {
+                // Any lookup stage (keychain formats or the encrypted file) may have answered, and each logs
+                // where it found the password, so this line names no source.
+                qDebug() << "dlgConnectionProfiles: Successfully loaded the saved password for" << profileName;
+            }
+        } else {
+            // Fallback to QSettings only if credential retrieval failed, and only into an empty
+            // field: one the keychain answered late for an earlier read has the password already
+            if (character_password_entry->text().isEmpty()) {
+                loadPasswordFromSettings(profileName);
+            }
+            qDebug() << "dlgConnectionProfiles: Credential retrieval unsuccessful for" << profileName << "-" << errorMessage;
+        }
+    }
+
+    // Check if there's a pending connection waiting for this password load
+    // (do this regardless of profile selection state to avoid hanging)
+    if (!completePendingProfileLoad(profileName)) {
+        abandonPendingProfileLoad();
+    }
+}
+
+void dlgConnectionProfiles::passwordArrivedLate(const QString& profileName, bool success, const QString& password, const QString& errorMessage)
+{
+    if (!success) {
+        qDebug() << "dlgConnectionProfiles: Credential retrieval that had timed out was answered unsuccessfully for" << profileName << "-" << errorMessage;
+        return;
+    }
+
+    // An empty field has nothing in it to lose, while a password typed in the meantime is the user's
+    const bool profileStillSelected = listWidget_profiles->currentItem() && listWidget_profiles->currentItem()->data(csmNameRole).toString() == profileName;
+    if (!password.isEmpty() && profileStillSelected && character_password_entry->text().isEmpty()) {
+        const QSignalBlocker blocker(character_password_entry);
+        character_password_entry->setText(password);
+        qDebug() << "dlgConnectionProfiles: Credential retrieval that had timed out was answered, filling the empty password field for" << profileName;
+    }
+}
+
+void dlgConnectionProfiles::loadPasswordFromSettings(const QString& profile_name)
+{
+    // The profile's own "password" file first, because that is where this dialog
+    // writes it when passwords are kept in the profile (slot_updatePassword), and
+    // where Host reads it back. The settings below are the older location, from
+    // before there were profile data files at all: reading only those left the
+    // field blank for everyone whose password lives in the file, which is everyone
+    // who has chosen profile storage since that choice existed.
+    const QString fromProfile = readProfileData(profile_name, qsl("password"));
+    if (!fromProfile.isEmpty()) {
+        const QSignalBlocker blocker(character_password_entry);
+        character_password_entry->setText(fromProfile);
+        return;
+    }
+
+    auto& settings = *MudletApp::getQSettings();
+    settings.beginGroup(qsl("profiles/%1").arg(profile_name));
+
+    // Get password and handle migration
+    const QString password = settings.value(qsl("password"), QString()).toString();
+    const QString oldPassword = settings.value(qsl("login"), QString()).toString();
+
+    // Temporarily block textChanged signal to avoid triggering save on programmatic setText
+    {
+        const QSignalBlocker blocker(character_password_entry);
+
+        if (!password.isEmpty()) {
+            character_password_entry->setText(password);
+        } else if (!oldPassword.isEmpty()) {
+            // Migrate old password
+            character_password_entry->setText(oldPassword);
+            settings.setValue(qsl("password"), oldPassword);
+            settings.remove(qsl("login"));
+        } else {
+            character_password_entry->setText(QString());
+        }
+    }
+
+    settings.endGroup();
+}
+
+void dlgConnectionProfiles::slot_passwordTextChanged()
+{
+    QListWidgetItem* pItem = listWidget_profiles->currentItem();
+    if (!pItem) {
+        return;
+    }
+    mPendingPasswordSaveProfile = pItem->data(csmNameRole).toString();
+
+    // Cancel any pending password save
+    if (mPasswordSaveTimer) {
+        mPasswordSaveTimer->stop();
+    } else {
+        mPasswordSaveTimer = new QTimer(this);
+        mPasswordSaveTimer->setSingleShot(true);
+        mPasswordSaveTimer->setInterval(500ms); // 500ms debounce
+        connect(mPasswordSaveTimer, &QTimer::timeout, this, [this]() {
+            if (!mPendingPasswordSaveProfile.isEmpty()) {
+                // Check if this profile is STILL selected - if not, don't save
+                // (user switched away, so the password field content is for a different profile)
+                QListWidgetItem* currentItem = listWidget_profiles->currentItem();
+                if (currentItem && currentItem->data(csmNameRole).toString() == mPendingPasswordSaveProfile) {
+                    slot_updatePassword(character_password_entry->text());
+                }
+            }
+        });
+    }
+    mPasswordSaveTimer->start();
 }

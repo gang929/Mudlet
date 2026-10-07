@@ -26,14 +26,11 @@
 
 #include "Tree.h"
 
-#include "pre_guard.h"
 #include <QDebug>
+#include <QDebugStateSaver>
+#include <QFlag>
 #include <QPointer>
-#include "post_guard.h"
-
-extern "C" {
-    #include <lua.h>
-}
+#include <QString>
 
 class Host;
 
@@ -49,7 +46,7 @@ public:
     TKey(QString name, Host* pHost);
     void compileAll();
     QString getName() const { return mName; }
-    void setName(const QString & name);
+    void setName(const QString& name);
     Qt::Key getKeyCode() const { return mKeyCode; }
     void setKeyCode(const Qt::Key code) { mKeyCode = code; }
     void setKeyCode(const int codeNumber) { setKeyCode(static_cast<Qt::Key>(codeNumber)); }
@@ -65,13 +62,22 @@ public:
     bool setScript(const QString& script);
     void setCommand(QString command) { mCommand = command; }
     QString getCommand() const { return mCommand; }
+    QString packageName(TKey* pKey);
+    QString moduleName(TKey* pKey);
+
 
     bool match(const Qt::Key, const Qt::KeyboardModifiers, const bool);
+    // Query-only counterpart to match(), which executes what it matches
+    bool wouldMatch(const Qt::Key, const Qt::KeyboardModifiers) const;
+    // The binding wouldMatch() found, for naming it in a clash report
+    const TKey* firstMatch(const Qt::Key, const Qt::KeyboardModifiers) const;
     bool registerKey();
+    void validateKeyBinding();
 
     bool exportItem = true;
     bool mModuleMasterFolder = false;
     bool mRegisteredAnonymousLuaFunction = false;
+    QPointer<Host> mpHost;
 
 private:
     TKey() = default;
@@ -88,14 +94,11 @@ private:
      * Qt::KeypadModifier  0x20000000 A keypad button is pressed.
      */
 
-    // Have to use brace default initiliaser here as there is not a null enum
-    // value declared:
-    Qt::Key mKeyCode = {};
+    Qt::Key mKeyCode = Qt::Key_unknown;
     Qt::KeyboardModifiers mKeyModifier = Qt::NoModifier;
 
     QString mScript;
     QString mFuncName;
-    QPointer<Host> mpHost;
     bool mNeedsToBeCompiled = true;
     bool mModuleMember = false;
 };
@@ -104,7 +107,7 @@ private:
 inline QDebug& operator<<(QDebug& debug, const TKey* key)
 {
     QDebugStateSaver saver(debug);
-    Q_UNUSED(saver);
+    Q_UNUSED(saver)
     debug.nospace() << "TKey(" << key->getName();
     debug.nospace() << ", keyCode=" << key->getKeyCode();
     debug.nospace() << ", keyModifiers=" << key->getKeyModifiers();

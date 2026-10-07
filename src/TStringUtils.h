@@ -20,20 +20,21 @@
 #ifndef MUDLET_TSTRINGUTILS_H
 #define MUDLET_TSTRINGUTILS_H
 
-#include "pre_guard.h"
+#include <QByteArray>
 #include <QString>
 #include <QStringList>
-#include "post_guard.h"
 #include <functional>
+#include <string>
 #include "utils.h"
 
 #define CHAR_NEW_LINE '\n'
 #define CHAR_CARRIAGE_RETURN '\r'
 #define CHAR_END_OF_FILE '\xff'
-#define CHAR_END_OF_TEXT '\004'
+#define CHAR_END_OF_TEXT '\003'
+#define CHAR_END_OF_TRANSMISSION '\004'
 #define CHAR_ESC '\033'
 
-#define CHAR_IS_COMMIT_CHAR(ch) ((ch) == CHAR_NEW_LINE || (ch) == CHAR_CARRIAGE_RETURN || (ch) == CHAR_END_OF_FILE || (ch) == CHAR_END_OF_TEXT)
+#define CHAR_IS_COMMIT_CHAR(ch) ((ch) == CHAR_NEW_LINE || (ch) == CHAR_CARRIAGE_RETURN || (ch) == CHAR_END_OF_FILE || (ch) == CHAR_END_OF_TRANSMISSION)
 
 
 class TStringUtils
@@ -41,6 +42,11 @@ class TStringUtils
 public:
     static bool isQuote(QChar ch);
     static bool isOneOf(QChar inputCharacter, const QString& characterSet);
+
+    // Decode raw MXP bytes into text using the active session encoding.
+    // Shared by the raw tag/content path and the attribute parser so both
+    // interpret non-ASCII bytes identically.
+    static QString decodeBytes(const std::string& bytes, const QByteArray& encoding);
 };
 
 #endif //MUDLET_TSTRINGUTILS_H

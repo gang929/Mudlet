@@ -23,16 +23,16 @@
  ***************************************************************************/
 
 
-#include "pre_guard.h"
 #include "ui_room_exits.h"
-#include <QCheckBox>
 #include <QDialog>
 #include <QPointer>
 #include <QSet>
 #include <QStyledItemDelegate>
-#include "post_guard.h"
+#include <map>
+#include <memory>
 
 class QAction;
+class QCheckBox;
 class Host;
 class TRoom;
 
@@ -116,6 +116,7 @@ class dlgRoomExits : public QDialog, public Ui::room_exits
 {
     Q_OBJECT
     friend class RoomIdLineEditDelegate;
+    friend class RoomExitsDeletedEditItemTest;
 
 public:
     Q_DISABLE_COPY(dlgRoomExits)
@@ -146,6 +147,7 @@ public slots:
     void slot_addSpecialExit();
     void slot_editSpecialExit(QTreeWidgetItem*, int);
     void slot_endEditSpecialExits();
+    void slot_specialExitRowsAboutToBeRemoved(const QModelIndex&, int, int);
     void slot_ne_textEdited(const QString&);
     void slot_n_textEdited(const QString&);
     void slot_nw_textEdited(const QString&);
@@ -181,7 +183,7 @@ private:
                   QCheckBox* noRoute, QCheckBox* stub,
                   QRadioButton* none, QRadioButton* open, QRadioButton* closed, QRadioButton* locked,
                   QSpinBox* weight, const QString &validExitToolTip);
-    TExit* makeExitFromControls(int direction);
+    std::unique_ptr<TExit> makeExitFromControls(int direction);
     void normalExitEdited(const QString& roomExitIdText,
                           QLineEdit* pExit,
                           QCheckBox* pNoRoute,
@@ -209,12 +211,13 @@ private:
     QTreeWidgetItem* mpEditItem = nullptr;
     TRoom* pR = nullptr;
     int mRoomID = 0;
+    quint64 mRoomSerial = 0;
     int mAreaID = 0;
     int mEditColumn = -1;
 
-    // key = (normal) exit DIR_***, value = exit class instance
-    QMap<int, TExit*> originalExits;
-    QMap<QString, TExit*> originalSpecialExits;
+    // key = (normal) exit DIR_***, value = owned exit class instance
+    std::map<int, std::unique_ptr<TExit>> originalExits;
+    std::map<QString, std::unique_ptr<TExit>> originalSpecialExits;
 };
 
 #endif // MUDLET_DLGROOMEXITS_H

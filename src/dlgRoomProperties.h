@@ -3,7 +3,8 @@
 
 /***************************************************************************
  *   Copyright (C) 2021 by Piotr Wilczynski - delwing@gmail.com            *
- *   Copyright (C) 2022-2023 by Stephen Lyons - slysven@virginmedia.com    *
+ *   Copyright (C) 2022-2023, 2025 by Stephen Lyons                        *
+ *                                               - slysven@virginmedia.com *
  *   Copyright (C) 2022 by Lecker Kebap - Leris@mudlet.org                 *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
@@ -22,12 +23,15 @@
  *   59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.             *
  ***************************************************************************/
 
-#include "Host.h"
-
-#include "pre_guard.h"
 #include "ui_room_properties.h"
-#include "post_guard.h"
 
+#include <QColor>
+#include <QListWidget>
+
+#include <optional>
+
+class Host;
+class TRoom;
 
 class dlgRoomProperties : public QDialog, public Ui::room_properties
 {
@@ -36,24 +40,32 @@ class dlgRoomProperties : public QDialog, public Ui::room_properties
 public:
     Q_DISABLE_COPY(dlgRoomProperties)
     explicit dlgRoomProperties(Host*, QWidget* parent = nullptr);
-    void init(
-        QHash<QString, int> usedNames,
-        QHash<int, int>& pColors,
-        QHash<QString, int>& pSymbols,
-        QHash<int, int>& pWeights,
-        QHash<bool, int> lockStatus,
-        QSet<TRoom*>& pRooms);
+    void
+    init(QHash<QString, int> usedNames, QHash<int, int>& pColors, QHash<QString, int>& pSymbols, QHash<int, int>& pWeights, QHash<bool, int> lockStatus, int hiddenRoomCount, const QSet<int>& roomIds);
     void accept() override;
+    void reject() override;
 
 signals:
-    void signal_save_symbol(
-        bool changeName, QString newName,
-        bool mChangeRoomColor, int mRoomColorNumber,
-        bool changeSymbol, QString newSymbol,
-        bool changeSymbolColor, QColor newSymbolColor,
-        bool changeWeight, int newWeight,
-        bool changeLockStatus, bool newLockStatus,
-        QSet<TRoom*> mpRooms);
+    void signal_save_symbol(bool changeName,
+                            QString newName,
+                            bool mChangeRoomColor,
+                            int mRoomColorNumber,
+                            bool changeSymbol,
+                            QString newSymbol,
+                            bool changeSymbolColor,
+                            QColor newSymbolColor,
+                            bool changeWeight,
+                            int newWeight,
+                            bool changeLockStatus,
+                            std::optional<bool> newLockStatus,
+                            bool changeHiddenStatus,
+                            std::optional<bool> newHiddenStatus,
+                            bool changeBorderColor,
+                            QColor newBorderColor,
+                            bool changeBorderThickness,
+                            int newBorderThickness,
+                            QSet<int> roomIds);
+    void signal_preview_border(QSet<int> roomIds);
 
 private:
     QColor backgroundBasedColor(QColor);
@@ -67,15 +79,29 @@ private:
     void initWeightInstructions();
     QStringList getComboBoxWeightItems();
     void initLockInstructions();
+    void initHiddenInstructions(const int);
+    void initBorderInstructions();
+    void emitBorderPreview();
+    void restoreOriginalBorders();
+    TRoom* liveRoom(const int) const;
+    QSet<int> liveRoomIds() const;
 
     Host* mpHost = nullptr;
-    QSet<TRoom*> mpRooms;
+    QSet<int> mRoomIds;
+    QHash<int, quint64> mRoomSerials;
     QHash<QString, int> mpSymbols;
     QHash<int, int> mpWeights;
     QColor selectedSymbolColor;
     QColor mRoomColor;
     int mRoomColorNumber = -1;
     bool mChangeRoomColor = false;
+    bool mSymbolColorWasChanged = false;
+    QColor selectedBorderColor;
+    int mBorderThickness = 0;
+    bool mBorderColorWasChanged = false;
+    bool mBorderThicknessWasChanged = false;
+    QHash<int, QColor> mOriginalBorderColors;
+    QHash<int, int> mOriginalBorderThicknesses;
     QString multipleValuesPlaceholder = tr("(Multiple values...)");
 
 private slots:
@@ -90,6 +116,11 @@ private slots:
 
     void slot_symbolComboBoxItemChanged(const int);
     void slot_weightComboBoxItemChanged(const int);
+
+    void slot_openBorderColorSelector();
+    void slot_borderColorSelected(const QColor&);
+    void slot_resetBorderColor();
+    void slot_borderThicknessChanged(int);
 };
 
 #endif // MUDLET_DLGROOMPROPERTIES_H

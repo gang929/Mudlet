@@ -1,9 +1,3 @@
--- for appveyor
-mingw_base_dir = os.getenv("MINGW_BASE_DIR")
-if mingw_base_dir then
-  package.path = package.path .. ";"..mingw_base_dir.."/share/lua/5.1/?.lua"
-end
-
 local argparse = require "argparse"
 local lunajson = require "lunajson"
 
@@ -12,13 +6,16 @@ local lunajson = require "lunajson"
 utf8 = utf8 or {}
 
 local github_workspace = os.getenv("GITHUB_WORKSPACE")
+local function_list_path
 if github_workspace then
   -- the script struggles to load the load files relatively in CI
   loadfile(github_workspace.. "/src/mudlet-lua/lua/StringUtils.lua")()
   loadfile(github_workspace.."/src/mudlet-lua/lua/TableUtils.lua")()
+  function_list_path = github_workspace.."/src/lua-function-list.json"
 else
   loadfile("../src/mudlet-lua/lua/StringUtils.lua")()
   loadfile("../src/mudlet-lua/lua/TableUtils.lua")()
+  function_list_path = "../src/lua-function-list.json"
 end
 
 local parser = argparse("generate-changelog.lua", "Generate a changelog from the HEAD until the most recent published commit.")
@@ -60,9 +57,10 @@ local htmlBuilder = {
     for s in string.gmatch(text, "(.-)\n") do
       s = escape_for_html(s)
       s = s:gsub("%(#(.-)%)", [[<a href='https://github.com/Mudlet/Mudlet/pull/%1'>(#%1)</a>]])
+      s = link_functions_html(s)
       t[#t+1] = string.format("<p>%s</p>", s)
     end
-  
+
     return table.concat(t, "\n")
   end
 }
@@ -74,11 +72,11 @@ local mdBuilder = {
     local t = {}
     text = text.."\n"
     for s in string.gmatch(text, "(.-)\n") do
-      s = escape_for_html(s)
       s = s:gsub("%(#(.-)%)", "[#%1](https://github.com/Mudlet/Mudlet/pull/%1)")
+      s = link_functions_md(s)
       t[#t+1] = string.format("\\%s\n", s)
     end
-  
+
     return table.concat(t, "\n")
   end
 }
@@ -111,6 +109,49 @@ function read_file(path)
     local content = file:read "*a"
     file:close()
     return content
+end
+
+-- Load function names from lua-function-list.json for auto-linking
+local function_names = {}
+local function_list_content = read_file(function_list_path)
+if function_list_content then
+  local function_list = lunajson.decode(function_list_content)
+  for name, _ in pairs(function_list) do
+    function_names[#function_names + 1] = name
+  end
+  -- Sort by length descending so longer names are matched first
+  -- (e.g., "selectString" before "select")
+  table.sort(function_names, function(a, b) return #a > #b end)
+end
+
+-- Escape special Lua pattern characters
+local function escape_pattern(str)
+  return str:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
+end
+
+-- Link function names to wiki documentation (HTML format)
+function link_functions_html(text)
+  for _, name in ipairs(function_names) do
+    local escaped_name = escape_pattern(name)
+    -- Match function name with optional () at word boundaries
+    -- Use frontier pattern %f for word boundary detection on both sides
+    local pattern = "(%f[%w])" .. escaped_name .. "(%f[^%w])(%(?)(%)?)"
+    local replacement = "%1<a href='https://wiki.mudlet.org/w/Manual:Lua_Functions#" .. name .. "'>" .. name .. "</a>%3%4"
+    text = text:gsub(pattern, replacement)
+  end
+  return text
+end
+
+-- Link function names to wiki documentation (Markdown format)
+function link_functions_md(text)
+  for _, name in ipairs(function_names) do
+    local escaped_name = escape_pattern(name)
+    -- Match function name with optional () at word boundaries
+    local pattern = "(%f[%w])" .. escaped_name .. "(%f[^%w])(%(?)(%)?)"
+    local replacement = "%1[" .. name .. "](https://wiki.mudlet.org/w/Manual:Lua_Functions#" .. name .. ")%3%4"
+    text = text:gsub(pattern, replacement)
+  end
+  return text
 end
 
 function extract_released_sha1s(input)
@@ -202,7 +243,7 @@ function print_sorted_changelog(changelog)
     elseif line:match(autoPattern) then --"(autocommit)" to catch bot PRs which may not start with "infra"
       trimmedLine = prefix .. line:match(autoPattern)
       infra[#infra+1] = trimmedLine
-    else
+    elseif line:trim() ~= "" then
       other[#other+1] = prefix .. line
     end
   end

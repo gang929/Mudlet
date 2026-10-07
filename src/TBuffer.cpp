@@ -1,7 +1,7 @@
 /***************************************************************************
  *   Copyright (C) 2008-2013 by Heiko Koehn - KoehnHeiko@googlemail.com    *
  *   Copyright (C) 2014 by Ahmed Charles - acharles@outlook.com            *
- *   Copyright (C) 2014-2018, 2020, 2022-2023 by Stephen Lyons             *
+ *   Copyright (C) 2014-2018, 2020, 2022-2024, 2026 by Stephen Lyons       *
  *                                               - slysven@virginmedia.com *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
@@ -23,50 +23,492 @@
 
 #include "TBuffer.h"
 
-#include "mudlet.h"
+#include "Host.h"
+#include "LuaLiteral.h"
+#include "TConsoleModel.h"
 #include "TEvent.h"
+#include "THyperlinkCompactManager.h"
+#include "THyperlinkVisibilityManager.h"
+#include "THyperlinkSelectionManager.h"
+#include "TPrintSink.h"
 #include "TStringUtils.h"
+#include "UntrustedText.h"
+#include "TTextProperties.h"
+#include "widechar_width.h"
+#include "TEncodingHelper.h"
+#include "SentryWrapper.h"
+#include "mudlet.h"
 
-#include "pre_guard.h"
-#include <QTextBoundaryFinder>
-#include <QTextCodec>
+#include <QDateTime>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
+#include <QJsonValue>
 #include <QRegularExpression>
-#include "post_guard.h"
+#include <QTextBoundaryFinder>
+#include <QTime>
+#include <QTimer>
+#include <QUrlQuery>
 
-// Define this to get qDebug() messages about the decoding of UTF-8 data when it
-// is not the single bytes of pure ASCII text:
-// #define DEBUG_UTF8_PROCESSING
-// Define this to get qDebug() messages about the decoding of GB2312/GBK/GB18030
-// data when it is not the single bytes of pure ASCII text:
-// #define DEBUG_GB_PROCESSING
-// Define this to get qDebug() messages about the decoding of BIG5
-// data when it is not the single bytes of pure ASCII text:
-// #define DEBUG_BIG5_PROCESSING
-// Define this to get qDebug() messages about the decoding of EUC-KR
-// data when it is not the single bytes of pure ASCII text:
-// #define DEBUG_EUC_KR_PROCESSING
-// Define this to get qDebug() messages about the decoding of ANSI SGR sequences:
-// #define DEBUG_SGR_PROCESSING
-// Define this to get qDebug() messages about the decoding of ANSI OSC sequences:
-// #define DEBUG_OSC_PROCESSING
-// Define this to get qDebug() messages about the decoding of ANSI MXP sequences
-// although there is not much against this item at present {only an announcement
-// of the type (?) of an `\x1b[?z` received}:
-//#define DEBUG_MXP_PROCESSING
+#include <QScopeGuard>
 
+#include <algorithm>
+#include <cstring>
+#include <span>
+#include <iterator>
+#include <limits>
+#include <optional>
+#include <utility>
+#include <chrono>
+
+// for system physical memory info
+#if defined(Q_OS_WINDOWS)
+#include <Windows.h>
+#elif defined(Q_OS_MACOS)
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#include <unistd.h>
+#elif defined(Q_OS_HURD)
+#include <errno.h>
+#include <unistd.h>
+#elif defined(Q_OS_OPENBSD)
+// OpenBSD doesn't have a sysinfo.h
+#include <sys/sysctl.h>
+#include <unistd.h>
+#elif defined(Q_OS_UNIX)
+// Including both GNU/Linux and FreeBSD
+#include <sys/sysinfo.h>
+#include <sys/types.h>
+#include <unistd.h>
+#else
+// Any other OS?
+#endif
+
+using namespace std::chrono_literals;
+
+namespace {
+
+// credit to https://github.com/DigitalInBlue/Celero/blob/master/src/Memory.cpp
+int64_t physicalMemoryTotal()
+{
+#if defined(Q_OS_WINDOWS)
+    MEMORYSTATUSEX memInfo;
+    memInfo.dwLength = sizeof(MEMORYSTATUSEX);
+    GlobalMemoryStatusEx(&memInfo);
+    return static_cast<int64_t>(memInfo.ullTotalPhys);
+#elif defined(Q_OS_HURD)
+    // GNU/Hurd does not have a sysinfo struct  yet:
+    errno = 0;
+    int64_t pageSize = sysconf(_SC_PAGESIZE);
+    if (pageSize < 0) {
+        if (errno) {
+            qDebug().nospace().noquote() << "physicalMemoryTotal() WARNING - error returned from sysconf(_SC_PAGESIZE); errno: " << errno;
+        } else {
+            qDebug().nospace().noquote() << "physicalMemoryTotal() WARNING - indeterminent limit returned from sysconf(_SC_PAGESIZE).";
+        }
+        return -1;
+    }
+    int64_t pageCount = sysconf(_SC_PHYS_PAGES);
+    if (pageCount < 0) {
+        if (errno) {
+            qDebug().nospace().noquote() << "physicalMemoryTotal() WARNING - error returned from sysconf(_SC_PHYS_PAGES); errno: " << errno;
+        } else {
+            qDebug().nospace().noquote() << "physicalMemoryTotal() WARNING - indeterminent limit returned from sysconf(_SC_PHYS_PAGES).";
+        }
+        return -1;
+    }
+    return pageSize * pageCount;
+#elif defined(Q_OS_MACOS)
+    int mib[2];
+    mib[0] = CTL_HW;
+    mib[1] = HW_MEMSIZE;
+
+    int64_t memInfo{0};
+    auto len = sizeof(memInfo);
+
+    if (!sysctl(mib, 2, &memInfo, &len, nullptr, 0)) {
+        return memInfo;
+    }
+
+    return -1;
+#elif defined(Q_OS_OPENBSD)
+    // Very similar to MacOS but uses a different second level name
+    int mib[2];
+    mib[0] = CTL_HW;
+    mib[1] = HW_PHYSMEM64; // Or do we really want HW_USERMEM64?
+
+    int64_t memInfo{0};
+    auto len = sizeof(memInfo);
+
+    if (!sysctl(mib, 2, &memInfo, &len, nullptr, 0)) {
+        return memInfo;
+    }
+
+    return -1;
+#elif defined(Q_OS_UNIX)
+    // Including both GNU/Linux and FreeBSD:
+    // Prefer sysctl() over sysconf() except sysctl() HW_REALMEM and HW_PHYSMEM
+    // return static_cast<int64_t>(sysconf(_SC_PHYS_PAGES)) * static_cast<int64_t>(sysconf(_SC_PAGE_SIZE));
+    struct sysinfo memInfo;
+    sysinfo(&memInfo);
+    int64_t const total = memInfo.totalram;
+    return total * static_cast<int64_t>(memInfo.mem_unit);
+#else
+    return -1;
+#endif
+}
+
+// QTime::currentTime() consults the timezone database per call (on glibc a stat() of /etc/localtime), so
+// reuse the stamp until the millisecond or the (translatable) format changes.
+QString currentTimeStamp()
+{
+    static qint64 cachedMSecs = 0;
+    static QString cachedFormat;
+    static QString cachedStamp;
+
+    // The cached format is a copy of the static, so until that is reassigned the two share one buffer
+    // and the characters need no comparing:
+    if (QDateTime::currentMSecsSinceEpoch() != cachedMSecs || cachedFormat.constData() != TBuffer::smTimeStampFormat.constData()) {
+        // Filed under the millisecond it was read in, which the clock may have moved past since the check
+        // above; the earlier one would stamp the rest of this millisecond's lines a millisecond early.
+        const QDateTime now = QDateTime::currentDateTime();
+        cachedMSecs = now.toMSecsSinceEpoch();
+        cachedFormat = TBuffer::smTimeStampFormat;
+        cachedStamp = now.time().toString(TBuffer::smTimeStampFormat);
+    }
+    return cachedStamp;
+}
+
+// Writes "rgb(r,g,b)" without the allocations QString::number() and arg() make
+void appendHtmlRgb(QString& s, const QRgb color)
+{
+    const auto appendChannel = [&s](const int value) {
+        char digits[3];
+        qsizetype count = 0;
+        if (value >= 100) {
+            digits[count++] = static_cast<char>('0' + value / 100);
+        }
+        if (value >= 10) {
+            digits[count++] = static_cast<char>('0' + (value / 10) % 10);
+        }
+        digits[count++] = static_cast<char>('0' + value % 10);
+        s.append(QLatin1StringView(digits, count));
+    };
+    s.append(QLatin1StringView("rgb("));
+    appendChannel(qRed(color));
+    s.append(QLatin1Char(','));
+    appendChannel(qGreen(color));
+    s.append(QLatin1Char(','));
+    appendChannel(qBlue(color));
+    s.append(QLatin1Char(')'));
+}
+
+void appendHtmlEscaped(QString& s, const QChar* text, const qsizetype length)
+{
+    qsizetype runStart = 0;
+    for (qsizetype i = 0; i < length; ++i) {
+        const char16_t c = text[i].unicode();
+        if (c != u'<' && c != u'>') {
+            continue;
+        }
+        s.append(text + runStart, i - runStart);
+        s.append(c == u'<' ? QLatin1StringView("&lt;") : QLatin1StringView("&gt;"));
+        runStart = i + 1;
+    }
+    s.append(text + runStart, length - runStart);
+}
+
+// Asks for the cache line holding the allocator's bookkeeping for a heap block,
+// which freeing it reads first and which (in glibc) sits just below the address
+// the allocator handed out - itself ownHeaderBytes below the contents for a
+// container that keeps a header of its own in the block. Integer arithmetic
+// because the contents may be a static's (an empty QString), where stepping a
+// pointer outside the object is undefined; a prefetch itself never faults
+// whatever it is aimed at.
+inline void prefetchAllocatorHeader(const void* contents, const quintptr ownHeaderBytes)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    constexpr quintptr allocatorHeaderBytes = 8;
+    __builtin_prefetch(reinterpret_cast<const void*>(reinterpret_cast<quintptr>(contents) - ownHeaderBytes - allocatorHeaderBytes));
+#else
+    Q_UNUSED(contents)
+    Q_UNUSED(ownHeaderBytes)
+#endif
+}
+
+// How much of a string sequence (OSC, DCS, SOS, PM or APC) is held while
+// waiting for its terminator - beyond this the bytes are discarded as they
+// arrive rather than buffered, so a server that never terminates one cannot
+// grow mIncompleteSequenceBytes without bound
+constexpr size_t MAX_OSC_SEQUENCE_LENGTH = 4096;
+
+// How much of a discarded string sequence to quote in the warning about it
+constexpr size_t STRING_SEQUENCE_EXCERPT_LENGTH = 40;
+
+// Whether a byte ends the line a string sequence (OSC, DCS, SOS, PM or APC)
+// started on, and with it the sequence: everything CHAR_IS_COMMIT_CHAR() calls
+// the end of a line except the carriage return. cTelnet strips the game's own
+// carriage returns and injects one of its own once the game goes quiet, to
+// flush a line that is still arriving (cTelnet::slot_timerPosting()), so
+// treating that one as an ending would cut a payload short merely for being
+// bigger than one network packet timeout's worth of data
+bool endsStringSequence(const char byte)
+{
+    return byte != CHAR_CARRIAGE_RETURN && CHAR_IS_COMMIT_CHAR(byte);
+}
+
+// How much of a chunk the multi-byte decoders may see. cTelnet strips the game's carriage returns
+// (readPipe()) and appends one as a flush marker when the game pauses mid-line (slot_timerPosting()).
+// Decoding a sequence against it loses the character (in Big5 and GB also the next byte); held back,
+// it acts as a chunk boundary and still commits the line it came to flush.
+size_t decodableLength(const std::string& data, const size_t length, const bool isFromServer)
+{
+    if (isFromServer && length && data[length - 1] == CHAR_CARRIAGE_RETURN) {
+        return length - 1;
+    }
+    return length;
+}
+
+// Decodes to one QChar of the same value in every encoding, so runs can be bulk-copied: every 7-bit byte
+// but the line endings, EOT and ESC, which the loop acts on. Other C0 controls decode to themselves.
+// Not DEL: EUC-KR renders it as the replacement character.
+bool bulkCopyableTextByte(const char byte)
+{
+    return static_cast<unsigned char>(byte) < 0x7F && byte != CHAR_NEW_LINE && byte != CHAR_CARRIAGE_RETURN && byte != CHAR_END_OF_TRANSMISSION && byte != CHAR_ESC;
+}
+
+// True when all eight bytes are printable ASCII (space to '~'), every one of
+// which bulkCopyableTextByte() accepts. Anything else - including the control
+// characters that are copyable - answers false and is left to the byte-wise
+// test. Both halves are the classic "does any byte of the word..." tests: a
+// borrow or carry can only leave a byte that already tripped the test, so they
+// never report a clean word as dirty or the reverse.
+bool eightPrintableAsciiBytes(const char* bytes)
+{
+    quint64 word = 0;
+    std::memcpy(&word, bytes, sizeof(word));
+    constexpr quint64 ones = 0x0101010101010101ULL;
+    constexpr quint64 highBits = 0x8080808080808080ULL;
+    const quint64 belowSpace = (word - ones * 0x20) & ~word & highBits;
+    const quint64 aboveTilde = ((word + ones) | word) & highBits;
+    return !(belowSpace | aboveTilde);
+}
+
+// The byte classes of a CSI sequence, ECMA-48 5.4: a parameter string is
+// made of bytes 0x30 to 0x3F ("0123456789:;<=>?"), so '<', '=', '>' and '?'
+// do not end it when they turn up after the first byte - games do emit them
+// there and every other terminal consumes them - but in the FIRST position
+// they mark the whole sequence as private/reserved. Intermediate bytes are
+// 0x20 to 0x2F and the final byte is 0x40 to 0x7E.
+constexpr bool csiParameterByte(const char byte)
+{
+    return (static_cast<unsigned char>(byte) & 0xF0) == 0x30;
+}
+
+constexpr bool csiPrivateIntroducerByte(const char byte)
+{
+    return static_cast<unsigned char>(byte) >= 0x3C && static_cast<unsigned char>(byte) <= 0x3F;
+}
+
+constexpr bool csiIntermediateByte(const char byte)
+{
+    return (static_cast<unsigned char>(byte) & 0xF0) == 0x20;
+}
+
+constexpr bool csiFinalByte(const char byte)
+{
+    return static_cast<unsigned char>(byte) >= 0x40 && static_cast<unsigned char>(byte) <= 0x7E;
+}
+
+// An SGR parameter is nearly always a short run of digits, which this reads
+// directly; anything else - a private byte, a number too long for an int -
+// is left to QStringView::toInt(), whose general parse costs more than the
+// rest of the sequence's handling.
+bool sgrDigits(const QStringView parameter, int& value)
+{
+    if (parameter.isEmpty() || parameter.size() > 9) {
+        return false;
+    }
+    int result = 0;
+    for (const QChar c : parameter) {
+        const char16_t unicode = c.unicode();
+        if (unicode < u'0' || unicode > u'9') {
+            return false;
+        }
+        result = result * 10 + (unicode - u'0');
+    }
+    value = result;
+    return true;
+}
+
+// Maximum length for a CSI sequence's parameter string before aborting - a
+// valid one is only a handful of bytes, so this only trips on a malformed or
+// hostile sequence that never sends a final byte (defense against a server
+// growing mIncompleteSequenceBytes without bound across packets)
+constexpr size_t MAX_CSI_SEQUENCE_LENGTH = 4096;
+// Inline room for any SGR parameter string a game actually sends, avoiding the heap:
+constexpr qsizetype SGR_INLINE_CHARS = 64;
+
+// Helper to interpret JSON values as boolean
+// Accepts both boolean true and numeric non-zero values (servers may send 1 instead of true)
+bool jsonBoolValue(const QJsonValue& val)
+{
+    return val.toBool() || (val.isDouble() && val.toDouble() != 0);
+}
+
+// One parameter of an OSC 8 URI query, kept exactly as it arrived. The styling parser decodes
+// only the values it consumes and decodeOSC() rebuilds the URL it opens out of the rest, so
+// neither can work from a query that has already been decoded.
+struct RawQueryParameter
+{
+    QString text;  // the whole parameter as it appeared, for rebuilding the query
+    QString key;   // raw key, empty when the parameter has no separator
+    QString value; // raw value, empty when the parameter has no separator
+    bool hasSeparator = false;
+};
+
+// One character of a possibly percent-encoded value, with how much of the raw query it took up.
+// A server may encode part of a config object and leave the rest raw, so the scan below has to
+// recognise a brace whether it arrived as '{' or as %7B.
+struct DecodedChar
+{
+    QChar ch;
+    int width = 1;
+};
+
+DecodedChar decodedCharAt(const QString& text, const int index)
+{
+    if (text.at(index) == '%' && index + 2 < text.size()) {
+        bool ok = false;
+        const int code = QStringView{text}.mid(index + 1, 2).toInt(&ok, 16);
+        if (ok) {
+            return {QChar(code), 3};
+        }
+    }
+    return {text.at(index), 1};
+}
+
+// Splits a query into parameters without decoding any of it, so that an escaped parameter name
+// is not mistaken for a reserved one (RFC 3986 2.4). A config value sent as unencoded JSON can
+// carry '&' inside its strings, so the end of one is found by counting braces rather than at
+// the next '&' - both callers have to agree on that or one of them sees a parameter the other
+// does not. Mirrors QString::split('&') otherwise, empty parameters included.
+QList<RawQueryParameter> splitOscQueryParameters(const QString& query)
+{
+    QList<RawQueryParameter> parameters;
+
+    int pos = 0;
+    while (true) {
+        const int nextAmp = query.indexOf('&', pos);
+        const int ampEnd = (nextAmp == -1) ? query.size() : nextAmp;
+
+        // Accept '%3D' as the key/value separator as well as '=', taking whichever comes first
+        const int literalEq = query.indexOf('=', pos);
+        const int encodedEq = query.indexOf(qsl("%3D"), pos, Qt::CaseInsensitive);
+        int eqPos = -1;
+        int eqLength = 0;
+        if (literalEq >= 0 && literalEq < ampEnd && (encodedEq < 0 || literalEq < encodedEq)) {
+            eqPos = literalEq;
+            eqLength = 1;
+        } else if (encodedEq >= 0 && encodedEq < ampEnd) {
+            eqPos = encodedEq;
+            eqLength = 3;
+        }
+
+        RawQueryParameter parameter;
+        int paramEnd = ampEnd;
+
+        if (eqPos >= 0) {
+            const int valueStart = eqPos + eqLength;
+            int valueEnd = ampEnd;
+            parameter.hasSeparator = true;
+            parameter.key = query.mid(pos, eqPos - pos);
+
+            // JSON allows insignificant whitespace before the object, so the brace the scan
+            // needs may not be the first character of the value
+            int objectStart = valueStart;
+            while (objectStart < query.size()) {
+                const DecodedChar decoded = decodedCharAt(query, objectStart);
+                if (!decoded.ch.isSpace()) {
+                    break;
+                }
+                objectStart += decoded.width;
+            }
+
+            if (parameter.key == qsl("config") && objectStart < query.size() && decodedCharAt(query, objectStart).ch == '{') {
+                int depth = 0;
+                bool inString = false;
+                bool escaped = false;
+                // valueEnd keeps its initial ampEnd if the scan finds no closing brace: the JSON
+                // is malformed, so the parser gets what there is and fails on it. Stopping at the
+                // next '&' rather than running to the end keeps one unterminated object from
+                // swallowing every parameter behind it and dropping them from the rebuilt URL
+
+                for (int i = objectStart; i < query.size();) {
+                    const DecodedChar decoded = decodedCharAt(query, i);
+                    const QChar ch = decoded.ch;
+                    i += decoded.width;
+
+                    if (escaped) {
+                        escaped = false;
+                        continue;
+                    }
+                    if (ch == '\\') {
+                        escaped = true;
+                        continue;
+                    }
+                    if (ch == '"') {
+                        inString = !inString;
+                        continue;
+                    }
+                    if (!inString) {
+                        if (ch == '{') {
+                            ++depth;
+                        } else if (ch == '}') {
+                            --depth;
+                            if (depth == 0) {
+                                valueEnd = i;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // The parameter still runs to the next '&', so that anything a server appended
+                // after the object goes with it rather than being left on the rebuilt URL
+                const int afterObject = query.indexOf('&', valueEnd);
+                paramEnd = (afterObject == -1) ? query.size() : afterObject;
+            }
+
+            parameter.value = query.mid(valueStart, valueEnd - valueStart);
+        }
+
+        parameter.text = query.mid(pos, paramEnd - pos);
+        parameters.append(parameter);
+
+        if (paramEnd >= query.size()) {
+            break;
+        }
+        pos = paramEnd + 1;
+    }
+
+    return parameters;
+}
+
+} // anonymous namespace
 
 TChar::TChar(const QColor& foreground, const QColor& background, const TChar::AttributeFlags flags, const int linkIndex)
-: mFgColor(foreground)
-, mBgColor(background)
+: mFgColor(foreground.rgba())
+, mBgColor(background.rgba())
 , mFlags(flags)
 , mLinkIndex(linkIndex)
 {
 }
 
-TChar::TChar(TConsole* pC)
-: mFgColor(pC ? pC->mFormatCurrent.foreground() : QColorConstants::White)
-, mBgColor(pC ? pC->mFormatCurrent.background() : QColorConstants::Black)
-, mFlags(pC ? pC->mFormatCurrent.allDisplayAttributes() : AttributeFlag::None)
+TChar::TChar()
+: mFgColor(QColorConstants::White.rgba())
+, mBgColor(QColorConstants::Black.rgba())
 {
 }
 
@@ -74,33 +516,7 @@ TChar::TChar(TConsole* pC)
 // not be wanted in every case:
 bool TChar::operator==(const TChar& other)
 {
-    if (mIsSelected != other.mIsSelected) {
-        return false;
-    }
-    if (mLinkIndex != other.mLinkIndex) {
-        return false;
-    }
-    if (mFgColor != other.mFgColor) {
-        return false;
-    }
-    if (mBgColor != other.mBgColor) {
-        return false;
-    }
-    if (mFlags != other.mFlags) {
-        return false;
-    }
-    return true;
-}
-
-// Copy constructor - because it is resetting the mIsSelected flag it is NOT a
-// default copy constructor:
-TChar::TChar(const TChar& copy)
-: mFgColor(copy.mFgColor)
-, mBgColor(copy.mBgColor)
-, mFlags(copy.mFlags)
-, mIsSelected(false)
-, mLinkIndex(copy.mLinkIndex)
-{
+    return mLinkIndex == other.mLinkIndex && mFgColor == other.mFgColor && mBgColor == other.mBgColor && mFlags == other.mFlags;
 }
 
 quint8 TChar::alternateFont() const
@@ -137,14 +553,22 @@ quint8 TChar::alternateFont() const
     return 1;
 }
 
-const QString timeStampFormat = qsl("hh:mm:ss.zzz ");
-const QString blankTimeStamp  = qsl("------------ ");
+#ifndef QT_NO_DEBUG
+static quint64 colorFingerprint(const std::vector<TChar>& line)
+{
+    quint64 hash = 14695981039346656037ULL;
+    for (const TChar& character : line) {
+        hash = (hash ^ character.foreground().rgba()) * 1099511628211ULL;
+        hash = (hash ^ character.background().rgba()) * 1099511628211ULL;
+    }
+    return hash;
+}
+#endif
 
 // Store for text and attributes (such as character color) to be drawn on screen
 // Contents are rendered by a TTextEdit
-TBuffer::TBuffer(Host* pH, TConsole* pConsole)
-: mpConsole(pConsole)
-, mBlack(pH->mBlack)
+TBuffer::TBuffer(Host* pH)
+: mBlack(pH->mBlack)
 , mLightBlack(pH->mLightBlack)
 , mRed(pH->mRed)
 , mLightRed(pH->mLightRed)
@@ -164,39 +588,254 @@ TBuffer::TBuffer(Host* pH, TConsole* pConsole)
 , mForeGroundColorLight(pH->mFgColor)
 , mBackGroundColor(pH->mBgColor)
 , mpHost(pH)
+, mTagWatchdog(std::make_unique<QTimer>())
 {
+    mTagWatchdog->setSingleShot(true);
+    QObject::connect(mTagWatchdog.get(), &QTimer::timeout, [this]() {
+        processMxpWatchdogCallback();
+    });
+    // All additions to the buffer must use append()/appendLine() to preserve formatting via TChar.
+    // Direct modification of the `buffer` vector may bypass formatting and should be avoided.
     clear();
 
 #ifdef QT_DEBUG
     // Validate the encoding tables in case there has been an edit which breaks
     // things:
-    for (auto table : csmEncodingTable.getEncodings()) {
+    for (const auto& table : csmEncodingTable.getEncodings()) {
         Q_ASSERT_X(table.size() == 128, "TBuffer", "Mis-sized encoding look-up table.");
     }
 #endif
 }
 
-// user-defined literal to represent megabytes
-auto operator""_MB(unsigned long long const x)
-        -> long
-{ return 1024L*1024L*x; }
+TBuffer::~TBuffer()
+{
+    if (mTagWatchdog) {
+        // The timeout lambda captures 'this', and so does the deferred
+        // continuation the watchdog queues against this timer. Destroying the
+        // timer with the buffer, just below, drops both:
+        mTagWatchdog->stop();
+    }
+}
+
+TBuffer::TBuffer(const TBuffer& other)
+: bufferLine(other.bufferLine)
+, buffer(other.buffer)
+, lineBuffer(other.lineBuffer)
+, timeBuffer(other.timeBuffer)
+, promptBuffer(other.promptBuffer)
+, mLinkStore(other.mLinkStore)
+, mLinesLimit(other.mLinesLimit)
+, mBatchDeleteSize(other.mBatchDeleteSize)
+, mWrapAt(other.mWrapAt)
+, mWrapIndent(other.mWrapIndent)
+, mWrapHangingIndent(other.mWrapHangingIndent)
+, mCursorY(other.mCursorY)
+, mEchoingText(other.mEchoingText)
+, mGotESC(other.mGotESC)
+, mGotEscCharset(other.mGotEscCharset)
+, mGotCSI(other.mGotCSI)
+, mGotOSC(other.mGotOSC)
+, mGotString(other.mGotString)
+, mIsDefaultColor(other.mIsDefaultColor)
+, mBlack(other.mBlack)
+, mLightBlack(other.mLightBlack)
+, mRed(other.mRed)
+, mLightRed(other.mLightRed)
+, mLightGreen(other.mLightGreen)
+, mGreen(other.mGreen)
+, mLightBlue(other.mLightBlue)
+, mBlue(other.mBlue)
+, mLightYellow(other.mLightYellow)
+, mYellow(other.mYellow)
+, mLightCyan(other.mLightCyan)
+, mCyan(other.mCyan)
+, mLightMagenta(other.mLightMagenta)
+, mMagenta(other.mMagenta)
+, mLightWhite(other.mLightWhite)
+, mWhite(other.mWhite)
+, mForeGroundColor(other.mForeGroundColor)
+, mForeGroundColorLight(other.mForeGroundColorLight)
+, mBackGroundColor(other.mBackGroundColor)
+, mpHost(other.mpHost)
+, mBold(other.mBold)
+, mItalics(other.mItalics)
+, mOverline(other.mOverline)
+, mReverse(other.mReverse)
+, mStrikeOut(other.mStrikeOut)
+, mUnderline(other.mUnderline)
+, mUnderlineWavy(other.mUnderlineWavy)
+, mUnderlineDotted(other.mUnderlineDotted)
+, mUnderlineDashed(other.mUnderlineDashed)
+, mBlink(other.mBlink)
+, mFastBlink(other.mFastBlink)
+, mConcealed(other.mConcealed)
+, mAltFont(other.mAltFont)
+, mMudLine(other.mMudLine)
+, mMudBuffer(other.mMudBuffer)
+, mServerWrapPendingLine(other.mServerWrapPendingLine)
+, mServerWrapPendingBuffer(other.mServerWrapPendingBuffer)
+, mServerWrapPendingSegmentLength(other.mServerWrapPendingSegmentLength)
+, mServerWrapPendingSegmentStart(other.mServerWrapPendingSegmentStart)
+, mIncompleteSequenceBytes(other.mIncompleteSequenceBytes)
+, mLocalGotESC(other.mLocalGotESC)
+, mLocalGotEscCharset(other.mLocalGotEscCharset)
+, mLocalGotCSI(other.mLocalGotCSI)
+, mLocalGotOSC(other.mLocalGotOSC)
+, mLocalGotString(other.mLocalGotString)
+, mLocalIncompleteSequenceBytes(other.mLocalIncompleteSequenceBytes)
+, mProcessingLocalFeed(other.mProcessingLocalFeed)
+, lastLoggedFromLine(other.lastLoggedFromLine)
+, lastloggedToLine(other.lastloggedToLine)
+, lastTextToLog(other.lastTextToLog)
+, mEncoding(other.mEncoding)
+, mDecoder(other.mDecoder)
+, mMultibyteDecoder(multibyteDecoderFor(other.mDecoder, other.mEncoding))
+, mCurrentHyperlinkCommand(other.mCurrentHyperlinkCommand)
+, mCurrentHyperlinkHint(other.mCurrentHyperlinkHint)
+, mCurrentHyperlinkLinkId(other.mCurrentHyperlinkLinkId)
+, mHyperlinkActive(other.mHyperlinkActive)
+, mWatchdogPhase(other.mWatchdogPhase)
+, mTagWatchdog(std::make_unique<QTimer>())
+, mWatchdogTagSnapshot(other.mWatchdogTagSnapshot)
+, mCurrentHyperlinkStyling(other.mCurrentHyperlinkStyling)
+, mCurrentHyperlinkMenu(other.mCurrentHyperlinkMenu)
+, mLinkStates(other.mLinkStates)
+, mVisitedLinks(other.mVisitedLinks)
+, mLinkOriginalBackgrounds(other.mLinkOriginalBackgrounds)
+, mLinkOriginalCharacters(other.mLinkOriginalCharacters)
+, mCurrentHoveredLinkIndex(other.mCurrentHoveredLinkIndex)
+, mCurrentActiveLinkIndex(other.mCurrentActiveLinkIndex)
+, mCurrentFocusedLinkIndex(other.mCurrentFocusedLinkIndex)
+{
+    mTagWatchdog->setSingleShot(true);
+    QObject::connect(mTagWatchdog.get(), &QTimer::timeout, [this]() {
+        processMxpWatchdogCallback();
+    });
+}
+
+TBuffer& TBuffer::operator=(const TBuffer& other)
+{
+    if (this != &other) {
+        bufferLine = other.bufferLine;
+        buffer = other.buffer;
+        lineBuffer = other.lineBuffer;
+        timeBuffer = other.timeBuffer;
+        promptBuffer = other.promptBuffer;
+        mLinkStore = other.mLinkStore;
+        mLinesLimit = other.mLinesLimit;
+        mBatchDeleteSize = other.mBatchDeleteSize;
+        mWrapAt = other.mWrapAt;
+        mWrapIndent = other.mWrapIndent;
+        mWrapHangingIndent = other.mWrapHangingIndent;
+        mCursorY = other.mCursorY;
+        mEchoingText = other.mEchoingText;
+        mGotESC = other.mGotESC;
+        mGotEscCharset = other.mGotEscCharset;
+        mGotCSI = other.mGotCSI;
+        mGotOSC = other.mGotOSC;
+        mGotString = other.mGotString;
+        mIsDefaultColor = other.mIsDefaultColor;
+        mBlack = other.mBlack;
+        mLightBlack = other.mLightBlack;
+        mRed = other.mRed;
+        mLightRed = other.mLightRed;
+        mLightGreen = other.mLightGreen;
+        mGreen = other.mGreen;
+        mLightBlue = other.mLightBlue;
+        mBlue = other.mBlue;
+        mLightYellow = other.mLightYellow;
+        mYellow = other.mYellow;
+        mLightCyan = other.mLightCyan;
+        mCyan = other.mCyan;
+        mLightMagenta = other.mLightMagenta;
+        mMagenta = other.mMagenta;
+        mLightWhite = other.mLightWhite;
+        mWhite = other.mWhite;
+        mForeGroundColor = other.mForeGroundColor;
+        mForeGroundColorLight = other.mForeGroundColorLight;
+        mBackGroundColor = other.mBackGroundColor;
+        mpHost = other.mpHost;
+        mBold = other.mBold;
+        mItalics = other.mItalics;
+        mOverline = other.mOverline;
+        mReverse = other.mReverse;
+        mStrikeOut = other.mStrikeOut;
+        mUnderline = other.mUnderline;
+        mUnderlineWavy = other.mUnderlineWavy;
+        mUnderlineDotted = other.mUnderlineDotted;
+        mUnderlineDashed = other.mUnderlineDashed;
+        mBlink = other.mBlink;
+        mFastBlink = other.mFastBlink;
+        mConcealed = other.mConcealed;
+        mAltFont = other.mAltFont;
+        mMudLine = other.mMudLine;
+        mMudBuffer = other.mMudBuffer;
+        mServerWrapPendingLine = other.mServerWrapPendingLine;
+        mServerWrapPendingBuffer = other.mServerWrapPendingBuffer;
+        mServerWrapPendingSegmentLength = other.mServerWrapPendingSegmentLength;
+        mServerWrapPendingSegmentStart = other.mServerWrapPendingSegmentStart;
+        mIncompleteSequenceBytes = other.mIncompleteSequenceBytes;
+        mLocalGotESC = other.mLocalGotESC;
+        mLocalGotEscCharset = other.mLocalGotEscCharset;
+        mLocalGotCSI = other.mLocalGotCSI;
+        mLocalGotOSC = other.mLocalGotOSC;
+        mLocalGotString = other.mLocalGotString;
+        mLocalIncompleteSequenceBytes = other.mLocalIncompleteSequenceBytes;
+        mProcessingLocalFeed = other.mProcessingLocalFeed;
+        lastLoggedFromLine = other.lastLoggedFromLine;
+        lastloggedToLine = other.lastloggedToLine;
+        lastTextToLog = other.lastTextToLog;
+        mEncoding = other.mEncoding;
+        mDecoder = other.mDecoder;
+        mMultibyteDecoder = multibyteDecoderFor(mDecoder, mEncoding);
+        mCurrentHyperlinkCommand = other.mCurrentHyperlinkCommand;
+        mCurrentHyperlinkHint = other.mCurrentHyperlinkHint;
+        mCurrentHyperlinkLinkId = other.mCurrentHyperlinkLinkId;
+        mHyperlinkActive = other.mHyperlinkActive;
+        mWatchdogPhase = other.mWatchdogPhase;
+        mWatchdogTagSnapshot = other.mWatchdogTagSnapshot;
+        mCurrentHyperlinkStyling = other.mCurrentHyperlinkStyling;
+        mCurrentHyperlinkMenu = other.mCurrentHyperlinkMenu;
+        mLinkStates = other.mLinkStates;
+        mVisitedLinks = other.mVisitedLinks;
+        mLinkOriginalBackgrounds = other.mLinkOriginalBackgrounds;
+        mLinkOriginalCharacters = other.mLinkOriginalCharacters;
+        mCurrentHoveredLinkIndex = other.mCurrentHoveredLinkIndex;
+        mCurrentActiveLinkIndex = other.mCurrentActiveLinkIndex;
+        mCurrentFocusedLinkIndex = other.mCurrentFocusedLinkIndex;
+
+        mTagWatchdog = std::make_unique<QTimer>();
+        mTagWatchdog->setSingleShot(true);
+        QObject::connect(mTagWatchdog.get(), &QTimer::timeout, [this]() {
+            processMxpWatchdogCallback();
+        });
+    }
+    return *this;
+}
 
 void TBuffer::setBufferSize(int requestedLinesLimit, int batch)
 {
     if (requestedLinesLimit < 100) {
         requestedLinesLimit = 100;
     }
-    if (batch >= requestedLinesLimit) {
-        batch = requestedLinesLimit / 10;
-    }
     // clip the maximum to something reasonable that the machine can handle
     auto max = getMaxBufferSize();
     if (requestedLinesLimit > max) {
-        qWarning().nospace() << "setBufferSize(): " << requestedLinesLimit <<
-                "lines for buffer requested but your computer can only handle " << max << ", clipping it";
+        qWarning().nospace() << "setBufferSize(): " << requestedLinesLimit << "lines for buffer requested but your computer can only handle " << max << ", clipping it";
         mLinesLimit = max;
     } else {
         mLinesLimit = requestedLinesLimit;
+    }
+    // checked against the clipped limit: shrinkBuffer() pops a whole batch as
+    // soon as the buffer passes it, and a batch bigger than that pops lines
+    // that are not there
+    if (batch >= mLinesLimit) {
+        batch = mLinesLimit / 10;
+    }
+    // shrinkBuffer() pops one line per batch step, so a batch of none at all
+    // switches trimming off and lets the buffer grow past its limit
+    if (batch < 1) {
+        batch = 1;
     }
 
     mBatchDeleteSize = batch;
@@ -205,17 +844,21 @@ void TBuffer::setBufferSize(int requestedLinesLimit, int batch)
 // naive calculation to get a reasonable limit for a maximum buffer size
 int TBuffer::getMaxBufferSize()
 {
-    const int64_t physicalMemoryTotal = mudlet::self()->getPhysicalMemoryTotal();
+    const int64_t memoryTotal = physicalMemoryTotal();
     // Mudlet is 32bit mainly on Windows, see where the practical limit for a process 2GB:
     // https://docs.microsoft.com/en-us/windows/win32/memory/memory-limits-for-windows-releases#memory-and-address-space-limits
     // 64bit: set to 80% of what is available to us, swap not included
-    const int64_t maxProcessMemoryBytes = (QSysInfo::WordSize == 32) ? 1600_MB : (physicalMemoryTotal * 0.80);
+    // the query answers -1 when it fails, which would leave room for no lines at all
+    const int64_t maxProcessMemoryBytes = (QSysInfo::WordSize == 32 || memoryTotal <= 0) ? 1600_MB : (memoryTotal * 0.80);
     auto maxLines = (maxProcessMemoryBytes / TCHAR_IN_BYTES) / mpHost->mWrapAt;
     // now we've calculated how many lines can we fit in 80% of memory, ignoring memory use for other things like triggers/aliases, Lua scripts, etc
     // so shave that down by 20%
     maxLines = (maxLines / 100) * 80;
 
-    return maxLines;
+    // a huge wrap width divides the estimate down to nothing, but few lines
+    // are ever that long, so keep the floor setBufferSize() gives a request;
+    // a wrap of 1 on a machine with a lot of memory overflows an int
+    return static_cast<int>(std::clamp<int64_t>(maxLines, 100, std::numeric_limits<int>::max()));
 }
 
 void TBuffer::updateColors()
@@ -267,19 +910,18 @@ int TBuffer::getLastLineNumber()
 {
     if (static_cast<int>(buffer.size()) > 0) {
         return static_cast<int>(buffer.size()) - 1;
-    } else {
-        return 0; //-1;
     }
+    return 0; //-1;
 }
 
-void TBuffer::addLink(bool trigMode, const QString& text, QStringList& command, QStringList& hint, TChar format, QVector<int> luaReference)
+void TBuffer::addLink(bool trigMode, const QString& text, QStringList& command, QStringList& hint, const TChar& format, const QVector<int>& luaReference)
 {
     const int id = mLinkStore.addLinks(command, hint, mpHost, luaReference);
 
     if (!trigMode) {
-        append(text, 0, text.length(), format.mFgColor, format.mBgColor, format.mFlags, id);
+        append(text, 0, text.length(), format.foreground(), format.background(), format.mFlags, id);
     } else {
-        appendLine(text, 0, text.length(), format.mFgColor, format.mBgColor, format.mFlags, id);
+        appendLine(text, 0, text.length(), format.foreground(), format.background(), format.mFlags, id);
     }
 }
 
@@ -360,25 +1002,96 @@ void TBuffer::addLink(bool trigMode, const QString& text, QStringList& command, 
       elements at the end can be omitted.
  */
 
+void TBuffer::resetSequenceParserState()
+{
+    mGotESC = false;
+    mGotEscCharset = false;
+    mGotCSI = false;
+    mGotOSC = false;
+    mGotString = false;
+    mIncompleteSequenceBytes.clear();
+    mLocalGotESC = false;
+    mLocalGotEscCharset = false;
+    mLocalGotCSI = false;
+    mLocalGotOSC = false;
+    mLocalGotString = false;
+    mLocalIncompleteSequenceBytes.clear();
+    mWarnedAboutStringSequence = false;
+}
+
+void TBuffer::warnAboutDiscardedStringSequence(const QString& what, const std::string& localBuffer, const size_t spanStart, const size_t spanEnd)
+{
+    // A game that gets this wrong usually gets it wrong on every line, and in
+    // a release build every warning also becomes a Sentry breadcrumb, so say
+    // it once per connection and quote enough of the payload to identify which
+    // of the game's features misbehaved:
+    if (mWarnedAboutStringSequence) {
+        return;
+    }
+    mWarnedAboutStringSequence = true;
+    const size_t excerptLength = std::min(spanEnd - spanStart, STRING_SEQUENCE_EXCERPT_LENGTH);
+    qWarning().noquote().nospace() << "TBuffer::translateToPlainText(...) WARNING - " << (mGotString ? "a DCS/SOS/PM/APC" : "an OSC") << " sequence " << what
+                                   << ", discarding it to recover. It began \"" << QString::fromLatin1(localBuffer.data() + spanStart, static_cast<int>(excerptLength))
+                                   << "\". Further such sequences on this connection are not reported.";
+}
+
+void TBuffer::swapParserSequenceState()
+{
+    std::swap(mGotESC, mLocalGotESC);
+    std::swap(mGotEscCharset, mLocalGotEscCharset);
+    std::swap(mGotCSI, mLocalGotCSI);
+    std::swap(mGotOSC, mLocalGotOSC);
+    std::swap(mGotString, mLocalGotString);
+    std::swap(mIncompleteSequenceBytes, mLocalIncompleteSequenceBytes);
+}
+
 void TBuffer::translateToPlainText(std::string& incoming, const bool isFromServer)
 {
-    // What can appear in a CSI Parameter String (Ps) byte or at least for it
-    // to be something we can handle:
-    const QByteArray cParameter = QByteArrayLiteral("0123456789;:");
-    // What can appear in the initial position of a CSI Parameter String (Ps) byte:
-    const QByteArray cParameterInitial = QByteArrayLiteral("0123456789;:<=>?");
-    // What can appear in a CSI Intermediate byte (includes a quote character in
-    // the middle of the text here which has to be escaped with a backslash):
-    const QByteArray cIntermediate = QByteArrayLiteral(" !\"#$%&'()*+,-./");
-    // What can appear in a CSI final byte position - (includes a backslash
-    // which has to be doubled to include it in here):
-    const QByteArray cFinal = QByteArrayLiteral("@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~");
+    // The mGot... latches and mIncompleteSequenceBytes persist between calls so
+    // that a sequence split across Game Server packets still parses.
+    // Locally generated text (feedTriggers(), MMCP chat messages, MXP
+    // insertions) runs through the same parser, so swap in a separate set of
+    // that state for the duration of such a feed - otherwise local text
+    // arriving between two packets would consume or clear a latch that the
+    // server stream is still relying on (and vice versa). The flag keeps a
+    // nested local feed (e.g. an MXP <HR> inside locally fed text) from
+    // swapping the server state back in part way through:
+    if (isFromServer || mProcessingLocalFeed) {
+        translateToPlainTextInner(incoming, isFromServer);
+        return;
+    }
 
-    // As well as enabling the prepending of left-over bytes from last packet
-    // from the MUD server this may help in high frequency interactions to
-    // protect this process from the supplied string being modified
-    // asynchronously by the QNetwork code that runs in another thread:
-    std::string localBuffer;
+    mProcessingLocalFeed = true;
+    swapParserSequenceState();
+    translateToPlainTextInner(incoming, false);
+    swapParserSequenceState();
+    mProcessingLocalFeed = false;
+}
+
+void TBuffer::translateToPlainTextInner(std::string& incoming, const bool isFromServer)
+{
+    // Lets the trigger engine tell a flood from a trickle (TriggerUnit::processDataStream()). Restored,
+    // not cleared, on exit: a nested feed re-enters here while the outer chunk is still being decoded.
+    const int previousPendingLines = mPendingChunkLines;
+    mPendingChunkLines = static_cast<int>(std::count(incoming.cbegin(), incoming.cend(), '\n'));
+    const auto pendingLinesGuard = qScopeGuard([this, previousPendingLines] {
+        mPendingChunkLines = previousPendingLines;
+    });
+
+    // The complete two byte escape sequences (DECSC, DECRC, RIS and a stray
+    // ST) that games do send and that Mudlet has to swallow. Only these: any
+    // other byte after an ESC is text, and printing it is no worse than what
+    // Mudlet has always done, whereas eating it loses real output:
+    const QByteArray cShortEscape = QByteArrayLiteral("78c\\");
+
+    // Parsed in place, and written to in three places: the bytes held over
+    // from a sequence the last packet cut in half are prepended to the front
+    // before the scan starts, an MXP entity expansion rewrites the head of the
+    // text, and a synthesised line break (MXP <BR> or &newline;) overwrites the
+    // byte it was found at through the ch reference the scan holds. So the
+    // caller's string is not meaningful afterwards (cTelnet::postData() copies
+    // it first for MMCP):
+    std::string& localBuffer = incoming;
 
     Host* pHost = mpHost;
     if (!pHost) {
@@ -387,7 +1100,7 @@ void TBuffer::translateToPlainText(std::string& incoming, const bool isFromServe
     }
 
     // Check this each packet
-    QByteArray const usedEncoding = mpHost->mTelnet.getEncoding();
+    const QByteArray usedEncoding = mpHost->mTelnet.getEncoding();
     if (mEncoding != usedEncoding) {
         encodingChanged(usedEncoding);
         // Will have to dump any stored bytes as they will be in the old
@@ -397,21 +1110,24 @@ void TBuffer::translateToPlainText(std::string& incoming, const bool isFromServe
         // sequences that were not complete at the end of the last packet:
         if (!mIncompleteSequenceBytes.empty()) {
 #if defined(DEBUG_SGR_PROCESSING) || defined(DEBUG_OSC_PROCESSING) || defined(DEBUG_UTF8_PROCESSING) || defined(DEBUG_GB_PROCESSING) || defined(DEBUG_BIG5_PROCESSING)
-            qDebug() << "TBuffer::translateToPlainText(...) WARNING - Dumping residual bytes that were carried over from previous packet onto incoming data - the encoding has changed and they may no longer be usable!";
+            qDebug() << "TBuffer::translateToPlainText(...) WARNING - Dumping residual bytes that were carried over from previous packet onto incoming data - the encoding has changed and they may no "
+                        "longer be usable!";
 #endif
-            mIncompleteSequenceBytes.clear();;
+            mIncompleteSequenceBytes.clear();
         }
+        // The other channel's held-over bytes are equally stale:
+        mLocalIncompleteSequenceBytes.clear();
     }
 
     if (isFromServer && !mIncompleteSequenceBytes.empty()) {
 #if defined(DEBUG_SGR_PROCESSING) || defined(DEBUG_OSC_PROCESSING) || defined(DEBUG_UTF8_PROCESSING) || defined(DEBUG_GB_PROCESSING) || defined(DEBUG_BIG5_PROCESSING)
         qDebug() << "TBuffer::translateToPlainText(...) Prepending residual bytes onto incoming data!";
 #endif
-        localBuffer = mIncompleteSequenceBytes + incoming;
+        localBuffer.insert(0, mIncompleteSequenceBytes);
         mIncompleteSequenceBytes.clear();
-    } else {
-        localBuffer = incoming;
     }
+
+    crashIfRequested();
 
     // Fixup table for our own, substitute QTextCodecs:
     QByteArray encodingTableToUse{mEncoding};
@@ -423,6 +1139,8 @@ void TBuffer::translateToPlainText(std::string& incoming, const bool isFromServe
         encodingTableToUse = "CP737";
     } else if (mEncoding == "M_CP869") {
         encodingTableToUse = "CP869";
+    } else if (mEncoding == "M_MEDIEVIA") {
+        encodingTableToUse = "MEDIEVIA";
     }
 
     const QVector<QChar> encodingLookupTable = csmEncodingTable.getLookupTable(encodingTableToUse);
@@ -435,11 +1153,28 @@ void TBuffer::translateToPlainText(std::string& incoming, const bool isFromServe
     // repeated switch(...) and branch to one of a series of decoding methods
     // each with another up to 128 value switch()
 
-    size_t const localBufferLength = localBuffer.length();
+    size_t localBufferLength = localBuffer.length();
     size_t localBufferPosition = 0;
     if (!localBufferLength) {
         return;
     }
+    // Kept in step with localBufferLength - see decodableLength():
+    size_t localBufferDecodableLength = decodableLength(localBuffer, localBufferLength, isFromServer);
+
+    // If we are resolving/interpolating an MXP entity, the interpolated text
+    // ends at localBuffer[endOfMXPEntity - 1]. This variable used to avoid an
+    // (infinite) recursion like <!EN E "foobar&E;>&E;
+    // Recursively interpolating a predefined entity like <!EN E "foobar&frac12;>&E;
+    // will work though.
+    size_t endOfMXPEntity = 0;
+
+    // A similar index which points behind the name of a literal entity name like
+    // &unknown; which does not exist and will be printed literal, w/o
+    // any MXP interpretation. Again, this avoid endless recursion trying to
+    // resolve an unsolvable entity. We need the hassle in both cases, as the
+    // the resolved values may be in a character encoding that must be decoded by
+    // Mudlet.
+    size_t endOfLiteralEntity = 0;
 
     while (true) {
         if (localBufferPosition >= localBufferLength) {
@@ -447,6 +1182,9 @@ void TBuffer::translateToPlainText(std::string& incoming, const bool isFromServe
         }
 
         char& ch = localBuffer[localBufferPosition];
+        // Set when a line break is synthesised (MXP <br>/&newline;) rather
+        // than being a genuine newline in the game's output stream:
+        bool forcedLineBreak = false;
         if (ch == '\033') {
             if (!mGotOSC) {
                 // The terminator for an OSC is the String Terminator but that
@@ -454,61 +1192,140 @@ void TBuffer::translateToPlainText(std::string& incoming, const bool isFromServe
                 // '\\' so must not respond to an ESC here - though the code
                 // arrangement should avoid looping around this loop while
                 // seeking this character pair anyhow...
+
+                // If MXP is building a tag when we see ESC, the tag is invalid
+                // because ANSI escape sequences cannot be part of MXP tags.
+                // Output the partial tag as literal text before processing ESC.
+                if (mpHost->mMxpProcessor.isEnabled() && mpHost->mMxpProcessor.getMxpTagBuilder().isInsideTag()) {
+                    TChar::AttributeFlags attributeFlags = computeCurrentAttributeFlags();
+                    attributeFlags &= ~(TChar::FastBlink | TChar::Concealed | TChar::AltFontMask);
+                    TChar c((!mIsDefaultColor && mBold) ? mForeGroundColorLight : mForeGroundColor, mBackGroundColor, attributeFlags);
+
+                    const QString literalText = mpHost->mMxpProcessor.abortCurrentTag();
+                    mMudLine.append(literalText);
+                    for (int i = 0; i < literalText.length(); ++i) {
+                        mMudBuffer.push_back(c);
+                    }
+
+                    mTagWatchdog->stop();
+                    mWatchdogPhase = WatchdogPhase::None;
+                }
+
                 mGotESC = true;
+                mGotEscCharset = false;
                 ++localBufferPosition;
                 continue;
             }
         }
 
-        if (mGotESC && (ch == '[' || ch == ']')) {
+        if ((mGotESC || mGotEscCharset) && localBufferPosition >= localBufferDecodableLength) {
+            // Mid escape sequence and only the flush marker is left (decodableLength()) - the loop head already
+            // returned for an empty chunk. Tested against it, the sequence would be abandoned and its rest print
+            // as text, so keep the latch for the next chunk and commit the line the marker came to flush. The
+            // CSI scan below tests for the marker first, as it is also reached when a chunk merely ran out:
+            commitLine(CHAR_CARRIAGE_RETURN, localBufferPosition, isFromServer, false);
+            return;
+        }
+
+        if (mGotEscCharset) {
+            mGotEscCharset = false;
+            if (static_cast<unsigned char>(ch) >= 0x30 && static_cast<unsigned char>(ch) <= 0x7E) {
+                ++localBufferPosition;
+                continue;
+            }
+            // Only a final byte can name a character set, so this was a stray
+            // ESC after all and the byte is text.
+        }
+
+        if (mGotESC) {
             mGotESC = false;
-            mGotCSI = (ch == '[');
-            mGotOSC = (ch == ']');
-            ++localBufferPosition;
-            continue;
+            if (ch == '[' || ch == ']') {
+                mGotCSI = (ch == '[');
+                mGotOSC = (ch == ']');
+                ++localBufferPosition;
+                continue;
+            }
+            if (ch == 'P' || ch == 'X' || ch == '^' || ch == '_') {
+                // DCS, SOS, PM and APC string sequences carry data that
+                // Mudlet does not use - consume them with the OSC code below
+                // but skip decoding the payload:
+                mGotOSC = true;
+                mGotString = true;
+                ++localBufferPosition;
+                continue;
+            }
+            if (ch == '(' || ch == ')' || ch == '*' || ch == '+') {
+                // An ISO 2022 character set designation such as ESC ( B; the
+                // byte after this one names the set:
+                mGotEscCharset = true;
+                ++localBufferPosition;
+                continue;
+            }
+            if (cShortEscape.indexOf(ch) >= 0) {
+                ++localBufferPosition;
+                continue;
+            }
+            // Any other byte is text: a stray ESC in the game's output must
+            // not swallow it, and consuming a multibyte character's lead byte
+            // would orphan its continuation bytes.
         }
 
         if (mGotCSI) {
-            // Lookahead and try and see what we are processing
-            // At the start of a CSI sequence the only valid character is one of:
-            // "0-9:;<=>?" if it is one of "0-9:;" then it is a
-            // "parameter-string" ELSE if it is one of '<', '=', '>' or '?' it
-            // IS a private/experimental and not covered by the ECMA-48
-            // specifications..
-            // After the first character the remaining characters of the
-            // parameter string will be in the range "0-9:;" only
+            // Lookahead over the parameter string - see cParameter and cParameterPrivateIntroducer.
             size_t const spanStart = localBufferPosition;
             size_t spanEnd = spanStart;
-            while (spanEnd < localBufferLength
-                   && ((((spanStart < spanEnd) && cParameterInitial.indexOf(localBuffer[spanEnd]) >= 0))
-                      ||((spanStart == spanEnd) && cParameter.indexOf(localBuffer[spanEnd]) >= 0))) {
+            while (spanEnd < localBufferLength && csiParameterByte(localBuffer[spanEnd])) {
                 ++spanEnd;
             }
 
-            // Test whether the first byte is within the usable subset of the
-            // allowed value - or not:
-            if (cParameter.indexOf(localBuffer[spanStart]) == -1 && cParameterInitial.indexOf(localBuffer[spanStart]) >= 0) {
-                // Oh dear, the CSI parameter string sequence begins with one of
-                // the reserved characters ('<', '=', '>' or '?') which we
-                // can/do not handle
-
-                qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - detected a private/reserved CSI sequence beginning with \"CSI" << localBuffer.substr(spanStart, spanEnd - spanStart).c_str() << "\" which Mudlet cannot interpret.";
-                // So skip over it as far as we can - will still possibly have
-                // garbage beyond the end which will still be shown...
+            if (spanEnd - spanStart >= MAX_CSI_SEQUENCE_LENGTH) {
+                // The parameter string is far longer than any valid CSI (which
+                // is only a handful of bytes): discard it instead of buffering
+                // it without bound while waiting for a final byte that a hostile
+                // server may never send.
+                qWarning().noquote().nospace() << "TBuffer::translateToPlainText(...) WARNING - CSI sequence exceeded " << MAX_CSI_SEQUENCE_LENGTH
+                                               << " bytes without a final byte, discarding it to recover.";
                 localBufferPosition += 1 + spanEnd - spanStart;
                 mGotCSI = false;
                 // Go around while loop again:
                 continue;
             }
 
-            if (spanEnd >= localBufferLength || cParameter.indexOf(localBuffer[spanEnd]) >= 0) {
-                // We have gone to the end of the buffer OR the last character
-                // in the buffer is still within a CSI sequence - therefore we
-                // have got a split between data packets and are not in a
-                // position to process the current line further...
+            if (spanEnd >= localBufferDecodableLength) {
+                // We ran to the end of the buffer while still inside a CSI
+                // sequence - therefore we have got a split between data packets
+                // and are not in a position to process the current line further.
+                // A flush marker is not held with it (decodableLength()), as the OSC path below drops
+                // one from its payload: it would never match a parameter byte, so the rest would print as text.
 
-                mIncompleteSequenceBytes = localBuffer.substr(spanStart);
+                mIncompleteSequenceBytes = localBuffer.substr(spanStart, localBufferDecodableLength - spanStart);
+                if (localBufferDecodableLength < localBufferLength) {
+                    // The marker still has to commit the text ahead of the sequence, and going round
+                    // again inside a CSI would feed it back into the scan above:
+                    size_t markerPosition = localBufferDecodableLength;
+                    commitLine(CHAR_CARRIAGE_RETURN, markerPosition, isFromServer, false);
+                }
                 return;
+            }
+
+            // Only now that a complete sequence is in hand, test whether the
+            // first byte is within the usable subset of the allowed value - or
+            // not. Doing this any earlier would consume a sequence split across
+            // packets without leaving the trailing bytes for the next one.
+            if (csiPrivateIntroducerByte(localBuffer[spanStart])) {
+                // Oh dear, the CSI parameter string sequence begins with one of
+                // the reserved characters ('<', '=', '>' or '?') which we
+                // can/do not handle
+#if defined(DEBUG_CSI_PROCESSING)
+                qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - detected a private/reserved CSI sequence beginning with \"CSI"
+                                             << localBuffer.substr(spanStart, spanEnd - spanStart).c_str() << "\" which Mudlet cannot interpret.";
+#endif
+                // So skip over it as far as we can - will still possibly have
+                // garbage beyond the end which will still be shown...
+                localBufferPosition += 1 + spanEnd - spanStart;
+                mGotCSI = false;
+                // Go around while loop again:
+                continue;
             }
 
             // Now we can take a peek at what the next character is, it could
@@ -518,15 +1335,17 @@ void TBuffer::translateToPlainText(std::string& incoming, const bool isFromServe
             // should be in the (ASCII) range '@' to '~' and the end of that
             // range 'p' to '~' is for "private" or "experimental" use.
 
-            if (cIntermediate.indexOf(localBuffer[spanEnd]) >= 0) {
+            if (csiIntermediateByte(localBuffer[spanEnd])) {
                 // We do not handle any sequences with intermediate bytes
                 // Report it and then ignore it, try and find out what the byte
                 // afterwards is as it might help to debug things
                 if (spanEnd + 1 < localBufferLength) {
                     // Yeah there is another byte we can report as the final byte
-                    qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - detected a CSI sequence with an 'intermediate' byte ('" << localBuffer[spanEnd] << "') and a 'final' byte ('" << localBuffer[spanEnd+1] << "') which Mudlet cannot interpret.";
+                    qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - detected a CSI sequence with an 'intermediate' byte ('" << localBuffer[spanEnd]
+                                                 << "') and a 'final' byte ('" << localBuffer[spanEnd + 1] << "') which Mudlet cannot interpret.";
                 } else {
-                    qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - detected a CSI sequence with an 'intermediate' byte ('" << localBuffer[spanEnd] << "') which Mudlet cannot interpret.";
+                    qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - detected a CSI sequence with an 'intermediate' byte ('" << localBuffer[spanEnd]
+                                                 << "') which Mudlet cannot interpret.";
                 }
                 // So skip over it as far as we can - will still be possible to
                 // have garbage beyond the end which will still be shown...
@@ -536,33 +1355,37 @@ void TBuffer::translateToPlainText(std::string& incoming, const bool isFromServe
                 continue;
             }
 
-            if (cFinal.indexOf(localBuffer[spanEnd]) >= 0) {
+            if (csiFinalByte(localBuffer[spanEnd])) {
                 // We have a valid CSI sequence - but is it one we handle?
                 // We currently only handle the 'm' for SGR and the 'z' for
                 // Zuggsoft's MXP protocol:
                 const quint8 modeChar = static_cast<unsigned char>(localBuffer[spanEnd]);
                 switch (modeChar) {
-                case static_cast<quint8>('m'):
+                case static_cast<quint8>('m'): {
                     // We have a complete SGR sequence:
 #if defined(DEBUG_SGR_PROCESSING)
-                    qDebug().nospace().noquote() << "    Consider the SGR sequence: \"" << localBuffer.substr(localBufferPosition, spanEnd - spanStart).c_str() << "\"";
+                    qDebug().nospace().noquote() << "    Consider the SGR sequence: \"" << localBuffer.substr(spanStart, spanEnd - spanStart).c_str() << "\"";
 #endif
-                    decodeSGR(QString(localBuffer.substr(localBufferPosition, spanEnd - spanStart).c_str()));
-                    break;
+                    // Only non-private cParameter bytes get here, each a single UTF-16 unit, so no QString is needed:
+                    QVarLengthArray<char16_t, SGR_INLINE_CHARS> sgrChars(spanEnd - spanStart);
+                    for (size_t i = spanStart; i < spanEnd; ++i) {
+                        sgrChars[i - spanStart] = static_cast<unsigned char>(localBuffer[i]);
+                    }
+                    decodeSGR(QStringView(sgrChars));
+                } break;
 
                 case static_cast<quint8>('z'):
                     // We have a control sequence for MXP
 #if defined(DEBUG_MXP_PROCESSING)
                     qDebug().nospace().noquote() << "    Consider the MXP control sequence: \"" << localBuffer.substr(localBufferPosition, spanEnd - spanStart).c_str() << "\"";
 #endif
-                    if (!mpHost->mFORCE_MXP_NEGOTIATION_OFF && mpHost->mServerMXPenabled && isFromServer) {
+                    if (isFromServer && (mpHost->mTelnet.isMXPEnabled() || mpHost->getForceMXPProcessorOn())) {
                         mGotCSI = false;
 
                         const QString code = QString(localBuffer.substr(localBufferPosition, spanEnd - spanStart).c_str());
                         mpHost->mMxpProcessor.setMode(code);
                     }
-                    // end of if (!mpHost->mFORCE_MXP_NEGOTIATION_OFF)
-                    // We have manually disabled MXP negotiation
+
                     break;
 
                 case static_cast<quint8>('C'): {
@@ -571,36 +1394,34 @@ void TBuffer::translateToPlainText(std::string& incoming, const bool isFromServe
                     // Needed for mud.durismud.com see forum message topic:
                     // https://forums.mudlet.org/viewtopic.php?f=9&t=22887
                     const int dataLength = spanEnd - spanStart;
-                    QByteArray const temp = QByteArray::fromRawData(localBuffer.substr(localBufferPosition, dataLength).c_str(), dataLength);
+                    // fromRawData() does not copy, so the bytes have to outlive temp:
+                    // point it into localBuffer rather than at any temporary
+                    const QByteArray temp = QByteArray::fromRawData(localBuffer.data() + localBufferPosition, dataLength);
                     bool isOk = false;
-                    const int spacesNeeded = temp.toInt(&isOk);
-                    if (isOk && spacesNeeded > 0) {
-                        const TChar::AttributeFlags attributeFlags =
-                                ((mIsDefaultColor ? mBold || mpHost->mMxpClient.bold() : false) ? TChar::Bold : TChar::None)
-                                | (mItalics || mpHost->mMxpClient.italic() ? TChar::Italic : TChar::None)
-                                | (mOverline ? TChar::Overline : TChar::None)
-                                | (mReverse ? TChar::Reverse : TChar::None)
-                                | (mStrikeOut || mpHost->mMxpClient.strikeOut() ? TChar::StrikeOut : TChar::None)
-                                | (mUnderline || mpHost->mMxpClient.underline() ? TChar::Underline : TChar::None)
-                                | (mFastBlink ? TChar::FastBlink : (mBlink ? TChar::Blink :TChar::None))
-                                | (TChar::alternateFontFlag(mAltFont))
-                                | (mConcealed ? TChar::Concealed : TChar::None);
-
+                    const int requested = temp.toInt(&isOk);
+                    // Like a terminal's, the cursor stops at the right margin: the
+                    // count comes from the game, and unbounded, one sequence or a
+                    // run of them could ask for gigabytes of spaces.
+                    constexpr int maxLineWidth = 1000;
+                    const int margin = std::max(1, std::min(mWrapAt, maxLineWidth));
+                    const int column = static_cast<int>(mMudLine.size() % margin);
+                    const int spacesNeeded = std::min(requested, margin - 1 - column);
+                    if (isOk && requested > 0) {
                         // Note: we are using the background color for the
                         // foreground color as well so that we are transparent:
-                        const TChar c(mBackGroundColor, mBackGroundColor, attributeFlags);
+                        const TChar c(mBackGroundColor, mBackGroundColor, computeCurrentAttributeFlags());
                         for (int spaceCount = 0; spaceCount < spacesNeeded; ++spaceCount) {
                             mMudLine.append(QChar::Space);
                             mMudBuffer.push_back(c);
                         }
                         // For debugging:
-//                        qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - CUF (cursor forward) sequence of form CSI" << temp << "C received, converting into " << spacesNeeded << " spaces.";
+                        //                        qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - CUF (cursor forward) sequence of form CSI" << temp << "C received, converting into " << spacesNeeded << " spaces.";
                     } else {
-                        qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - Unhandled sequence of form CSI..." << temp << "C received, that is supposed to be a CUF (cursor forward) sequence but doesn't make sense, Mudlet will ignore it.";
+                        qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - Unhandled sequence of form CSI..." << temp
+                                                     << "C received, that is supposed to be a CUF (cursor forward) sequence but doesn't make sense, Mudlet will ignore it.";
                     }
 
-                }
-                    break;
+                } break;
 
                 case static_cast<quint8>('J'): {
                     /*
@@ -614,91 +1435,286 @@ void TBuffer::translateToPlainText(std::string& incoming, const bool isFromServe
                      *   scrollback buffer - which is again a NWIH for us...!
                      */
                     const int dataLength = spanEnd - spanStart;
-                    QByteArray const temp = QByteArray::fromRawData(localBuffer.substr(localBufferPosition, dataLength).c_str(), dataLength);
+                    // fromRawData() does not copy, so the bytes have to outlive temp:
+                    // point it into localBuffer rather than at any temporary
+                    const QByteArray temp = QByteArray::fromRawData(localBuffer.data() + localBufferPosition, dataLength);
                     bool isOk = false;
                     const int argValue = temp.toInt(&isOk);
                     if (isOk) {
                         if (argValue >= 0 && argValue < 3) {
-                            qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - ED (erase in display) sequence of form CSI" << temp << "J received,\nrejecting as incompatible with Mudlet.";
+                            qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - ED (erase in display) sequence of form CSI" << temp
+                                                         << "J received,\nrejecting as incompatible with Mudlet.";
                         } else {
-                            qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - Invalid ED (erase in display) sequence of form CSI" << temp << "J received,\nwhich Mudlet will ignore.";
+                            qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - Invalid ED (erase in display) sequence of form CSI" << temp
+                                                         << "J received,\nwhich Mudlet will ignore.";
                         }
                     } else {
-                        qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - Unhandled sequence of form CSI..." << temp << "J received, that is supposed to\nbe a ED (erase in display) sequence but it doesn't make sense, Mudlet will ignore it.";
+                        qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - Unhandled sequence of form CSI..." << temp
+                                                     << "J received, that is supposed to\nbe a ED (erase in display) sequence but it doesn't make sense, Mudlet will ignore it.";
                     }
-                }
-                    break;
+                } break;
 
                 default: // Unhandled other (valid) CSI final byte sequences will end up here
                     qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - Unhandled sequence of form CSI..." << localBuffer[spanEnd] << " received, Mudlet will ignore it.";
 
                 } // End of switch(modeChar) {}
             } else {
-                qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - detected an invalid CSI sequence beginning with \"CSI" << localBuffer.substr(spanStart, spanEnd - spanStart).c_str() << " which Mudlet will ignore.";
-            }  // End of (isAValidFinalByte) {}
+                qDebug().noquote().nospace() << "TBuffer::translateToPlainText(...) INFO - detected an invalid CSI sequence beginning with \"CSI"
+                                             << localBuffer.substr(spanStart, spanEnd - spanStart).c_str() << " which Mudlet will ignore.";
+            } // End of the isAValidFinalByte test
 
             mGotCSI = false;
-            localBufferPosition += 1 + spanEnd - spanStart;
+            // Step over the parameter string and final byte, unless that is a control byte: a sequence with no
+            // final byte doesn't own the newline or escape that stopped the scan, and eating it would join two
+            // lines or drop the next sequence:
+            localBufferPosition += spanEnd - spanStart + (static_cast<unsigned char>(localBuffer[spanEnd]) < ' ' ? 0 : 1);
             // Go around while loop again:
             continue;
 
         } // End of if (mGotCSI)
 
         if (mGotOSC) {
-            // Lookahead and find end of sequence (the ST string terminator)
-            // DANGER, WILL ROBINSON! Should an OSC be received without a
-            // terminator then all data will just be swallowed into the buffer
+            // Also reached - with mGotString set - whenever the payload is to
+            // be consumed but not decoded: a DCS, SOS, PM or APC sequence, or
+            // an OSC already truncated by the length cap below.
+            // Lookahead and find the end of the sequence, which is whichever
+            // comes first of:
+            // - ST (String Terminator): ESC followed by '\' (backslash)
+            // - BEL (0x07): Common alternative used by xterm and many MUDs
+            // - the end of the line it started on. ECMA-48 does allow an <LF>
+            //   inside a "command string", but honouring that lets a single
+            //   unterminated sequence blacken the rest of the session
 
-            // Valid characters inside an OSC are: a "command string" or a
-            // "character string".
-            // A "command string" is a sequence of bit combinations in the range
-            // <BS><TAB><LF><VT><FF><CR> and ASCII printables from Space to '~'
             // A "character string" is a sequence of any character except Start
             // of String (SOS) or String Terminator (ST) and the latter is ESC
             // followed by '\\' (a single \ BTW) in the 7-bit code case (the
             // former is encoded as ESC followed by 'X'):
             size_t const spanStart = localBufferPosition;
             size_t spanEnd = spanStart;
-            // It is safe to look at spanEnd-1 even at the starting position
-            // because we already know that the localBuffer extends backwards
-            // that far (it will be the ']' character!)
-            while (spanEnd < localBufferLength
-                   && (localBuffer[spanEnd-1] != '\033')
-                   && (localBuffer[spanEnd] != '\\')) {
+            // Looking at spanEnd-1 at the starting position is safe: either
+            // the sequence started earlier in this buffer, so the byte behind
+            // is its introducer (or, after a trip round the length cap below,
+            // more of its payload), or spanStart is 0 and the spanEnd > 0
+            // guard keeps the read in bounds.
+            while (spanEnd < localBufferLength && (spanEnd - spanStart) < MAX_OSC_SEQUENCE_LENGTH && localBuffer[spanEnd] != '\x07' && !endsStringSequence(localBuffer[spanEnd])
+                   && !((spanEnd > 0 && localBuffer[spanEnd - 1] == '\033') && localBuffer[spanEnd] == '\\')) {
                 ++spanEnd;
             }
 
-            if (localBuffer[spanEnd] != '\\') {
-                // The last character in the buffer is NOT the expected ST
-                // - therefore we have probably got a split between
-                // data packets and are not in a position to process the
-                // current line further...
+            // Determine what terminated the loop
+            const bool foundBEL = (spanEnd < localBufferLength && localBuffer[spanEnd] == '\x07');
+            const bool foundST = (spanEnd < localBufferLength && spanEnd > 0 && localBuffer[spanEnd - 1] == '\033' && localBuffer[spanEnd] == '\\');
+            const bool foundLineEnding = (spanEnd < localBufferLength && endsStringSequence(localBuffer[spanEnd]));
+            const bool exceededLength = ((spanEnd - spanStart) >= MAX_OSC_SEQUENCE_LENGTH);
 
-                mIncompleteSequenceBytes = localBuffer.substr(spanStart);
-                return;
+            if (foundBEL) {
+                // BEL terminator - sequence content excludes the BEL
+                if (!mGotString) {
+                    decodeOSC(QString(localBuffer.substr(spanStart, spanEnd - spanStart).c_str()));
+                }
+                mGotOSC = false;
+                mGotString = false;
+                localBufferPosition = spanEnd + 1; // Skip past BEL
+                continue;
             }
 
-            decodeOSC(QString(localBuffer.substr(localBufferPosition, spanEnd - spanStart - 1).c_str()));
-            mGotOSC = false;
-            localBufferPosition += 1 + spanEnd - spanStart;
-            // Go around while loop again:
-            continue;
+            if (foundST) {
+                // ST terminator (ESC \) - sequence content excludes the ESC before backslash
+                if (!mGotString) {
+                    decodeOSC(QString(localBuffer.substr(spanStart, spanEnd - spanStart - 1).c_str()));
+                }
+                mGotOSC = false;
+                mGotString = false;
+                localBufferPosition = spanEnd + 1; // Skip past backslash
+                continue;
+            }
+
+            if (foundLineEnding) {
+                // A stray introducer - a game that emits one would otherwise
+                // black out every line that followed it for the rest of the
+                // session, so give up on the sequence at the end of the line
+                // and leave the line ending itself to be processed as usual:
+                warnAboutDiscardedStringSequence(qsl("was not terminated before the end of its line"), localBuffer, spanStart, spanEnd);
+                mGotOSC = false;
+                mGotString = false;
+                localBufferPosition = spanEnd;
+                continue;
+            }
+
+            if (exceededLength) {
+                if (!mGotString) {
+                    // An OSC is the only one of these whose payload Mudlet
+                    // acts on, so it is the only one that loses anything by
+                    // being consumed rather than decoded. A DCS or APC over
+                    // the cap is ordinary - a Sixel image or a Kitty graphic
+                    // legitimately runs to many times it:
+                    warnAboutDiscardedStringSequence(qsl("passed %1 bytes, so its command will be ignored").arg(MAX_OSC_SEQUENCE_LENGTH), localBuffer, spanStart, spanEnd);
+                }
+                // Stay in the sequence and consume the rest as it arrives, but
+                // what is left is no longer the whole payload so it must not
+                // reach the OSC decoder when the terminator turns up:
+                mGotString = true;
+                // Hold on to a trailing ESC so that a String Terminator that
+                // straddles this boundary is still recognised:
+                localBufferPosition = (localBuffer[spanEnd - 1] == '\033') ? spanEnd - 1 : spanEnd;
+                continue;
+            }
+
+            // This is safe because we're under the length limit. The only
+            // carriage returns that reach here are the ones cTelnet injects to
+            // flush a line that is still arriving, and they are always the
+            // last byte of the chunk that carried them: drop them rather than
+            // keep them as payload, or one landing between the ESC and the
+            // backslash of a String Terminator would hide that terminator:
+            mIncompleteSequenceBytes.clear();
+            std::remove_copy(localBuffer.cbegin() + spanStart, localBuffer.cend(), std::back_inserter(mIncompleteSequenceBytes), CHAR_CARRIAGE_RETURN);
+            return;
         }
 
         // We are outside of a CSI or OSC sequence if we get to here:
 
-        if (mpHost->mMxpProcessor.isEnabled()) {
-            if (mpHost->mServerMXPenabled) {
+        if (localBufferPosition >= endOfLiteralEntity && mpHost->mMxpProcessor.isEnabled()) {
+            if (mpHost->mTelnet.isMXPEnabled() || mpHost->getForceMXPProcessorOn()) {
                 if (mpHost->mMxpProcessor.mode() != MXP_MODE_LOCKED) {
-                    TMxpProcessingResult const result = mpHost->mMxpProcessor.processMxpInput(ch);
-                    if (result == HANDLER_NEXT_CHAR) {
+                    // The comparison signals to the processor, if custom entities may be resolved
+                    // (countermeasure against infinite recursion)
+                    TMxpProcessingResult const result = mpHost->mMxpProcessor.processMxpInput(ch, localBufferPosition >= endOfMXPEntity);
+                    if (!mTagWatchdog->isActive() && mpHost->mMxpProcessor.getMxpTagBuilder().isInsideTag() && !mpHost->mMxpProcessor.getMxpTagBuilder().getRawTagContent().empty()) {
+                        mWatchdogPhase = WatchdogPhase::Phase1_Snapshot;
+                        mTagWatchdog->start(MAX_TAG_TIMEOUT_MS);
+                    }
+
+                    switch (result) {
+                    case HANDLER_NEXT_CHAR:
                         localBufferPosition++;
                         continue;
-                    } else if (result == HANDLER_COMMIT_LINE) { // BR tag
+                    case HANDLER_COMMIT_LINE: // BR tag or &newline;
                         ch = '\n';
+                        forcedLineBreak = true;
                         goto COMMIT_LINE;
-                    } else { //HANDLER_FALL_THROUGH -> do nothing
+                    case HANDLER_INSERT_ENTITY_CUST:
+                        // custom entity value set with <!EN>, recurse except for other custom entities
+                        [[fallthrough]];
+                    case HANDLER_INSERT_ENTITY_LIT: {
+                        // Unknown entity name like &unknown; push back into buffer for codeset interpretation,
+                        // but no MXP parsing.
+
+                        // We replace the already processed text with the entity value into the buffer and restart
+                        // processing it for charset encoding but with limited MXP handling.
+                        // A CUST value is decoded text, so encode it with the session's encoding
+                        // (not toLatin1(), which would flatten non-Latin1 characters to '?') for the
+                        // re-decode below. A LIT value is the raw, undecoded entity bytes held as one
+                        // Latin1 code unit per byte (see TEntityHandler::handle()), so toLatin1() is
+                        // an exact byte passthrough - re-encoding it would double-encode those bytes
+                        // and orphan any continuation bytes still ahead in the buffer. Either way the
+                        // byte length, not the QString length, is what the offset bookkeeping needs.
+                        const QByteArray entityValueBytes =
+                                result == HANDLER_INSERT_ENTITY_CUST ? TEncodingHelper::encode(mpHost->mMxpProcessor.getEntityValue(), mEncoding) : mpHost->mMxpProcessor.getEntityValue().toLatin1();
+                        size_t valueLength = entityValueBytes.size();
+                        localBuffer.replace(0, localBufferPosition + 1, entityValueBytes.constData(), entityValueBytes.size());
+
+                        if (result == HANDLER_INSERT_ENTITY_LIT) {
+                            if (localBufferPosition < endOfMXPEntity) {
+                                // This is a special case, our unknown entity might actually be a custom one
+                                // inside a custom one which we refused to resolve to avoid an endless recursion.
+                                // So we carefully adjust the end marker s.t. custom entities are not reenabled
+                                // too early
+                                endOfMXPEntity -= localBufferPosition + 1 - valueLength;
+                                endOfLiteralEntity = valueLength;
+                            } else {
+                                endOfMXPEntity = valueLength;
+                            }
+                            endOfLiteralEntity = valueLength;
+                        } else {
+                            // HANDLER_INSERT_ENTITY_CUST
+                            endOfMXPEntity = valueLength;
+                            endOfLiteralEntity = 0;
+                        }
+
+                        // Now restart the loop to parse the newly inserted text
+                        localBufferLength = localBuffer.length();
+                        localBufferDecodableLength = decodableLength(localBuffer, localBufferLength, isFromServer);
+                        localBufferPosition = 0;
+                        continue;
+                    }
+                    case HANDLER_INSERT_ENTITY_SYS: {
+                        // System entities are literal QString / UTF values which we just 'print'
+                        // There is no further MXP or Codeset evaluation
+
+                        TChar::AttributeFlags attributeFlags = computeCurrentAttributeFlags();
+                        attributeFlags &= ~(TChar::FastBlink | TChar::Concealed | TChar::AltFontMask);
+                        TChar c((!mIsDefaultColor && mBold) ? mForeGroundColorLight : mForeGroundColor, mBackGroundColor, attributeFlags);
+
+                        size_t valueLength = mpHost->mMxpProcessor.getEntityValue().length();
+                        mMudLine.append(mpHost->mMxpProcessor.getEntityValue());
+                        // We also need to set the color attributes for the special character
+                        while (valueLength--) {
+                            mMudBuffer.push_back(c);
+                        }
+                        // We already handled the input, go to the next character
+                        localBufferPosition++;
+                        continue;
+                    }
+                    case HANDLER_INSERT_AND_REPROCESS: {
+                        // Insert text like HANDLER_INSERT_ENTITY_SYS, but don't increment position.
+                        // Used for error recovery: output the rejected/incomplete tag as literal
+                        // text, then reprocess the current character (which may be a newline,
+                        // an ANSI escape, or the character after an unrecognized tag name)
+
+                        TChar::AttributeFlags attributeFlags = computeCurrentAttributeFlags();
+                        attributeFlags &= ~(TChar::FastBlink | TChar::Concealed | TChar::AltFontMask);
+                        TChar c((!mIsDefaultColor && mBold) ? mForeGroundColorLight : mForeGroundColor, mBackGroundColor, attributeFlags);
+
+                        size_t valueLength = mpHost->mMxpProcessor.getEntityValue().length();
+                        mMudLine.append(mpHost->mMxpProcessor.getEntityValue());
+                        while (valueLength--) {
+                            mMudBuffer.push_back(c);
+                        }
+                        // Do NOT increment position - the current character needs to be reprocessed
+                        continue;
+                    }
+                    default:
+                        //HANDLER_FALL_THROUGH -> do nothing
                         assert(localBuffer[localBufferPosition] == ch);
+                    }
+                } else if (mpHost->mMxpProcessor.getMxpTagBuilder().isInsideTag()) {
+                    // Mode is LOCKED but we're inside a tag that started in a different mode.
+                    // We need to continue feeding characters to the tag builder to complete the tag.
+                    TMxpProcessingResult const result = mpHost->mMxpProcessor.processMxpInput(ch, localBufferPosition >= endOfMXPEntity);
+
+                    switch (result) {
+                    case HANDLER_NEXT_CHAR:
+                        localBufferPosition++;
+                        continue;
+                    case HANDLER_INSERT_ENTITY_SYS: {
+                        // Tag was not handled, output as text
+                        TChar::AttributeFlags attributeFlags = computeCurrentAttributeFlags();
+                        attributeFlags &= ~(TChar::FastBlink | TChar::Concealed | TChar::AltFontMask);
+                        TChar c((!mIsDefaultColor && mBold) ? mForeGroundColorLight : mForeGroundColor, mBackGroundColor, attributeFlags);
+
+                        size_t valueLength = mpHost->mMxpProcessor.getEntityValue().length();
+                        mMudLine.append(mpHost->mMxpProcessor.getEntityValue());
+                        while (valueLength--) {
+                            mMudBuffer.push_back(c);
+                        }
+                        localBufferPosition++;
+                        continue;
+                    }
+                    case HANDLER_INSERT_AND_REPROCESS: {
+                        TChar::AttributeFlags attributeFlags = computeCurrentAttributeFlags();
+                        attributeFlags &= ~(TChar::FastBlink | TChar::Concealed | TChar::AltFontMask);
+                        TChar c((!mIsDefaultColor && mBold) ? mForeGroundColorLight : mForeGroundColor, mBackGroundColor, attributeFlags);
+
+                        size_t valueLength = mpHost->mMxpProcessor.getEntityValue().length();
+                        mMudLine.append(mpHost->mMxpProcessor.getEntityValue());
+                        while (valueLength--) {
+                            mMudBuffer.push_back(c);
+                        }
+                        continue;
+                    }
+                    default:
+                        localBufferPosition++;
+                        continue;
                     }
                 } else {
                     mpHost->mMxpProcessor.processRawInput(ch);
@@ -707,119 +1723,23 @@ void TBuffer::translateToPlainText(std::string& incoming, const bool isFromServe
 
             if (CHAR_IS_COMMIT_CHAR(ch)) {
                 // after a newline (but not a <br>) return to default mode
-                mpHost->mMxpProcessor.resetToDefaultMode();
+                // BUT only if we're not in the middle of parsing a tag (tags can span lines)
+                if (!mpHost->mMxpProcessor.getMxpTagBuilder().isInsideTag()) {
+                    mpHost->mMxpProcessor.resetToDefaultMode();
+                }
             }
         }
 
-COMMIT_LINE:
-        if (CHAR_IS_COMMIT_CHAR(ch)) {
-            // DE: MUD Zeilen werden immer am Zeilenanfang geschrieben
-            // EN: MUD lines are always written at the beginning of the line
-
-            // FIXME: This is the point where we should renormalise the new text
-            // data - of course there is the theoretical chance that the new
-            // text would alter the prior contents but as that is on a separate
-            // line there should not be any changes to text before a line feed
-            // which sort of seems to be implied by the current value of ch:
-
-            // Qt struggles to report blank lines on Windows to screen readers, this is a workaround
-            // https://bugreports.qt.io/browse/QTBUG-105035
-            if (Q_UNLIKELY(mMudLine.isEmpty())) {
-                if (mpHost->mBlankLineBehaviour == Host::BlankLineBehaviour::Hide) {
-                    localBufferPosition++;
-                    continue;
-                } else if (mpHost->mBlankLineBehaviour == Host::BlankLineBehaviour::ReplaceWithSpace) {
-                    const TChar::AttributeFlags attributeFlags =
-                            ((mIsDefaultColor ? mBold || mpHost->mMxpClient.bold(): false) ? TChar::Bold : TChar::None)
-                            | (mItalics || mpHost->mMxpClient.italic() ? TChar::Italic : TChar::None)
-                            | (mOverline ? TChar::Overline : TChar::None)
-                            | (mReverse ? TChar::Reverse : TChar::None)
-                            | (mStrikeOut || mpHost->mMxpClient.strikeOut() ? TChar::StrikeOut : TChar::None)
-                            | (mUnderline || mpHost->mMxpClient.underline() ? TChar::Underline : TChar::None)
-                            | (mFastBlink ? TChar::FastBlink : (mBlink ? TChar::Blink :TChar::None))
-                            | (TChar::alternateFontFlag(mAltFont))
-                            | (mConcealed ? TChar::Concealed : TChar::None);
-
-                    // Note: we are using the background color for the
-                    // foreground color as well so that we are transparent:
-                    const TChar c(mBackGroundColor, mBackGroundColor, attributeFlags);
-                    mMudLine.append(QChar::Space);
-                    mMudBuffer.push_back(c);
-                }
-            }
-
-            if (static_cast<size_t>(mMudLine.size()) != mMudBuffer.size()) {
-                qWarning() << "TBuffer::translateToPlainText(...) WARNING: mismatch in new text "
-                              "data character and attribute data items!";
-            }
-
-            if (!lineBuffer.back().isEmpty()) {
-                if (!mMudLine.isEmpty()) {
-                    lineBuffer << mMudLine;
-                } else {
-                    if (ch == '\r') {
-                        ++localBufferPosition;
-                        continue; //empty timer posting
-                    }
-                    lineBuffer << QString();
-                }
-                buffer.push_back(mMudBuffer);
-                timeBuffer << QTime::currentTime().toString(timeStampFormat);
-                if (ch == '\xff') {
-                    promptBuffer.append(true);
-                } else {
-                    promptBuffer.append(false);
-                }
-            } else {
-                if (!mMudLine.isEmpty()) {
-                    lineBuffer.back().append(mMudLine);
-                } else {
-                    if (ch == '\r') {
-                        ++localBufferPosition;
-                        continue; //empty timer posting
-                    }
-                    lineBuffer.back().append(QString());
-                }
-                buffer.back() = mMudBuffer;
-                timeBuffer.back() = QTime::currentTime().toString(timeStampFormat);
-                if (ch == '\xff') {
-                    promptBuffer.back() = true;
-                } else {
-                    promptBuffer.back() = false;
-                }
-            }
-
-            mMudLine.clear();
-            mMudBuffer.clear();
-            const int line = lineBuffer.size() - 1;
-            mpHost->mpConsole->runTriggers(line);
-            // Only use of TBuffer::wrap(), breaks up new text
-            // NOTE: it MAY have been clobbered by the trigger engine!
-            wrap(lineBuffer.size() - 1);
-
-            // Start a new, but empty line in the various buffers
-            ++localBufferPosition;
-            std::deque<TChar> const newLine;
-            buffer.push_back(newLine);
-            lineBuffer.push_back(QString());
-            timeBuffer.push_back(QString());
-            promptBuffer << false;
-            if (static_cast<int>(buffer.size()) > mLinesLimit) {
-                // Whilst we also include a call to TConsole::handleLinesOverflowEvent(...)
-                // in all other methods where the following is used (because
-                // both need to monitor the number of lines of text in the
-                // buffer) the event that the former may be required to
-                // generate is NOT used for the TMainConsole case whereas this
-                // (translateToPlainText(...)) method is ONLY for that one:
-                shrinkBuffer();
-            }
+    COMMIT_LINE:
+        if (commitLine(ch, localBufferPosition, isFromServer, forcedLineBreak)) {
             continue;
         }
-
         // PLACEMARKER: Incoming text decoding
         // Used to double up the TChars for Utf-8 byte sequences that produce
         // a surrogate pair (non-BMP):
         bool isTwoTCharsNeeded = false;
+        // A decoder ran out mid-sequence and stored its bytes for the next chunk:
+        bool heldIncompleteSequence = false;
 
         if (!encodingLookupTable.isEmpty()) {
             auto index = static_cast<quint8>(ch);
@@ -828,38 +1748,18 @@ COMMIT_LINE:
             } else {
                 mMudLine.append(encodingLookupTable.at(index - 128));
             }
-        } else if (mEncoding == "ISO 8859-1") {
-            mMudLine.append(QString(QChar::fromLatin1(ch)));
-        } else if (mEncoding == "GBK") {
-            if (!processGBSequence(localBuffer, isFromServer, false, localBufferLength, localBufferPosition, isTwoTCharsNeeded)) {
-                // We have run out of bytes and we have stored the unprocessed
-                // ones but we need to bail out NOW!
-                return;
-            }
-        } else if (mEncoding == "GB18030") {
-            if (!processGBSequence(localBuffer, isFromServer, true, localBufferLength, localBufferPosition, isTwoTCharsNeeded)) {
-                // We have run out of bytes and we have stored the unprocessed
-                // ones but we need to bail out NOW!
-                return;
-            }
-        } else if (mEncoding == "EUC-KR") {
-            if (!processEUC_KRSequence(localBuffer, isFromServer, localBufferLength, localBufferPosition, isTwoTCharsNeeded)) {
-                // We have run out of bytes and we have stored the unprocessed
-                // ones but we need to bail out NOW!
-                return;
-            }
-        } else if (mEncoding == "BIG5" || mEncoding == "BIG5-HKSCS") {
-            if (!processBig5Sequence(localBuffer, isFromServer, localBufferLength, localBufferPosition, isTwoTCharsNeeded)) {
-                // We have run out of bytes and we have stored the unprocessed
-                // ones but we need to bail out NOW!
-                return;
-            }
-        } else if (mEncoding == "UTF-8") {
-            if (!processUtf8Sequence(localBuffer, isFromServer, localBufferLength, localBufferPosition, isTwoTCharsNeeded)) {
-                // We have run out of bytes and we have stored the unprocessed
-                // ones but we need to bail out NOW!
-                return;
-            }
+        } else if (mDecoder == Decoder::Latin1) {
+            mMudLine.append(QChar::fromLatin1(ch));
+        } else if (mDecoder == Decoder::Gbk) {
+            heldIncompleteSequence = !processGBSequence(localBuffer, isFromServer, false, localBufferDecodableLength, localBufferPosition, isTwoTCharsNeeded);
+        } else if (mDecoder == Decoder::Gb18030) {
+            heldIncompleteSequence = !processGBSequence(localBuffer, isFromServer, true, localBufferDecodableLength, localBufferPosition, isTwoTCharsNeeded);
+        } else if (mDecoder == Decoder::EucKr) {
+            heldIncompleteSequence = !processEUC_KRSequence(localBuffer, isFromServer, localBufferDecodableLength, localBufferPosition, isTwoTCharsNeeded);
+        } else if (mDecoder == Decoder::Big5) {
+            heldIncompleteSequence = !processBig5Sequence(localBuffer, isFromServer, localBufferDecodableLength, localBufferPosition, isTwoTCharsNeeded);
+        } else if (mDecoder == Decoder::Utf8) {
+            heldIncompleteSequence = !processUtf8Sequence(localBuffer, isFromServer, localBufferDecodableLength, localBufferPosition, isTwoTCharsNeeded);
         } else {
             // Default - no encoding case - reject anything that has MS Bit set
             // as that isn't ASCII which is what no encoding specifies!
@@ -875,18 +1775,125 @@ COMMIT_LINE:
             }
         }
 
-        const TChar::AttributeFlags attributeFlags =
-                ((mIsDefaultColor ? mBold || mpHost->mMxpClient.bold() : false) ? TChar::Bold : TChar::None)
-                | (mItalics || mpHost->mMxpClient.italic() ? TChar::Italic : TChar::None)
-                | (mOverline ? TChar::Overline : TChar::None)
-                | (mReverse ? TChar::Reverse : TChar::None)
-                | (mStrikeOut || mpHost->mMxpClient.strikeOut() ? TChar::StrikeOut : TChar::None)
-                | (mUnderline || mpHost->mMxpClient.underline() ? TChar::Underline : TChar::None)
-                | (mFastBlink ? TChar::FastBlink : (mBlink ? TChar::Blink :TChar::None))
-                | (TChar::alternateFontFlag(mAltFont))
-                | (mConcealed ? TChar::Concealed : TChar::None);
+        if (heldIncompleteSequence) {
+            // The rest of the sequence is in the next chunk, but a withheld flush marker still has
+            // this line to commit, so go round once more for it:
+            if (localBufferDecodableLength < localBufferLength) {
+                localBufferPosition = localBufferDecodableLength;
+                continue;
+            }
+            return;
+        }
 
-        TChar c((!mIsDefaultColor && mBold) ? mForeGroundColorLight : mForeGroundColor, mBackGroundColor, attributeFlags);
+        TChar c((!mIsDefaultColor && mBold) ? mForeGroundColorLight : mForeGroundColor, mBackGroundColor, computeCurrentAttributeFlags());
+
+        if (mHyperlinkActive) {
+            c.mLinkIndex = mCurrentHyperlinkLinkId;
+
+            // Store the original ANSI-formatted character before applying JSON styling
+            // This is needed for ANSI base restoration when pseudo-classes are inactive
+            if (!mLinkOriginalCharacters.contains(mCurrentHyperlinkLinkId)) {
+                mLinkOriginalCharacters[mCurrentHyperlinkLinkId] = c;
+#if defined(DEBUG_OSC_PROCESSING)
+                qDebug().nospace().noquote() << "TBuffer::translateToPlainText(): Stored original character for link " << mCurrentHyperlinkLinkId << " with ANSI colors: fg=" << c.foreground().name()
+                                             << " bg=" << c.background().name() << " flags=" << c.mFlags;
+#endif
+            }
+
+            // Apply base styling first (if any)
+            if (mCurrentHyperlinkStyling.hasForegroundColor) {
+                c.setForeground(mCurrentHyperlinkStyling.foregroundColor);
+            }
+
+            if (mCurrentHyperlinkStyling.hasBackgroundColor) {
+                c.setBackground(mCurrentHyperlinkStyling.backgroundColor);
+            }
+
+            // For preset-only links, base styling may be empty but pseudo-class styling exists
+            // Apply effective styling with :link pseudo-class to ensure preset colors show
+            Mudlet::HyperlinkStyling effectiveStyling = getEffectiveHyperlinkStyling(mCurrentHyperlinkLinkId);
+            if (effectiveStyling.hasCustomStyling) {
+                if (effectiveStyling.hasForegroundColor) {
+                    c.setForeground(effectiveStyling.foregroundColor);
+                }
+                if (effectiveStyling.hasBackgroundColor) {
+                    c.setBackground(effectiveStyling.backgroundColor);
+                }
+                if (effectiveStyling.isBold) {
+                    c.mFlags |= TChar::Bold;
+                }
+                if (effectiveStyling.isItalic) {
+                    c.mFlags |= TChar::Italic;
+                }
+                if (effectiveStyling.isUnderlined) {
+                    c.mFlags |= TChar::Underline;
+                    switch (effectiveStyling.underlineStyle) {
+                    case Mudlet::HyperlinkStyling::UnderlineWavy:
+                        c.mFlags |= TChar::UnderlineWavy;
+                        break;
+                    case Mudlet::HyperlinkStyling::UnderlineDotted:
+                        c.mFlags |= TChar::UnderlineDotted;
+                        break;
+                    case Mudlet::HyperlinkStyling::UnderlineDashed:
+                        c.mFlags |= TChar::UnderlineDashed;
+                        break;
+                    case Mudlet::HyperlinkStyling::UnderlineSolid:
+                    case Mudlet::HyperlinkStyling::UnderlineNone:
+                    default:
+                        break;
+                    }
+                }
+                if (effectiveStyling.isOverlined) {
+                    c.mFlags |= TChar::Overline;
+                }
+                if (effectiveStyling.isStrikeOut) {
+                    c.mFlags |= TChar::StrikeOut;
+                }
+            }
+
+            // Only re-apply base styling if effective pseudo-class styling is not present
+            // This prevents base decoration flags from overriding pseudo-class cascade decisions
+            if (!effectiveStyling.hasCustomStyling) {
+                if (mCurrentHyperlinkStyling.isUnderlined) {
+                    c.mFlags |= TChar::Underline;
+
+                    switch (mCurrentHyperlinkStyling.underlineStyle) {
+                    case Mudlet::HyperlinkStyling::UnderlineWavy:
+                        c.mFlags |= TChar::UnderlineWavy;
+                        break;
+                    case Mudlet::HyperlinkStyling::UnderlineDotted:
+                        c.mFlags |= TChar::UnderlineDotted;
+                        break;
+                    case Mudlet::HyperlinkStyling::UnderlineDashed:
+                        c.mFlags |= TChar::UnderlineDashed;
+                        break;
+                    case Mudlet::HyperlinkStyling::UnderlineSolid:
+                    case Mudlet::HyperlinkStyling::UnderlineNone:
+                    default:
+                        break;
+                    }
+                }
+
+                if (mCurrentHyperlinkStyling.isOverlined) {
+                    c.mFlags |= TChar::Overline;
+                }
+
+                if (mCurrentHyperlinkStyling.isStrikeOut) {
+                    c.mFlags |= TChar::StrikeOut;
+                }
+
+                if (mCurrentHyperlinkStyling.isBold) {
+                    c.mFlags |= TChar::Bold;
+                }
+
+                if (mCurrentHyperlinkStyling.isItalic) {
+                    c.mFlags |= TChar::Italic;
+                }
+            }
+
+            // Only apply underline if explicitly set in styling (respects OSC 8 default of no underline)
+            // Note: This differs from other Mudlet hyperlinks which default to underlined
+        }
 
         if (mpHost->mMxpClient.isInLinkMode()) {
             c.mLinkIndex = mLinkStore.getCurrentLinkID();
@@ -894,44 +1901,778 @@ COMMIT_LINE:
         }
 
         if (mpHost->mMxpClient.hasFgColor()) {
-            c.mFgColor = mpHost->mMxpClient.getFgColor();
+            c.setForeground(mpHost->mMxpClient.getFgColor());
         }
 
         if (mpHost->mMxpClient.hasBgColor()) {
-            c.mBgColor = mpHost->mMxpClient.getBgColor();
+            c.setBackground(mpHost->mMxpClient.getBgColor());
         }
 
         if (isTwoTCharsNeeded) {
             // CHECK: Do we need to duplicate stuff for mMXP_LINK_MODE - yes I think we do:
             mMudBuffer.push_back(c);
             mMudBuffer.push_back(c);
+            if (mHyperlinkActive) {
+                // Capture the column position when the first character of the hyperlink is added
+                if (mCurrentHyperlinkText.isEmpty()) {
+                    mCurrentHyperlinkStartColumn = static_cast<int>(mMudBuffer.size()) - 2; // -2 because we just added 2 chars
+                }
+                mCurrentHyperlinkText += QString(QChar(ch));
+                mCurrentHyperlinkText += QString(QChar(ch));
+            }
         } else {
             mMudBuffer.push_back(c);
+            if (mHyperlinkActive) {
+                // Capture the column position when the first character of the hyperlink is added
+                if (mCurrentHyperlinkText.isEmpty()) {
+                    mCurrentHyperlinkStartColumn = static_cast<int>(mMudBuffer.size()) - 1; // -1 because we just added 1 char
+                }
+                mCurrentHyperlinkText += QString(QChar(ch));
+            } else if (!(mpHost->mMxpProcessor.isEnabled() && (mpHost->mTelnet.isMXPEnabled() || mpHost->getForceMXPProcessorOn()))) {
+                // Plain text bytes decode to themselves with the format just computed, so a run takes one
+                // append and one fill. Not for MXP, which must see every byte, nor hyperlink text, built per character.
+                size_t runEnd = localBufferPosition + 1;
+                const char* const bytes = localBuffer.data();
+                while (runEnd + 8 <= localBufferLength && eightPrintableAsciiBytes(bytes + runEnd)) {
+                    runEnd += 8;
+                }
+                while (runEnd < localBufferLength && bulkCopyableTextByte(bytes[runEnd])) {
+                    ++runEnd;
+                }
+                const size_t runLength = runEnd - (localBufferPosition + 1);
+                if (runLength) {
+                    mMudLine.append(QLatin1StringView(localBuffer.data() + localBufferPosition + 1, static_cast<qsizetype>(runLength)));
+                    mMudBuffer.insert(mMudBuffer.cend(), runLength, c);
+                    localBufferPosition = runEnd - 1;
+                }
+            }
         }
 
         ++localBufferPosition;
     }
 }
 
-void TBuffer::decodeSGR38(const QStringList& parameters, bool isColonSeparated)
+void TBuffer::flushPendingDestinationContent()
+{
+    if (!mpHost || mMudLine.isEmpty()) {
+        return;
+    }
+
+    if (mpHost->mMxpFrameManager.hasActiveDestination()) {
+        if (TPrintSink* destSink = mpHost->mMxpFrameManager.currentDestinationSink()) {
+            destSink->printFormatted(mMudLine, mMudBuffer, mLinkStore);
+            mMudLine.clear();
+            mMudBuffer.clear();
+        }
+    }
+}
+
+void TBuffer::resetCurrentTextFormat()
+{
+    if (!mpHost) {
+        return;
+    }
+
+    // Reset to default colors and attributes - equivalent to SGR 0
+    mIsDefaultColor = true;
+    mForeGroundColor = mpHost->mFgColor;
+    mForeGroundColorLight = mpHost->mFgColor;
+    mBackGroundColor = mpHost->mBgColor;
+    mBold = false;
+    mItalics = false;
+    mOverline = false;
+    mReverse = false;
+    mStrikeOut = false;
+    mUnderline = false;
+    mUnderlineWavy = false;
+    mUnderlineDotted = false;
+    mUnderlineDashed = false;
+    mBlink = false;
+    mFastBlink = false;
+    mConcealed = false;
+    mAltFont = 0;
+}
+
+bool TBuffer::commitLine(char ch, size_t& localBufferPosition, const bool isFromServer, const bool forcedLineBreak)
+{
+    if (!CHAR_IS_COMMIT_CHAR(ch)) {
+        return false;
+    }
+
+    // DE: MUD Zeilen werden immer am Zeilenanfang geschrieben
+    // EN: MUD lines are always written at the beginning of the line
+
+    // FIXME: This is the point where we should renormalise the new text
+    // data - of course there is the theoretical chance that the new
+    // text would alter the prior contents but as that is on a separate
+    // line there should not be any changes to text before a line feed
+    // which sort of seems to be implied by the current value of ch:
+
+    // Check if there's an active MXP DEST - route to destination frame
+    if (mpHost->mMxpFrameManager.hasActiveDestination()) {
+        if (TPrintSink* destSink = mpHost->mMxpFrameManager.currentDestinationSink()) {
+            flushPendingServerWrapJoin(endsStringSequence(ch) || mMudLine.isEmpty());
+            if (mHyperlinkActive) {
+                if (endsStringSequence(ch) && !mCurrentHyperlinkText.isEmpty()) {
+                    finaliseActiveHyperlink();
+                } else {
+                    carryActiveHyperlinkPastFlush(mMudLine);
+                }
+            }
+            if (!mMudLine.isEmpty()) {
+                destSink->printFormatted(mMudLine, mMudBuffer, mLinkStore);
+            }
+            mMudLine.clear();
+            mMudBuffer.clear();
+            ++localBufferPosition;
+            // Skip creating lines in main console while destination is active
+            return true;
+        }
+    }
+
+    if (mpHost->mUndoServerWrap && isFromServer && ch == '\n' && !forcedLineBreak && !mMudLine.isEmpty()) {
+        // The game wraps its own output and this is a genuine newline from
+        // it: a segment that runs right up to the game's wrap column is
+        // probably not a whole line, so hold it back and join its
+        // continuation on instead of committing it. Everything else -
+        // prompts ('\xff' from GA/EOR), timer-flushed fragments ('\r'),
+        // MXP <br> breaks and blank lines - is a real line boundary.
+        const bool proseSegment = looksLikeWrappedProse(mMudLine);
+        if (!mServerWrapPendingLine.isEmpty()) {
+            // A held segment was only wrapped if what follows continues it:
+            // prose rather than art, not a list entry, indented by no more
+            // than the single space some games move the break to instead of
+            // swallowing it, not opening with the words the held segment
+            // opened with, and opening with a word that would not have fitted
+            // on the line above. Anything else means the held line was
+            // complete after all:
+            const bool deeplyIndented = mMudLine.at(0).isSpace() && mMudLine.size() > 1 && mMudLine.at(1).isSpace();
+            if (deeplyIndented || !proseSegment || startsWithListMarker(mMudLine) || continuationRepeatsSegmentOpening() || pendingLineHadRoomForNextWord()) {
+                flushPendingServerWrapJoin();
+            }
+        }
+        // Deliberately judged before the pending line is joined on: ending at
+        // the game's wrap column is a property of the segment as the game
+        // sent it, not of the longer joined line. A segment that finished a
+        // sentence there is not held at all, see
+        // segmentEndsSettledSentence().
+        const bool segmentLooksWrapped = endsAtServerWrapColumn() && proseSegment && !segmentEndsSettledSentence(mMudLine);
+        const qsizetype segmentLength = mMudLine.size();
+        const QString segmentStart = segmentLooksWrapped ? mMudLine.left(csmServerWrapSegmentStartChars) : QString();
+        joinPendingServerWrapOntoCurrent();
+        if (segmentLooksWrapped && mMudLine.size() <= csmServerWrapMaxJoinedLength) {
+            mServerWrapPendingLine.swap(mMudLine);
+            mServerWrapPendingBuffer.swap(mMudBuffer);
+            mServerWrapPendingSegmentLength = segmentLength;
+            mServerWrapPendingSegmentStart = segmentStart;
+            mCurrentHyperlinkStartsAfterHeldText = mHyperlinkActive && mCurrentHyperlinkText.isEmpty();
+            if (mpModel) {
+                emit mpModel->mNotifier.serverWrapLineHeld();
+            }
+            ++localBufferPosition;
+            return true;
+        }
+    } else {
+        // Any other kind of line ending means held text was a complete line
+        // after all - commit it on its own first. The held text ended at the
+        // game's own newline, so a link begun in it ends with it too - unless
+        // the flush marker came part way through text that continues it.
+        flushPendingServerWrapJoin(endsStringSequence(ch) || mMudLine.isEmpty());
+    }
+
+    // End any hyperlink the game left open. OSC 8 lets a link span lines, but a
+    // send: link runs a command, so an unclosed one would make all later output
+    // clickable. Not on Mudlet's own flush marker, which only means the rest of
+    // the line has not arrived yet (endsStringSequence()), and not above, where
+    // a line held back for joining returns: the link carries on into the rest.
+    // Nor before the link has any text: one opened just before a line break is
+    // for the line after it.
+    if (mHyperlinkActive) {
+        if (endsStringSequence(ch) && !mCurrentHyperlinkText.isEmpty()) {
+            finaliseActiveHyperlink();
+        } else {
+            carryActiveHyperlinkPastFlush(mMudLine);
+        }
+    }
+
+    // Copy out and clear rather than swap: the accumulators keep their allocation (regrowing costs more than
+    // the copy) and stored lines are exactly sized, not worst-case; past csmMaxRetainedLineCapacity the
+    // accumulator is released instead. Emptied before the commit so nested passes from commitLineData() can
+    // use them. Characters are moved: none can be selected, so the copy constructor's flag clearing is wasted.
+    QString line;
+    if (!mMudLine.isEmpty()) {
+        line = QString(mMudLine.constData(), mMudLine.size());
+        mMudLine.resize(0);
+    }
+    std::vector<TChar> chars(std::make_move_iterator(mMudBuffer.begin()), std::make_move_iterator(mMudBuffer.end()));
+    mMudBuffer.clear();
+    if (static_cast<size_t>(mMudLine.capacity()) > csmMaxRetainedLineCapacity) {
+        QString().swap(mMudLine);
+    }
+    if (mMudBuffer.capacity() > csmMaxRetainedLineCapacity) {
+        std::vector<TChar>().swap(mMudBuffer);
+    }
+    commitLineData(std::move(line), std::move(chars), ch);
+    ++localBufferPosition;
+    return true;
+}
+
+void TBuffer::commitLineData(QString line, std::vector<TChar> chars, const char ch)
+{
+    // Qt struggles to report blank lines on Windows to screen readers, this is a workaround
+    // https://bugreports.qt.io/browse/QTBUG-105035
+    if (Q_UNLIKELY(line.isEmpty())) {
+        if (mpHost->mBlankLineBehaviour == Host::BlankLineBehaviour::Hide) {
+            return;
+        } else if (mpHost->mBlankLineBehaviour == Host::BlankLineBehaviour::ReplaceWithSpace) { // NOLINT(readability-else-after-return)
+            // Note: we are using the background color for the
+            // foreground color as well so that we are transparent:
+            const TChar c(mBackGroundColor, mBackGroundColor, computeCurrentAttributeFlags());
+            line.append(QChar::Space);
+            chars.push_back(c);
+        }
+    }
+
+    if (static_cast<size_t>(line.size()) != chars.size()) {
+        qWarning() << "TBuffer::translateToPlainText(...) WARNING: mismatch in new text "
+                      "data character and attribute data items!";
+    }
+    if (lineBuffer.isEmpty()) {
+        appendEmptyLine();
+    }
+    if (!lineBuffer.back().isEmpty()) {
+        if (!line.isEmpty()) {
+            lineBuffer << std::move(line);
+        } else {
+            if (ch == '\r') {
+                return; //empty timer posting
+            }
+            lineBuffer << QString();
+        }
+        buffer.push_back(std::move(chars));
+        timeBuffer << currentTimeStamp();
+        if (ch == '\xff') {
+            promptBuffer.append(true);
+        } else {
+            promptBuffer.append(false);
+        }
+    } else {
+        if (!line.isEmpty()) {
+            // The last line is empty, so this is the whole of it
+            lineBuffer.back() = std::move(line);
+        } else {
+            if (ch == '\r') {
+                return; //empty timer posting
+            }
+            lineBuffer.back().append(QString());
+        }
+        // A commit re-entered from a pass (feedTriggers(), MXP) fills the empty last line, which may be
+        // the one the enclosing pass is still running over:
+        materialisePreTriggerPassLine(static_cast<int>(buffer.size()) - 1);
+        buffer.back() = std::move(chars);
+        timeBuffer.back() = currentTimeStamp();
+        if (ch == '\xff') {
+            promptBuffer.back() = true;
+        } else {
+            promptBuffer.back() = false;
+        }
+    }
+    // Every game line passes here (TConsoleModel::print() sees only client output). Mirroring before runTriggers()
+    // keeps arrival order, so script output in response follows it, but lines that triggers gag or rewrite
+    // are still mirrored as sent. Mirroring at log() below would trade the other way and copy wrapLine()'s
+    // fragments instead of the line as sent.
+    if (Q_UNLIKELY(mudlet::smMirrorToStdOut)) {
+        if (Q_LIKELY(mpModel)) {
+            // Read back out of the buffer rather than from line, which every
+            // path above has moved from by now
+            mpModel->mirrorLineToStdOut(lineBuffer.back());
+        } else {
+            static bool mirrorWithoutConsoleReported = false;
+            if (!mirrorWithoutConsoleReported) {
+                mirrorWithoutConsoleReported = true;
+                qWarning() << "--mirror: a buffer with no console model is committing lines, which cannot be copied to standard output";
+            }
+        }
+    }
+    const int lineIndex = lineBuffer.size() - 1;
+    mCommitLineIndices.append(lineIndex);
+    if (!mSkipTriggerProcessing) {
+        // Color triggers match the colors as received, so a line recolored earlier in the pass keeps its
+        // originals; materialisePreTriggerPassLine() copies them lazily as most lines are never touched.
+        // An enclosing pass is about to lose its state to this one, so snapshot its line now - a recolor
+        // from inside this pass would aim at this line instead:
+        materialisePreTriggerPassLine(mPreTriggerPassLineNumber);
+        // Save/restore gives each nested pass its own snapshot; the spare member recycles its allocation:
+        std::vector<TChar> savedPassLine;
+        savedPassLine.swap(mPreTriggerPassLine);
+        const int savedPassLineNumber = mPreTriggerPassLineNumber;
+        const bool savedPassSnapshotTaken = mPreTriggerPassSnapshotTaken;
+        const PassLineUniformity savedPassLineUniformity = mPreTriggerPassLineUniformity;
+        mPreTriggerPassLine.swap(mSpareTriggerPassLine);
+        mPreTriggerPassLine.clear();
+        mPreTriggerPassSnapshotTaken = false;
+        mPreTriggerPassLineNumber = lineIndex;
+        mPreTriggerPassLineUniformity = PassLineUniformity::Unknown;
+#ifndef QT_NO_DEBUG
+        const quint64 committedColors = colorFingerprint(buffer.back());
+#endif
+        mpHost->runTriggers(lineIndex);
+#ifndef QT_NO_DEBUG
+        // A write bypassing materialisePreTriggerPassLine() fails silently (color triggers match the
+        // recolored text), so catch it here:
+        if (!mPreTriggerPassSnapshotTaken && mPreTriggerPassLineNumber == lineIndex && lineIndex < static_cast<int>(buffer.size())) {
+            Q_ASSERT_X(colorFingerprint(buffer[lineIndex]) == committedColors, "TBuffer::commitLineData", "a trigger recolored the line without going through materialisePreTriggerPassLine()");
+        }
+#endif
+        mSpareTriggerPassLine.swap(mPreTriggerPassLine);
+        if (mSpareTriggerPassLine.capacity() > csmMaxRetainedLineCapacity) {
+            std::vector<TChar>().swap(mSpareTriggerPassLine);
+        }
+        mPreTriggerPassLine.swap(savedPassLine);
+        mPreTriggerPassLineNumber = savedPassLineNumber;
+        mPreTriggerPassSnapshotTaken = savedPassSnapshotTaken;
+        mPreTriggerPassLineUniformity = savedPassLineUniformity;
+    }
+
+    // Only use of TBuffer::wrap(), breaks up new text
+    // NOTE: it MAY have been clobbered by the trigger engine!
+    // If deleteLine() was called in a trigger, 'lineIndex' may now be past the
+    // end of the buffer; clamp to the last valid line so that any text
+    // inserted via echo() into the preceding line (which may contain embedded
+    // '\n' characters from insertInLine) is still wrapped correctly.
+    const int lastValidLine = static_cast<int>(lineBuffer.size()) - 1;
+    const int wrapStartLine = (lastValidLine >= 0) ? std::min(lineIndex, lastValidLine) : 0;
+    const int addedLines = wrapLine(wrapStartLine, mWrapAt, mWrapIndent, mWrapHangingIndent);
+
+    // Skip logging if a trigger deleted the line that was being committed;
+    // deleteLines() has already adjusted the deferred logging state
+    if (mCommitLineIndices.takeLast() >= 0) {
+        log(lineBuffer.size() - 1, lineBuffer.size() - 1);
+    }
+
+    // Suppress new empty line IFF echoes already created a new empty line
+    // i.e. add newline if no added lines or the lastline isn't empty
+    if (addedLines == 0 || !lineBuffer.back().isEmpty()) {
+        buffer.emplace_back();
+        lineBuffer.push_back(QString());
+        timeBuffer.push_back(QString());
+        promptBuffer << false;
+    }
+
+    if (static_cast<int>(buffer.size()) > mLinesLimit) {
+        // Whilst we also include a call to TConsole::handleLinesOverflowEvent(...)
+        // in all other methods where the following is used (because
+        // both need to monitor the number of lines of text in the
+        // buffer) the event that the former may be required to
+        // generate is NOT used for the TMainConsole case whereas this
+        // (translateToPlainText(...)) method is ONLY for that one:
+        shrinkBuffer();
+    }
+
+    applyPendingSelectionStyling();
+}
+
+// A line whose length is within csmServerWrapSlack characters below the
+// configured column could have been broken there by the game's own word wrap
+// (which breaks at the last space that fits, so wrapped segments fall up to a
+// word short of the column); pendingLineHadRoomForNextWord() settles whether
+// it really was once the continuation is in:
+bool TBuffer::endsAtServerWrapColumn() const
+{
+    const qsizetype width = mpHost->mUndoServerWrapWidth;
+    const qsizetype len = mMudLine.size();
+    return len <= width && len >= width - csmServerWrapSlack;
+}
+
+namespace {
+// What the end of a sentence looks like, closing quotes and brackets
+// included. The two checks below have to agree on it: one takes a wide
+// trailing gap after such a mark as a wrap the game kept the break space of,
+// the other refuses to hold a segment that ends on one:
+constexpr QStringView SENTENCE_FINALS = u".!?'\")";
+} // anonymous namespace
+
+// Word-wrapped prose breaks between words, so a wrapped segment ends in a
+// word (or a sentence mark that happened to fall on the wrap column) and
+// consists mostly of letters. ASCII art, dividers and table borders - which
+// also run right up to the screen width - end in and are full of symbols;
+// those must not be glued back together:
+bool TBuffer::looksLikeWrappedProse(const QString& line) const
+{
+    // Some games keep the space they broke the line at rather than
+    // swallowing it - but only ever the one, except right after the end of
+    // a sentence: games that put two spaces after a full stop keep both
+    // when the wrap point lands there. Any longer run of trailing
+    // whitespace means padding (or a blank line), which word wrap never
+    // produces:
+    qsizetype end = line.size();
+    while (end > 0 && line.at(end - 1).isSpace()) {
+        --end;
+    }
+    if (end == 0) {
+        return false;
+    }
+    static const QString allowedFinals = qsl(".,;:!?'\")");
+    const QChar last = line.at(end - 1);
+    const qsizetype trailingSpaces = line.size() - end;
+    if (trailingSpaces > 2 || (trailingSpaces == 2 && !SENTENCE_FINALS.contains(last))) {
+        return false;
+    }
+    if (!last.isLetterOrNumber() && !allowedFinals.contains(last)) {
+        return false;
+    }
+    qsizetype letters = 0;
+    qsizetype nonSpace = 0;
+    for (const QChar& c : line) {
+        if (c.isSpace()) {
+            continue;
+        }
+        ++nonSpace;
+        if (c.isLetterOrNumber()) {
+            ++letters;
+        }
+    }
+    return nonSpace > 0 && letters * 10 >= nonSpace * 6;
+}
+
+// Where a game swallows the space it breaks at, a segment that finishes a
+// sentence right on the wrap column looks exactly like one the game ended
+// there itself - and games end lines on sentences all the time: a room
+// description, the exits line below it, the object line below that. Joining
+// those runs separate lines into one and breaks triggers anchored to their
+// starts. A kept break space is the one piece of evidence
+// that settles it, so only a sentence with nothing at all after it is
+// refused. What that costs is a genuine wrap landing exactly after a sentence
+// staying split, which reads as a break at a sentence boundary - far cheaper
+// than the joins it prevents; the closing quotes and brackets in the set take
+// a mid-sentence one landing on the column with them, at the same cost and in
+// the same direction. The hold decision is the only place this belongs:
+// continuations legitimately end sentences, so looksLikeWrappedProse() must
+// keep accepting them.
+bool TBuffer::segmentEndsSettledSentence(const QString& line)
+{
+    if (line.isEmpty()) {
+        return false;
+    }
+    return SENTENCE_FINALS.contains(line.back());
+}
+
+// A list entry reads exactly like wrapped prose: a sentence that can end
+// right at the wrap column. Only its marker tells the list apart from a
+// paragraph, so every form accepted here has to be one that word wrap would
+// not itself produce at the start of a continuation. The ambiguous ones are
+// left out on purpose: a spaced dash opens a continuation whenever the wrap
+// lands on it, and a parenthesised number is as often an aside as a label,
+// so it is capped like a bare one.
+bool TBuffer::startsWithListMarker(const QString& line)
+{
+    qsizetype start = 0;
+    while (start < line.size() && line.at(start).isSpace()) {
+        ++start;
+    }
+    if (start >= line.size()) {
+        return false;
+    }
+
+    static const QString bullets = qsl("*+•·●◦");
+    if (bullets.contains(line.at(start))) {
+        return start + 1 < line.size() && line.at(start + 1) == QChar::Space;
+    }
+
+    static const QString openers = qsl("[(");
+    static const QString closers = qsl("])");
+    const qsizetype bracket = openers.indexOf(line.at(start));
+    const qsizetype numberStart = (bracket < 0) ? start : start + 1;
+    qsizetype numberEnd = numberStart;
+    while (numberEnd < line.size() && line.at(numberEnd).isDigit()) {
+        ++numberEnd;
+    }
+    const qsizetype digits = numberEnd - numberStart;
+    if (!digits || numberEnd >= line.size()) {
+        return false;
+    }
+    const bool numberFitsAList = digits <= csmMaxListNumberDigits || line.at(start) == QChar('[');
+    const bool closed = (bracket >= 0) ? line.at(numberEnd) == closers.at(bracket) : (line.at(numberEnd) == QChar('.') || line.at(numberEnd) == QChar(')'));
+    return numberFitsAList && closed && numberEnd + 1 < line.size() && line.at(numberEnd + 1) == QChar::Space;
+}
+
+// Word wrap breaks a line for one reason only: the next word did not fit. So
+// a continuation whose first word would have gone on the game line above it
+// is not a continuation at all - the game ended that line itself. Without
+// this two sentences that each stop short of the wrap column read exactly
+// like one wrapped paragraph. Only clear room counts, see
+// csmServerWrapFitTolerance.
+bool TBuffer::pendingLineHadRoomForNextWord() const
+{
+    // Measured against the last game line joined into the held text rather
+    // than the held text itself, which by then may be a whole paragraph:
+    qsizetype trailingSpaces = 0;
+    while (trailingSpaces < mServerWrapPendingLine.size() && mServerWrapPendingLine.at(mServerWrapPendingLine.size() - trailingSpaces - 1).isSpace()) {
+        ++trailingSpaces;
+    }
+    const qsizetype heldEnd = mServerWrapPendingSegmentLength - trailingSpaces;
+    qsizetype wordStart = 0;
+    while (wordStart < mMudLine.size() && mMudLine.at(wordStart).isSpace()) {
+        ++wordStart;
+    }
+    qsizetype wordEnd = wordStart;
+    while (wordEnd < mMudLine.size() && !mMudLine.at(wordEnd).isSpace()) {
+        ++wordEnd;
+    }
+    // The word starts past whatever the join will put between the two: the
+    // spaces the game left on either side of the break, or the single one
+    // added for it when the game swallowed it:
+    const qsizetype separator = std::max<qsizetype>(1, trailingSpaces + wordStart);
+    return heldEnd + separator + (wordEnd - wordStart) + csmServerWrapFitTolerance <= mpHost->mUndoServerWrapWidth;
+}
+
+// Games that wrap a tell, say or channel message themselves put the whole
+// prefix back on every physical line of it ("Anne teilt Dir mit: ..."). Those
+// lines break mid-sentence at the wrap column and leave no room for the next
+// word, so every other check reads them as one wrapped paragraph and the join
+// buries the prefix in the middle of it. The repeated opening is what gives
+// them away. Two words of it, because prose starts line after line with the
+// same article or pronoun and one proves nothing.
+bool TBuffer::continuationRepeatsSegmentOpening() const
+{
+    const qsizetype comparable = std::min(mServerWrapPendingSegmentStart.size(), mMudLine.size());
+    qsizetype i = 0;
+    // A held segment can open with the space the game moved the break to
+    // rather than swallowing it, and that space begins no word:
+    while (i < comparable && mServerWrapPendingSegmentStart.at(i).isSpace()) {
+        ++i;
+    }
+    int repeatedWords = 0;
+    for (; i < comparable; ++i) {
+        if (mServerWrapPendingSegmentStart.at(i) != mMudLine.at(i)) {
+            break;
+        }
+        // A word is over at the first space after it, so a run of them counts
+        // once - two words shared, not one and a wide gap:
+        if (mServerWrapPendingSegmentStart.at(i).isSpace() && !mServerWrapPendingSegmentStart.at(i - 1).isSpace()) {
+            ++repeatedWords;
+        }
+    }
+    return repeatedWords >= csmServerWrapRepeatedWords;
+}
+
+void TBuffer::joinPendingServerWrapOntoCurrent()
+{
+    if (mServerWrapPendingLine.isEmpty()) {
+        return;
+    }
+    // The game's wrapper swallowed the space it broke the line at:
+    if (!mServerWrapPendingLine.endsWith(QChar::Space) && !mMudLine.startsWith(QChar::Space)) {
+        mServerWrapPendingLine.append(QChar::Space);
+        mServerWrapPendingBuffer.push_back(mServerWrapPendingBuffer.empty() ? TChar(mForeGroundColor, mBackGroundColor, computeCurrentAttributeFlags()) : mServerWrapPendingBuffer.back());
+    }
+    const int heldLength = static_cast<int>(mServerWrapPendingLine.size());
+    if (mHyperlinkActive && mCurrentHyperlinkStartsAfterHeldText) {
+        mCurrentHyperlinkStartColumn += heldLength;
+        mCurrentHyperlinkStartsAfterHeldText = false;
+    }
+    mMudLine.prepend(mServerWrapPendingLine);
+    mMudBuffer.insert(mMudBuffer.begin(), mServerWrapPendingBuffer.begin(), mServerWrapPendingBuffer.end());
+    if (mHeldSpoilerLinkId) {
+        maskSpoilerText(mHeldSpoilerLinkId, mMudLine, mHeldSpoilerStartColumn, heldLength - mHeldSpoilerStartColumn + mHeldSpoilerContinuationLength);
+        mHeldSpoilerLinkId = 0;
+    }
+    if (mHeldVisibility.linkId) {
+        const HeldVisibility held = std::exchange(mHeldVisibility, HeldVisibility{});
+        if (held.startsAfterHeldText) {
+            registerLinkVisibility(held.linkId, held.startColumn + heldLength, held.continuationLength - held.startColumn, held.styling);
+        } else {
+            registerLinkVisibility(held.linkId, held.startColumn, heldLength - held.startColumn + held.continuationLength, held.styling);
+        }
+    }
+    mServerWrapPendingLine.clear();
+    mServerWrapPendingBuffer.clear();
+}
+
+void TBuffer::flushPendingServerWrapJoin(const bool endsHyperlink)
+{
+    if (mServerWrapPendingLine.isEmpty()) {
+        return;
+    }
+    if (mHeldSpoilerLinkId) {
+        maskSpoilerText(mHeldSpoilerLinkId, mServerWrapPendingLine, mHeldSpoilerStartColumn, mServerWrapPendingLine.size() - mHeldSpoilerStartColumn);
+        maskSpoilerText(mHeldSpoilerLinkId, mMudLine, 0, mHeldSpoilerContinuationLength);
+        mHeldSpoilerLinkId = 0;
+    }
+    // A link closed after the held text sits whole on the line after it, at the columns it recorded;
+    // one that began in the held text now spans two lines, which visibility does not cover.
+    const HeldVisibility heldVisibility = std::exchange(mHeldVisibility, HeldVisibility{});
+    const bool linkStartsAfterHeldText = mHyperlinkActive && mCurrentHyperlinkStartsAfterHeldText;
+    if (mHyperlinkActive && !linkStartsAfterHeldText) {
+        if (endsHyperlink) {
+            // A link that began in the held text ends with it, now that it has
+            // turned out to be a whole line - finalised against that line, not
+            // the one after, which loses the id its text was stamped with while
+            // the join was pending
+            const int linkId = mCurrentHyperlinkLinkId;
+            QString rest;
+            rest.swap(mMudLine);
+            mMudLine.swap(mServerWrapPendingLine);
+            finaliseActiveHyperlink();
+            mServerWrapPendingLine.swap(mMudLine);
+            mMudLine.swap(rest);
+            for (auto& c : mMudBuffer) {
+                if (c.mLinkIndex == linkId) {
+                    c.mLinkIndex = 0;
+                }
+            }
+        } else {
+            carryActiveHyperlinkPastFlush(mServerWrapPendingLine);
+        }
+    }
+    QString line;
+    std::vector<TChar> chars;
+    line.swap(mServerWrapPendingLine);
+    chars.swap(mServerWrapPendingBuffer);
+    commitLineData(std::move(line), std::move(chars), '\n');
+    if (linkStartsAfterHeldText) {
+        mCurrentHyperlinkStartLine = static_cast<int>(lineBuffer.size()) - 1;
+        mCurrentHyperlinkStartsAfterHeldText = false;
+    }
+    if (heldVisibility.linkId && heldVisibility.startsAfterHeldText) {
+        registerLinkVisibility(heldVisibility.linkId, heldVisibility.startColumn, heldVisibility.continuationLength - heldVisibility.startColumn, heldVisibility.styling);
+    }
+}
+
+const std::vector<TChar>* TBuffer::preTriggerPassLine(int lineNumber) const
+{
+    if (lineNumber >= 0 && lineNumber == mPreTriggerPassLineNumber && mPreTriggerPassSnapshotTaken) {
+        return &mPreTriggerPassLine;
+    }
+    return nullptr;
+}
+
+// A structural edit to the trigger-pass line makes the edited text the new
+// baseline for color matching:
+void TBuffer::syncPreTriggerPassLine(int y)
+{
+    if (y >= 0 && y == mPreTriggerPassLineNumber && y < static_cast<int>(buffer.size())) {
+        mPreTriggerPassLine = buffer[y];
+        mPreTriggerPassLineUniformity = PassLineUniformity::Unknown;
+        mPreTriggerPassSnapshotTaken = true;
+    }
+}
+
+void TBuffer::materialisePreTriggerPassLine(int y)
+{
+    if (!mPreTriggerPassSnapshotTaken && y >= 0 && y == mPreTriggerPassLineNumber && y < static_cast<int>(buffer.size())) {
+        mPreTriggerPassLine.assign(buffer[y].cbegin(), buffer[y].cend());
+        mPreTriggerPassSnapshotTaken = true;
+    }
+}
+
+const TChar* TBuffer::preTriggerPassLineUniformColors(int lineNumber)
+{
+    if (lineNumber < 0 || lineNumber != mPreTriggerPassLineNumber || lineNumber >= static_cast<int>(buffer.size())) {
+        return nullptr;
+    }
+    // Until a write materialises the snapshot, the line still holds the game's colors - most lines do:
+    const std::vector<TChar>& passLine = mPreTriggerPassSnapshotTaken ? mPreTriggerPassLine : buffer[lineNumber];
+    if (passLine.empty()) {
+        return nullptr;
+    }
+    const TChar& first = passLine.front();
+    if (mPreTriggerPassLineUniformity == PassLineUniformity::Unknown) {
+        // The first character stands for the rest only while this compares colors as the trigger does.
+        const bool uniform = std::all_of(passLine.cbegin() + 1, passLine.cend(), [&first](const TChar& character) {
+            return first.foregroundRgba() == character.foregroundRgba() && first.backgroundRgba() == character.backgroundRgba();
+        });
+        mPreTriggerPassLineUniformity = uniform ? PassLineUniformity::Uniform : PassLineUniformity::Mixed;
+    }
+    if (mPreTriggerPassLineUniformity == PassLineUniformity::Uniform) {
+        return &first;
+    }
+    return nullptr;
+}
+
+void TBuffer::processMxpWatchdogCallback()
+{
+    if (!mpHost) {
+        mWatchdogPhase = WatchdogPhase::None;
+        return;
+    }
+
+    TMxpNodeBuilder& tagBuilder = mpHost->mMxpProcessor.getMxpTagBuilder();
+    std::string currentTagContent = tagBuilder.getRawTagContent();
+    bool isMxpParserFrozen = !currentTagContent.empty() && currentTagContent.starts_with(mWatchdogTagSnapshot) && tagBuilder.isInsideTag();
+
+    if (mWatchdogPhase == WatchdogPhase::Phase1_Snapshot) {
+        mWatchdogTagSnapshot = currentTagContent;
+        mWatchdogPhase = WatchdogPhase::Phase2_Unfreeze;
+        mTagWatchdog->start(MAX_TAG_TIMEOUT_MS);
+    } else if (mWatchdogPhase == WatchdogPhase::Phase2_Unfreeze) {
+        // The continuation commits into this buffer and finalizes the main
+        // console's view, so it needs that view and this to be its buffer:
+        if (isMxpParserFrozen && !mpHost->mpConsole.isNull() && mpModel == &mpHost->mainConsoleModel()) {
+            mpHost->mMxpProcessor.setLastEntityValue(QString::fromStdString('<' + currentTagContent));
+            const TChar style(mForeGroundColor, mBackGroundColor, computeCurrentAttributeFlags());
+            QPointer<Host> hostGuard = mpHost;
+            // The continuation writes into this buffer through the captured
+            // 'this', so what has to cancel it is this buffer going away - not
+            // the console going away, which is a different and longer life. The
+            // watchdog timer is owned by the buffer, so naming it as the context
+            // object ties the two together: destroying the buffer destroys the
+            // timer, and that drops any continuation still queued against it.
+            QTimer::singleShot(0ms, mTagWatchdog.get(), [this, style, hostGuard]() {
+                // commitLine() and finalize() below both reach the main console
+                // through the host, and that pointer empties on its own when the
+                // profile's console goes:
+                if (!hostGuard || hostGuard->mpConsole.isNull()) {
+                    return;
+                }
+                QString lastEntityValue = hostGuard->mMxpProcessor.getEntityValue();
+                size_t unusedBufferPosition = 0;
+
+                mMudLine.append(lastEntityValue);
+                for (qsizetype i = 0; i < lastEntityValue.size(); ++i) {
+                    mMudBuffer.push_back(style);
+                }
+                commitLine('\r', unusedBufferPosition);
+                hostGuard->mMxpProcessor.getMxpTagBuilder().reset();
+                hostGuard->finalizeMainConsole();
+            });
+        }
+        mWatchdogPhase = WatchdogPhase::None;
+    }
+}
+
+TChar::AttributeFlags TBuffer::computeCurrentAttributeFlags() const
+{
+    return ((mIsDefaultColor ? mBold || mpHost->mMxpClient.bold() : false) ? TChar::Bold : TChar::None) | (mItalics || mpHost->mMxpClient.italic() ? TChar::Italic : TChar::None)
+           | (mOverline ? TChar::Overline : TChar::None) | (mReverse ? TChar::Reverse : TChar::None) | (mStrikeOut || mpHost->mMxpClient.strikeOut() ? TChar::StrikeOut : TChar::None)
+           | (mUnderline || mpHost->mMxpClient.underline() ? TChar::Underline : TChar::None) | (mUnderlineWavy ? TChar::UnderlineWavy : TChar::None)
+           | (mUnderlineDotted ? TChar::UnderlineDotted : TChar::None) | (mUnderlineDashed ? TChar::UnderlineDashed : TChar::None)
+           | (mFastBlink ? TChar::FastBlink : (mBlink ? TChar::Blink : TChar::None)) | (TChar::alternateFontFlag(mAltFont)) | (mConcealed ? TChar::Concealed : TChar::None);
+}
+
+void TBuffer::decodeSGR38(const SgrParameters& parameters, bool isColonSeparated)
 {
 #if defined(DEBUG_SGR_PROCESSING)
-    qDebug() << "    TBuffer::decodeSGR38(" << parameters << "," << isColonSeparated <<") INFO - called";
+    qDebug() << "    TBuffer::decodeSGR38(" << parameters << "," << isColonSeparated << ") INFO - called";
 #endif
     if (parameters.at(1) == QLatin1String("5")) {
         int tag = 0;
         if (parameters.count() > 2) {
             bool isOk = false;
             tag = parameters.at(2).toInt(&isOk);
-#if defined(DEBUG_SGR_PROCESSING)
             if (!isOk) {
+#if defined(DEBUG_SGR_PROCESSING)
                 if (isColonSeparated) {
-                    qDebug().noquote().nospace() << "TBuffer::decodeSGR38(...) ERROR - failed to parse color index parameter element (the third part) in a SGR...;38:5:" << parameters.at(2) << ":...;...m sequence treating it as a zero!";
+                    qDebug().noquote().nospace() << "TBuffer::decodeSGR38(...) ERROR - failed to parse color index parameter element (the third part) in a SGR...;38:5:" << parameters.at(2)
+                                                 << ":...;...m sequence, leaving the colour as it was!";
                 } else {
-                    qDebug().noquote().nospace() << "TBuffer::decodeSGR38(...) ERROR - failed to parse color index parameter string (the third part) in a SGR...;38;5;" << parameters.at(2) << ";...m sequence treating it as a zero!";
+                    qDebug().noquote().nospace() << "TBuffer::decodeSGR38(...) ERROR - failed to parse color index parameter string (the third part) in a SGR...;38;5;" << parameters.at(2)
+                                                 << ";...m sequence, leaving the colour as it was!";
                 }
-            }
 #endif
+                // An index we cannot read is not a request for colour zero:
+                return;
+            }
         } else {
             // Missing last parameter - so it is treated as a zero
 #if defined(DEBUG_SGR_PROCESSING)
@@ -989,7 +2730,7 @@ void TBuffer::decodeSGR38(const QStringList& parameters, bool isColonSeparated)
 
         } else if (tag < 232) {
             // because color 1-15 behave like normal ANSI colors
-           tag -= 16;
+            tag -= 16;
             // 6x6x6 RGB color space
             quint8 const r = tag / 36;
             quint8 const g = (tag - (r * 36)) / 6;
@@ -998,9 +2739,7 @@ void TBuffer::decodeSGR38(const QStringList& parameters, bool isColonSeparated)
             // To match the common terminal palettes, the values are
             // scaled as follows:
             // 0: 0, 1: 95, 2:135, 3:175, 4:215, 5:255
-            mForeGroundColor = QColor(r == 0 ? 0 : (r - 1) * 40 + 95,
-                                      g == 0 ? 0 : (g - 1) * 40 + 95,
-                                      b == 0 ? 0 : (b - 1) * 40 + 95);
+            mForeGroundColor = QColor(r == 0 ? 0 : (r - 1) * 40 + 95, g == 0 ? 0 : (g - 1) * 40 + 95, b == 0 ? 0 : (b - 1) * 40 + 95);
             mForeGroundColorLight = mForeGroundColor;
 
         } else {
@@ -1024,7 +2763,7 @@ void TBuffer::decodeSGR38(const QStringList& parameters, bool isColonSeparated)
             // but green and blue components are
             // zero
             mForeGroundColor = QColor(qBound(0, parameters.at(3).toInt(), 255), 0, 0);
-        } else  {
+        } else {
             // No codes left for any colour
             // components so colour must be black,
             // as all of red, green and blue
@@ -1034,22 +2773,22 @@ void TBuffer::decodeSGR38(const QStringList& parameters, bool isColonSeparated)
 
         if (parameters.count() >= 3 && !parameters.at(2).isEmpty()) {
             if (!isColonSeparated) {
-#if ! defined(DEBUG_SGR_PROCESSING)
-                qDebug() << "Unhandled color space identifier in a SGR...;38;2;" << parameters.at(2) << ";...m sequence - if 16M colors items are missing blue elements you may have checked the \"Expect Color Space Id in SGR...(3|4)8;2;....m codes\" option on the Special Options tab of the preferences when it is not needed!";
+#if !defined(DEBUG_SGR_PROCESSING)
+                qDebug() << "Unhandled color space identifier in a SGR...;38;2;" << parameters.at(2)
+                         << ";...m sequence - if 16M colors items are missing blue elements you may have checked the \"Expect Color Space Id in SGR...(3|4)8;2;....m codes\" option on the "
+                            "Compatibility card of the Connection settings when it is not needed!";
 #else
-                qDebug().noquote().nospace() << "TBuffer::decodeSGR38(...) WARNING - unhandled color space identifier in a SGR...;38;2;" << parameters.at(2) << ";...m sequence treating it as the default (empty) case!";
+                qDebug().noquote().nospace() << "TBuffer::decodeSGR38(...) WARNING - unhandled color space identifier in a SGR...;38;2;" << parameters.at(2)
+                                             << ";...m sequence treating it as the default (empty) case!";
             } else {
-                qDebug().noquote().nospace() << "TBuffer::decodeSGR38(...) WARNING - unhandled color space identifier in a SGR...;38:2:" << parameters.at(2) << ":...;...m sequence treating it as the default (empty) case!";
+                qDebug().noquote().nospace() << "TBuffer::decodeSGR38(...) WARNING - unhandled color space identifier in a SGR...;38:2:" << parameters.at(2)
+                                             << ":...;...m sequence treating it as the default (empty) case!";
 #endif
             }
         }
         mForeGroundColorLight = mForeGroundColor;
 
-    } else if (parameters.at(1) == QLatin1String("4")
-            || parameters.at(1) == QLatin1String("3")
-            || parameters.at(1) == QLatin1String("1")
-            || parameters.at(1) == QLatin1String("0")) {
-
+    } else if (parameters.at(1) == QLatin1String("4") || parameters.at(1) == QLatin1String("3") || parameters.at(1) == QLatin1String("1") || parameters.at(1) == QLatin1String("0")) {
 #if defined(DEBUG_SGR_PROCESSING)
         if (isColonSeparated) {
             qDebug().noquote().nospace() << "TBuffer::decodeSGR38(...) WARNING - unhandled SGR code: SGR...;38:" << parameters.at(1) << ":...;...m ignoring sequence!";
@@ -1059,7 +2798,6 @@ void TBuffer::decodeSGR38(const QStringList& parameters, bool isColonSeparated)
 #endif
 
     } else {
-
 #if defined(DEBUG_SGR_PROCESSING)
         if (isColonSeparated) {
             qDebug().noquote().nospace() << "TBuffer::decodeSGR38(...) WARNING - unexpected SGR code: SGR...;38:" << parameters.at(1) << ":...;...m ignoring sequence!";
@@ -1067,14 +2805,13 @@ void TBuffer::decodeSGR38(const QStringList& parameters, bool isColonSeparated)
             qDebug().noquote().nospace() << "TBuffer::decodeSGR38(...) WARNING - unexpected SGR code: SGR...;38;" << parameters.at(1) << ";...m ignoring sequence!";
         }
 #endif
-
     }
 }
 
-void TBuffer::decodeSGR48(const QStringList& parameters, bool isColonSeparated)
+void TBuffer::decodeSGR48(const SgrParameters& parameters, bool isColonSeparated)
 {
 #if defined(DEBUG_SGR_PROCESSING)
-    qDebug() << "    TBuffer::decodeSGR48(" << parameters << "," << isColonSeparated <<") INFO - called";
+    qDebug() << "    TBuffer::decodeSGR48(" << parameters << "," << isColonSeparated << ") INFO - called";
 #endif
     bool useLightColor = false;
 
@@ -1083,15 +2820,19 @@ void TBuffer::decodeSGR48(const QStringList& parameters, bool isColonSeparated)
         if (parameters.count() > 2) {
             bool isOk = false;
             tag = parameters.at(2).toInt(&isOk);
-#if defined(DEBUG_SGR_PROCESSING)
             if (!isOk) {
+#if defined(DEBUG_SGR_PROCESSING)
                 if (isColonSeparated) {
-                    qDebug().noquote().nospace() << "TBuffer::decodeSGR48(...) ERROR - failed to parse color index parameter element (the third part) in a SGR...;48:5:" << parameters.at(2) << ":...;...m sequence treating it as a zero!";
+                    qDebug().noquote().nospace() << "TBuffer::decodeSGR48(...) ERROR - failed to parse color index parameter element (the third part) in a SGR...;48:5:" << parameters.at(2)
+                                                 << ":...;...m sequence, leaving the colour as it was!";
                 } else {
-                    qDebug().noquote().nospace() << "TBuffer::decodeSGR48(...) ERROR - failed to parse color index parameter string (the third part) in a SGR...;48;5;" << parameters.at(2) << ";...m sequence treating it as a zero!";
+                    qDebug().noquote().nospace() << "TBuffer::decodeSGR48(...) ERROR - failed to parse color index parameter string (the third part) in a SGR...;48;5;" << parameters.at(2)
+                                                 << ";...m sequence, leaving the colour as it was!";
                 }
-            }
 #endif
+                // An index we cannot read is not a request for colour zero:
+                return;
+            }
         } else {
             // Missing last parameter - so it is treated as a zero
 #if defined(DEBUG_SGR_PROCESSING)
@@ -1162,9 +2903,7 @@ void TBuffer::decodeSGR48(const QStringList& parameters, bool isColonSeparated)
             // To match the common terminal palettes, the values are
             // scaled as follows:
             // 0: 0, 1: 95, 2:135, 3:175, 4:215, 5:255
-            mBackGroundColor = QColor(r == 0 ? 0 : (r - 1) * 40 + 95,
-                                      g == 0 ? 0 : (g - 1) * 40 + 95,
-                                      b == 0 ? 0 : (b - 1) * 40 + 95);
+            mBackGroundColor = QColor(r == 0 ? 0 : (r - 1) * 40 + 95, g == 0 ? 0 : (g - 1) * 40 + 95, b == 0 ? 0 : (b - 1) * 40 + 95);
 
         } else {
             const int value = (tag - 232) * 10 + 8;
@@ -1189,7 +2928,7 @@ void TBuffer::decodeSGR48(const QStringList& parameters, bool isColonSeparated)
             // zero
             mBackGroundColor = QColor(qBound(0, parameters.at(3).toInt(), 255), 0, 0);
 
-        } else  {
+        } else {
             // No codes left for any colour
             // components so colour must be black,
             // as all of red, green and blue
@@ -1199,21 +2938,21 @@ void TBuffer::decodeSGR48(const QStringList& parameters, bool isColonSeparated)
 
         if (parameters.count() >= 3 && !parameters.at(2).isEmpty()) {
             if (!isColonSeparated) {
-#if ! defined(DEBUG_SGR_PROCESSING)
-                qDebug() << "Unhandled color space identifier in a SGR...;48;2;" << parameters.at(2) << ";...m sequence - if 16M colors items are missing blue elements you may have checked the \"Expect Color Space Id in SGR...(3|4)8;2;....m codes\" option on the Special Options tab of the preferences when it is not needed!";
+#if !defined(DEBUG_SGR_PROCESSING)
+                qDebug() << "Unhandled color space identifier in a SGR...;48;2;" << parameters.at(2)
+                         << ";...m sequence - if 16M colors items are missing blue elements you may have checked the \"Expect Color Space Id in SGR...(3|4)8;2;....m codes\" option on the "
+                            "Compatibility card of the Connection settings when it is not needed!";
 #else
-                qDebug().noquote().nospace() << "TBuffer::decodeSGR48(...) WARNING - unhandled color space identifier in a SGR...;48;2;" << parameters.at(2) << ";...m sequence treating it as the default (empty) case!";
+                qDebug().noquote().nospace() << "TBuffer::decodeSGR48(...) WARNING - unhandled color space identifier in a SGR...;48;2;" << parameters.at(2)
+                                             << ";...m sequence treating it as the default (empty) case!";
             } else {
-                qDebug().noquote().nospace() << "TBuffer::decodeSGR48(...) WARNING - unhandled color space identifier in a SGR...;48:2:" << parameters.at(2) << ":...;...m sequence treating it as the default (empty) case!";
+                qDebug().noquote().nospace() << "TBuffer::decodeSGR48(...) WARNING - unhandled color space identifier in a SGR...;48:2:" << parameters.at(2)
+                                             << ":...;...m sequence treating it as the default (empty) case!";
 #endif
             }
         }
 
-    } else if (parameters.at(1) == QLatin1String("4")
-            || parameters.at(1) == QLatin1String("3")
-            || parameters.at(1) == QLatin1String("1")
-            || parameters.at(1) == QLatin1String("0")) {
-
+    } else if (parameters.at(1) == QLatin1String("4") || parameters.at(1) == QLatin1String("3") || parameters.at(1) == QLatin1String("1") || parameters.at(1) == QLatin1String("0")) {
 #if defined(DEBUG_SGR_PROCESSING)
         if (isColonSeparated) {
             qDebug().noquote().nospace() << "TBuffer::decodeSGR48(...) WARNING - unhandled SGR code: SGR...;48:" << parameters.at(1) << ":...;...m ignoring sequence!";
@@ -1223,7 +2962,6 @@ void TBuffer::decodeSGR48(const QStringList& parameters, bool isColonSeparated)
 #endif
 
     } else {
-
 #if defined(DEBUG_SGR_PROCESSING)
         if (isColonSeparated) {
             qDebug().noquote().nospace() << "TBuffer::decodeSGR48(...) WARNING - unexpected SGR code: SGR...;48:" << parameters.at(1) << ":...;...m ignoring sequence!";
@@ -1232,10 +2970,9 @@ void TBuffer::decodeSGR48(const QStringList& parameters, bool isColonSeparated)
         }
 #endif
     }
-
 }
 
-void TBuffer::decodeSGR(const QString& sequence)
+void TBuffer::decodeSGR(const QStringView sequence)
 {
     Host* pHost = mpHost;
     if (!pHost) {
@@ -1245,15 +2982,21 @@ void TBuffer::decodeSGR(const QString& sequence)
 
     const bool haveColorSpaceId = pHost->getHaveColorSpaceId();
 
-    const QStringList parameterStrings = sequence.split(QChar(';'));
+    SgrParameters parameterStrings;
+    for (const QStringView parameter : sequence.tokenize(u';')) {
+        parameterStrings.append(parameter);
+    }
     for (int paraIndex = 0, total = parameterStrings.count(); paraIndex < total; ++paraIndex) {
-        const QString allParameterElements = parameterStrings.at(paraIndex);
-        if (allParameterElements.contains(QLatin1String(":"))) {
+        const QStringView allParameterElements = parameterStrings.at(paraIndex);
+        if (allParameterElements.contains(u':')) {
             /******************************************************************
              * Parameter string with colon separated Parameter (sub) elements *
              ******************************************************************/
             // We have colon separated parameter elements, so we must have at least 2 members
-            const QStringList parameterElements(allParameterElements.split(QChar(':')));
+            SgrParameters parameterElements;
+            for (const QStringView element : allParameterElements.tokenize(u':')) {
+                parameterElements.append(element);
+            }
             if (parameterElements.at(0) == QLatin1String("38")) {
                 if (parameterElements.count() >= 2) {
                     decodeSGR38(parameterElements, true);
@@ -1271,8 +3014,8 @@ void TBuffer::decodeSGR(const QString& sequence)
 
                     // Okay we have one more parameter at least - so examine it
                     // and grab the needed number of arguments:
-                    QStringList madeElements;
-                    madeElements << parameterStrings.at(paraIndex); // "38"
+                    SgrParameters madeElements;
+                    madeElements << parameterStrings.at(paraIndex);     // "38"
                     madeElements << parameterStrings.at(paraIndex + 1); // "2" or "5" hopefully
                     bool isOk = false;
                     const int sgr38_type = madeElements.at(1).toInt(&isOk);
@@ -1293,17 +3036,17 @@ void TBuffer::decodeSGR(const QString& sequence)
                         paraIndex += 2;
                         break;
                     case 4: // Not handled but we still should skip its arguments
-                            // Uses four or five depending on whether there is
-                            // the colour space id first
-                            // Move the index to consume the used values
+                        // Uses four or five depending on whether there is
+                        // the colour space id first
+                        // Move the index to consume the used values
                         paraIndex += (haveColorSpaceId ? 6 : 5);
                         break;
                     case 3: // Not handled but we still should skip its arguments
-                            // Move the index to consume the used values
+                        // Move the index to consume the used values
                         paraIndex += (haveColorSpaceId ? 5 : 4);
                         break;
                     case 2: // Need three or four depending on whether there is
-                            // the colour space id first
+                        // the colour space id first
                         if (haveColorSpaceId) {
                             if (paraIndex + 2 < total) {
                                 // We have the color space id
@@ -1323,7 +3066,7 @@ void TBuffer::decodeSGR(const QString& sequence)
                             }
                         } else {
                             // Fake an empty colour space id
-                            madeElements << QString();
+                            madeElements << QStringView();
                             if (paraIndex + 2 < total) {
                                 // We have the red component
                                 madeElements << parameterStrings.at(paraIndex + 2);
@@ -1343,14 +3086,13 @@ void TBuffer::decodeSGR(const QString& sequence)
                         paraIndex += (haveColorSpaceId ? 5 : 4);
                         break;
                     case 1: // This uses no extra arguments and, as it means
-                            // transparent, is no use to us
+                        // transparent, is no use to us
                         [[fallthrough]];
                     default:
                         break;
                     }
-
                 }
-            // End of if (parameterElements.at(0) == QLatin1String("38"))
+                // End of if (parameterElements.at(0) == QLatin1String("38"))
             } else if (parameterElements.at(0) == QLatin1String("48")) {
                 if (parameterElements.count() >= 2) {
                     decodeSGR48(parameterElements, true);
@@ -1368,7 +3110,7 @@ void TBuffer::decodeSGR(const QString& sequence)
 
                     // Okay we have one more parameter at least - so examine it
                     // and grab the needed number of arguments:
-                    QStringList madeElements;
+                    SgrParameters madeElements;
                     madeElements << parameterStrings.at(paraIndex);
                     madeElements << parameterStrings.at(paraIndex + 1);
                     bool isOk = false;
@@ -1390,17 +3132,17 @@ void TBuffer::decodeSGR(const QString& sequence)
                         paraIndex += 2;
                         break;
                     case 4: // Not handled but we still should skip its arguments
-                            // Uses four or five depending on whether there is
-                            // the colour space id first
-                            // Move the index to consume the used values
+                        // Uses four or five depending on whether there is
+                        // the colour space id first
+                        // Move the index to consume the used values
                         paraIndex += (haveColorSpaceId ? 6 : 5);
                         break;
                     case 3: // Not handled but we still should skip its arguments
-                            // Move the index to consume the used values
+                        // Move the index to consume the used values
                         paraIndex += (haveColorSpaceId ? 5 : 4);
                         break;
                     case 2: // Need three or four depending on whether there is
-                            // the colour space id first
+                        // the colour space id first
                         if (haveColorSpaceId) {
                             if (paraIndex + 2 < total) {
                                 // We have the color space id
@@ -1420,7 +3162,7 @@ void TBuffer::decodeSGR(const QString& sequence)
                             }
                         } else {
                             // Fake an empty colour space id
-                            madeElements << QString();
+                            madeElements << QStringView();
                             if (paraIndex + 2 < total) {
                                 // We have the red component
                                 madeElements << parameterStrings.at(paraIndex + 2);
@@ -1440,38 +3182,71 @@ void TBuffer::decodeSGR(const QString& sequence)
                         paraIndex += (haveColorSpaceId ? 5 : 4);
                         break;
                     case 1: // This uses no extra arguments and, as it means
-                            // transparent, is no use to us
+                        // transparent, is no use to us
                         [[fallthrough]];
                     default:
                         break;
                     }
-
                 }
-            // End of if (parameterElements.at(0) == QLatin1String("48"))
+                // End of if (parameterElements.at(0) == QLatin1String("48"))
             } else if (parameterElements.at(0) == QLatin1String("4")) {
                 // New way of controlling underline
                 bool isOk = false;
                 const int value = parameterElements.at(1).toInt(&isOk);
                 if (!isOk) {
                     // missing value
-                    qDebug().noquote().nospace() << "TBuffer::decodeSGR(\"" << sequence << "\") ERROR - failed to detect underline parameter element (the second part) in a SGR...;4:?;..m sequence assuming it is a zero!";
+                    qDebug().noquote().nospace() << "TBuffer::decodeSGR(\"" << sequence
+                                                 << "\") ERROR - failed to detect underline parameter element (the second part) in a SGR...;4:?;..m sequence assuming it is a zero!";
                 }
+                // Sub-parameter values follow the widely-adopted kitty/VTE
+                // convention: 0 none, 1 single, 2 double, 3 curly, 4 dotted,
+                // 5 dashed. Mudlet has no distinct double-underline style so
+                // 2 is shown as a plain single underline.
                 switch (value) {
                 case 0: // Underline off
                     mUnderline = false;
+                    mUnderlineWavy = false;
+                    mUnderlineDotted = false;
+                    mUnderlineDashed = false;
                     break;
-                case 1: // Underline on
+                case 1: // Single (straight) underline
                     mUnderline = true;
+                    mUnderlineWavy = false;
+                    mUnderlineDotted = false;
+                    mUnderlineDashed = false;
                     break;
-                case 2: // Double underline - not supported, treat as single
-                    [[fallthrough]];
-                case 3: // Wavey underline - not supported, treat as single
-                    qDebug().noquote().nospace() << "TBuffer::decodeSGR(\"" << sequence << "\") ERROR - unsupported underline parameter element (the second part) in a SGR...;4:" << parameterElements.at(1) << ";../m sequence treating it as a one!";
+                case 2: // Double underline - unsupported, show as single
                     mUnderline = true;
+                    mUnderlineWavy = false;
+                    mUnderlineDotted = false;
+                    mUnderlineDashed = false;
+                    break;
+                case 3: // Curly (wavy) underline
+                    mUnderline = true;
+                    mUnderlineWavy = true;
+                    mUnderlineDotted = false;
+                    mUnderlineDashed = false;
+                    break;
+                case 4: // Dotted underline
+                    mUnderline = true;
+                    mUnderlineWavy = false;
+                    mUnderlineDotted = true;
+                    mUnderlineDashed = false;
+                    break;
+                case 5: // Dashed underline
+                    mUnderline = true;
+                    mUnderlineWavy = false;
+                    mUnderlineDotted = false;
+                    mUnderlineDashed = true;
                     break;
                 default: // Something unexpected
-                    qDebug().noquote().nospace() << "TBuffer::decodeSGR(\"" << sequence << "\") ERROR - unexpected underline parameter element (the second part) in a SGR...;4:" << parameterElements.at(1) << ";../m sequence treating it as a zero!";
+                    qDebug().noquote().nospace() << "TBuffer::decodeSGR(\"" << sequence
+                                                 << "\") ERROR - unexpected underline parameter element (the second part) in a SGR...;4:" << parameterElements.at(1)
+                                                 << ";../m sequence treating it as a zero!";
                     mUnderline = false;
+                    mUnderlineWavy = false;
+                    mUnderlineDotted = false;
+                    mUnderlineDashed = false;
                     break;
                 }
             } else if (parameterElements.at(0) == QLatin1String("3")) {
@@ -1480,7 +3255,8 @@ void TBuffer::decodeSGR(const QString& sequence)
                 const int value = parameterElements.at(1).toInt(&isOk);
                 if (!isOk) {
                     // missing value
-                    qDebug().noquote().nospace() << "TBuffer::decodeSGR(\"" << sequence << "\") ERROR - failed to detect italic parameter element (the second part) in a SGR...;3:?;../m sequence assuming it is a zero!";
+                    qDebug().noquote().nospace() << "TBuffer::decodeSGR(\"" << sequence
+                                                 << "\") ERROR - failed to detect italic parameter element (the second part) in a SGR...;3:?;../m sequence assuming it is a zero!";
                 }
                 switch (value) {
                 case 0: // Italics/Slant off
@@ -1490,16 +3266,20 @@ void TBuffer::decodeSGR(const QString& sequence)
                     mItalics = true;
                     break;
                 case 2: // Slant on - not supported, treat as italics
-                    qDebug().noquote().nospace() << "TBuffer::decodeSGR(\"" << sequence << "\") ERROR - unsupported italic parameter element (the second part) in a SGR...;3:" << parameterElements.at(1) << ";../m sequence treating it as a one!";
-                    mUnderline = true;
+                    qDebug().noquote().nospace() << "TBuffer::decodeSGR(\"" << sequence
+                                                 << "\") ERROR - unsupported italic parameter element (the second part) in a SGR...;3:" << parameterElements.at(1)
+                                                 << ";../m sequence treating it as a one!";
+                    mItalics = true;
                     break;
                 default: // Something unexpected
-                    qDebug().noquote().nospace() << "TBuffer::decodeSGR(\"" << sequence << "\") ERROR - unexpected italic parameter element (the second part) in a SGR...;3:" << parameterElements.at(1) << ";../m sequence treating it as a zero!";
-                    mUnderline = false;
+                    qDebug().noquote().nospace() << "TBuffer::decodeSGR(\"" << sequence << "\") ERROR - unexpected italic parameter element (the second part) in a SGR...;3:" << parameterElements.at(1)
+                                                 << ";../m sequence treating it as a zero!";
+                    mItalics = false;
                     break;
                 }
             } else {
-                qDebug().noquote().nospace() << "TBuffer::decodeSGR(\"" << sequence << "\") ERROR - parameter string with an unexpected initial parameter element in a SGR...;" << parameterElements.at(0) << ":" << parameterElements.at(1) << "...;.../m sequence, ignoring it!";
+                qDebug().noquote().nospace() << "TBuffer::decodeSGR(\"" << sequence << "\") ERROR - parameter string with an unexpected initial parameter element in a SGR...;"
+                                             << parameterElements.at(0) << ":" << parameterElements.at(1) << "...;.../m sequence, ignoring it!";
             }
         } else {
             /******************************************************************
@@ -1509,11 +3289,13 @@ void TBuffer::decodeSGR(const QString& sequence)
             // number:
             bool isOk = false;
             int tag = 0;
-            if (!allParameterElements.isEmpty()) {
-                tag = allParameterElements.toInt(&isOk);
-            } else {
+            if (allParameterElements.isEmpty()) {
                 // Allow for an empty parameter to be treated as valid and equal to 0:
                 isOk = true;
+            } else if (sgrDigits(allParameterElements, tag)) {
+                isOk = true;
+            } else {
+                tag = allParameterElements.toInt(&isOk);
             }
             if (isOk) {
                 switch (tag) {
@@ -1527,6 +3309,9 @@ void TBuffer::decodeSGR(const QString& sequence)
                     mReverse = false;
                     mStrikeOut = false;
                     mUnderline = false;
+                    mUnderlineWavy = false;
+                    mUnderlineDotted = false;
+                    mUnderlineDashed = false;
                     mBlink = false;
                     mFastBlink = false;
                     mConcealed = false;
@@ -1557,8 +3342,12 @@ void TBuffer::decodeSGR(const QString& sequence)
                     // {presumably 2 would be a double underline and 1
                     // the normal single underline) by sending e.g.:
                     // ESC[...;4:3;...m - that is handled above in the colon
-                    // sub-string separated part:
+                    // sub-string separated part. Plain 4 is that convention's
+                    // single underline, so it has to drop any style already set:
                     mUnderline = true;
+                    mUnderlineWavy = false;
+                    mUnderlineDotted = false;
+                    mUnderlineDashed = false;
                     break;
                 case 5:
                     mBlink = true;
@@ -1618,6 +3407,9 @@ void TBuffer::decodeSGR(const QString& sequence)
                     break;
                 case 24:
                     mUnderline = false;
+                    mUnderlineWavy = false;
+                    mUnderlineDotted = false;
+                    mUnderlineDashed = false;
                     break;
                 case 25:
                     mBlink = false;
@@ -1683,7 +3475,7 @@ void TBuffer::decodeSGR(const QString& sequence)
 
                     // Okay we have one more parameter at least - so examine it
                     // and grab the needed number of arguments:
-                    QStringList madeElements;
+                    SgrParameters madeElements;
                     madeElements << parameterStrings.at(paraIndex);
                     madeElements << parameterStrings.at(paraIndex + 1);
                     bool isOk = false;
@@ -1705,17 +3497,17 @@ void TBuffer::decodeSGR(const QString& sequence)
                         paraIndex += 2;
                         break;
                     case 4: // Not handled but we still should skip its arguments
-                            // Uses four or five depending on whether there is
-                            // the colour space id first
-                            // Move the index to consume the used values
+                        // Uses four or five depending on whether there is
+                        // the colour space id first
+                        // Move the index to consume the used values
                         paraIndex += (haveColorSpaceId ? 6 : 5);
                         break;
                     case 3: // Not handled but we still should skip its arguments
-                            // Move the index to consume the used values
+                        // Move the index to consume the used values
                         paraIndex += (haveColorSpaceId ? 5 : 4);
                         break;
                     case 2: // Need three or four depending on whether there is
-                            // the colour space id first
+                        // the colour space id first
                         if (haveColorSpaceId) {
                             if (paraIndex + 2 < total) {
                                 // We have the color space id
@@ -1735,7 +3527,7 @@ void TBuffer::decodeSGR(const QString& sequence)
                             }
                         } else {
                             // Fake an empty colour space id
-                            madeElements << QString();
+                            madeElements << QStringView();
                             if (paraIndex + 2 < total) {
                                 // We have the red component
                                 madeElements << parameterStrings.at(paraIndex + 2);
@@ -1757,15 +3549,16 @@ void TBuffer::decodeSGR(const QString& sequence)
                         paraIndex += (haveColorSpaceId ? 5 : 4);
                         break;
                     case 1: // This uses no extra arguments and, as it means
-                            // transparent, is no use to us
+                        // transparent, is no use to us
                         [[fallthrough]];
                     default:
                         break;
                     }
-                }
-                    break;
+                } break;
                 case 39: //default foreground color
+                    mIsDefaultColor = true;
                     mForeGroundColor = pHost->mFgColor;
+                    mForeGroundColorLight = pHost->mFgColor;
                     break;
                 case 40:
                     mBackGroundColor = mBlack;
@@ -1802,7 +3595,7 @@ void TBuffer::decodeSGR(const QString& sequence)
 
                     // Okay we have one more parameter at least - so examine it
                     // and grab the needed number of arguments:
-                    QStringList madeElements;
+                    SgrParameters madeElements;
                     madeElements << parameterStrings.at(paraIndex);
                     madeElements << parameterStrings.at(paraIndex + 1);
                     bool isOk = false;
@@ -1824,17 +3617,17 @@ void TBuffer::decodeSGR(const QString& sequence)
                         paraIndex += 2;
                         break;
                     case 4: // Not handled but we still should skip its arguments
-                            // Uses four or five depending on whether there is
-                            // the colour space id first
-                            // Move the index to consume the used values
+                        // Uses four or five depending on whether there is
+                        // the colour space id first
+                        // Move the index to consume the used values
                         paraIndex += (haveColorSpaceId ? 6 : 5);
                         break;
                     case 3: // Not handled but we still should skip its arguments
-                            // Move the index to consume the used values
+                        // Move the index to consume the used values
                         paraIndex += (haveColorSpaceId ? 5 : 4);
                         break;
                     case 2: // Need three or four depending on whether there is
-                            // the colour space id first
+                        // the colour space id first
                         if (haveColorSpaceId) {
                             if (paraIndex + 2 < total) {
                                 // We have the color space id
@@ -1854,7 +3647,7 @@ void TBuffer::decodeSGR(const QString& sequence)
                             }
                         } else {
                             // Fake an empty colour space id
-                            madeElements << QString();
+                            madeElements << QStringView();
                             if (paraIndex + 2 < total) {
                                 // We have the red component
                                 madeElements << parameterStrings.at(paraIndex + 2);
@@ -1874,13 +3667,12 @@ void TBuffer::decodeSGR(const QString& sequence)
                         paraIndex += (haveColorSpaceId ? 5 : 4);
                         break;
                     case 1: // This uses no extra arguments and, as it means
-                            // transparent, is no use to us
+                        // transparent, is no use to us
                         [[fallthrough]];
                     default:
                         break;
                     }
-                }
-                    break;
+                } break;
                 case 49: // default background color
                     mBackGroundColor = pHost->mBgColor;
                     break;
@@ -1983,6 +3775,11 @@ void TBuffer::decodeSGR(const QString& sequence)
 
 void TBuffer::decodeOSC(const QString& sequence)
 {
+    if (sequence.isEmpty()) {
+        qWarning() << "TBuffer::decodeOSC(...) WARNING - Received empty OSC sequence, ignoring.";
+        return;
+    }
+
     Host* pHost = mpHost;
     if (!pHost) {
         qWarning() << "TBuffer::decodeOSC(...) ERROR - Called when mpHost pointer is nullptr";
@@ -1991,9 +3788,12 @@ void TBuffer::decodeOSC(const QString& sequence)
 
     const bool serverMayRedefineDefaultColors = pHost->getMayRedefineColors();
 #if defined(DEBUG_OSC_PROCESSING)
-    qDebug().nospace().noquote() << "    Consider the OSC sequence: \"" << sequence << "\"";
+    // Only log sequences that aren't just OSC 8 terminators to reduce noise
+    if (!(sequence.startsWith("8;;") && sequence.length() == 3)) {
+        qDebug().nospace().noquote() << "    Consider the OSC sequence: \"" << sequence << "\"";
+    }
 #endif
-    unsigned short const character = sequence.at(0).unicode();
+    const uint16_t character = sequence.at(0).unicode();
     switch (character) {
     case static_cast<quint8>('P'):
         if (serverMayRedefineDefaultColors) {
@@ -2074,21 +3874,21 @@ void TBuffer::decodeOSC(const QString& sequence)
                         // This will refresh the "main" console as it is only this
                         // class instance associated with that one that is to be
                         // changed by this method:
-                        if (pHost->mpConsole) {
-                            pHost->mpConsole->changeColors();
-                        }
+                        pHost->applyMainConsoleColors();
                         // Also need to update the Lua sub-system's "color_table"
                         pHost->updateAnsi16ColorsInTable();
                     }
 
                 } else {
 #if defined(DEBUG_OSC_PROCESSING)
-                    qDebug().noquote().nospace() << "TBuffer::decodeOSC(\"" << sequence << "\") ERROR - Unable to parse this as a <OSC>P<I><RR><GG><BB><ST> string to redefined one of the 16 ANSI colors.";
+                    qDebug().noquote().nospace() << "TBuffer::decodeOSC(\"" << sequence
+                                                 << "\") ERROR - Unable to parse this as a <OSC>P<I><RR><GG><BB><ST> string to redefined one of the 16 ANSI colors.";
 #endif
                 }
             } else {
 #if defined(DEBUG_OSC_PROCESSING)
-                qDebug().noquote().nospace() << "TBuffer::decodeOSC(\"" << sequence << "\") ERROR - Wrong length of string, unable to decode this as a <OSC>P<I><RR><GG><BB><ST> string to redefined one of the 16 ANSI colors.";
+                qDebug().noquote().nospace() << "TBuffer::decodeOSC(\"" << sequence
+                                             << "\") ERROR - Wrong length of string, unable to decode this as a <OSC>P<I><RR><GG><BB><ST> string to redefined one of the 16 ANSI colors.";
 #endif
             }
         }
@@ -2098,9 +3898,1262 @@ void TBuffer::decodeOSC(const QString& sequence)
             resetColors();
         }
         break;
+    case static_cast<quint8>('8'): {
+        QStringView rest = QStringView(sequence).mid(1); // skip selector "8"
+        int firstSemi = rest.indexOf(';');
+
+        if (firstSemi == -1) {
+            qWarning() << "OSC 8: Missing first semicolon";
+            return;
+        }
+
+        int secondSemi = rest.indexOf(';', firstSemi + 1);
+
+        if (secondSemi == -1) {
+            qWarning() << "OSC 8: Missing second semicolon";
+            return;
+        }
+
+        QString param = rest.left(firstSemi).toString();
+
+        // Parameters are available but not used by Mudlet currently
+#if defined(DEBUG_OSC_PROCESSING)
+        if (!param.isEmpty()) {
+            qDebug().noquote().nospace() << "[OSC 8] Params provided (not used by Mudlet but shown for debugging): \"" << param << "\"";
+        }
+#endif
+        QString rawUrl = rest.mid(secondSemi + 1).toString();
+
+#if defined(DEBUG_OSC_PROCESSING)
+        if (!rawUrl.isEmpty()) {
+            qDebug().noquote().nospace() << "[OSC] Received OSC 8 sequence with URL (length=" << rawUrl.length() << "): " << (rawUrl.length() > 80 ? rawUrl.left(80) + "..." : rawUrl);
+        }
+#endif
+
+        // OSC 8 ;; closes the hyperlink
+        if ((param.isEmpty() && rawUrl.isEmpty())) {
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug().noquote() << "[OSC] Hyperlink terminator - closing active hyperlink";
+#endif
+
+            finaliseActiveHyperlink();
+            break;
+        }
+
+        // Deliberately below the terminator branch above: the close is the only
+        // thing that clears mHyperlinkActive, so refusing it would leave a link
+        // open forever and mark the rest of the session clickable. Turning the
+        // preference off mid-link must still let that link finish.
+        if (!mpHost->mEnableOSC8Hyperlinks) {
+            return;
+        }
+
+        if (!rawUrl.isEmpty()) {
+            if (rawUrl.length() > static_cast<int>(MAX_OSC_SEQUENCE_LENGTH)) {
+                qWarning() << "TBuffer::decodeOSC(...) - Rejected hyperlink: URL too long:" << rawUrl;
+                return;
+            }
+
+            if (rawUrl.startsWith(qsl("preset:"))) {
+#if defined(DEBUG_OSC_PROCESSING)
+                qDebug() << "[OSC] Detected preset: URL:" << rawUrl;
+#endif
+                // Extract preset name (between "preset:" and "?")
+                int queryStart = rawUrl.indexOf('?');
+                QString presetName = (queryStart > 7) ? rawUrl.mid(7, queryStart - 7) : rawUrl.mid(7);
+
+                // Extract config parameter manually to avoid QUrl parsing issues with custom schemes
+                QString configParam;
+                if (queryStart != -1) {
+                    QString queryString = rawUrl.mid(queryStart + 1);
+                    QUrlQuery query(queryString);
+                    configParam = query.queryItemValue(qsl("config"), QUrl::FullyDecoded);
+                }
+#if defined(DEBUG_OSC_PROCESSING)
+                qDebug() << "[OSC] Preset name extracted:" << presetName;
+                qDebug() << "[OSC] Config param length:" << configParam.length();
+                qDebug() << "[OSC] Config param preview:" << (configParam.length() > 100 ? configParam.left(100) + "..." : configParam);
+#endif
+
+                if (!presetName.isEmpty() && !configParam.isEmpty() && mpModel) {
+                    // Parse the JSON configuration
+                    QJsonParseError parseError;
+                    QJsonDocument doc = QJsonDocument::fromJson(configParam.toUtf8(), &parseError);
+
+                    if (parseError.error == QJsonParseError::NoError && doc.isObject()) {
+                        mpModel->mHyperlinkCompactManager.registerPreset(presetName, doc.object());
+#if defined(DEBUG_OSC_PROCESSING)
+                        qDebug() << "[OSC] Successfully registered preset:" << presetName;
+#endif
+                    } else {
+                        qWarning().noquote().nospace() << "TBuffer::decodeOSC(...) - Failed to parse preset JSON for \"" << presetName << "\": " << parseError.errorString();
+#if defined(DEBUG_OSC_PROCESSING)
+                        qDebug() << "[OSC] Failed JSON:" << configParam;
+#endif
+                    }
+                } else {
+#if defined(DEBUG_OSC_PROCESSING)
+                    qDebug() << "[OSC] Preset registration skipped - presetName empty:" << presetName.isEmpty() << "configParam empty:" << configParam.isEmpty() << "mpModel:" << (mpModel != nullptr);
+#endif
+                }
+                // Preset definitions don't create visible hyperlinks
+                return;
+            }
+
+            // Parse query parameters for enhanced functionality
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] Raw URL for parameter parsing:" << rawUrl;
+#endif
+            // Reset styling to defaults before parsing
+            mCurrentHyperlinkStyling = Mudlet::HyperlinkStyling();
+            QMap<QString, QString> queryParams;
+            parseUriQueryParameters(rawUrl, mCurrentHyperlinkStyling, queryParams);
+
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] Styling parsed directly from JSON (isUnderlined=" << mCurrentHyperlinkStyling.isUnderlined << ")";
+#endif
+
+            // Extract menu parameters
+            if (queryParams.contains(qsl("menu"))) {
+                QString menuString = queryParams.value(qsl("menu"));
+                mCurrentHyperlinkMenu = menuString.split('|', Qt::SkipEmptyParts);
+#if defined(DEBUG_OSC_PROCESSING)
+                qDebug() << "[OSC] Menu parameter found:" << menuString;
+                qDebug() << "[OSC] Menu items parsed:" << mCurrentHyperlinkMenu;
+                qDebug() << "[OSC] Menu items count:" << mCurrentHyperlinkMenu.size();
+#endif
+            } else {
+                mCurrentHyperlinkMenu.clear();
+#if defined(DEBUG_OSC_PROCESSING)
+                qDebug() << "[OSC] No menu parameter found";
+#endif
+            }
+
+            // Extract custom tooltip parameter
+            QString customTooltip;
+
+            if (queryParams.contains(qsl("tooltip"))) {
+                customTooltip = UntrustedText::forAuthoredText(queryParams.value(qsl("tooltip")));
+            }
+
+            // Note: title is now parsed directly into mCurrentHyperlinkStyling by parseJsonHyperlinkConfig
+
+            QString baseUrl = rawUrl;
+
+            if (rawUrl.startsWith(qsl("http://")) || rawUrl.startsWith(qsl("https://")) || rawUrl.startsWith(qsl("ftp://"))) {
+                int queryStart = baseUrl.indexOf('?');
+                if (queryStart != -1) {
+                    // Strip reserved parameters when corresponding OSC 8 features are enabled
+                    // (currently always true; will reflect NEW-ENVIRON negotiation once fully implemented)
+                    const bool stripConfig = mpHost->shouldStripOscHyperlinkConfigParam();
+                    const bool stripPreset = mpHost->shouldStripOscHyperlinkPresetParam();
+
+                    // Mudlet only removes what the style parser claims, which leaves two kinds of
+                    // parameter in place: one whose name is percent-encoded (%63%6F%6E%66%69%67
+                    // for "config"), since keys are compared as literal strings, and one with no
+                    // '=' at all, since the split gives that no key and the style parser passes
+                    // over it. Both are the server's own URL data.
+                    QStringList kept;
+                    for (const auto& parameter : splitOscQueryParameters(baseUrl.mid(queryStart + 1))) {
+                        if (parameter.hasSeparator && ((stripConfig && parameter.key == qsl("config")) || (stripPreset && parameter.key == qsl("preset")))) {
+                            continue;
+                        }
+                        kept.append(parameter.text);
+                    }
+
+                    baseUrl = baseUrl.left(queryStart);
+                    if (!kept.isEmpty()) {
+                        baseUrl += '?' + kept.join('&');
+                    }
+                }
+            } else {
+                // For send: and prompt: commands, remove all query parameters
+                int queryStart = baseUrl.indexOf('?');
+                if (queryStart != -1) {
+                    baseUrl = baseUrl.left(queryStart);
+                }
+            }
+
+            QStringList command;
+            QStringList hint;
+
+            if (baseUrl.startsWith(qsl("send:"))) {
+                QString innerCommand = QUrl::fromPercentEncoding(baseUrl.mid(5).toUtf8());
+                mCurrentHyperlinkStyling.actionScheme = Mudlet::HyperlinkStyling::ActionSend;
+                mCurrentHyperlinkStyling.baseCommand = innerCommand;
+                command = {qsl("send(%1, false)").arg(LuaLiteral::quote(innerCommand))};
+                hint = {qsl("%1: %2").arg(QObject::tr("Send"), UntrustedText::forTarget(innerCommand))};
+            } else if (baseUrl.startsWith(qsl("prompt:"))) {
+                QString innerCommand = QUrl::fromPercentEncoding(baseUrl.mid(7).toUtf8());
+                mCurrentHyperlinkStyling.actionScheme = Mudlet::HyperlinkStyling::ActionPrompt;
+                mCurrentHyperlinkStyling.baseCommand = innerCommand;
+                command = {qsl("sendCmdLine(%1)").arg(LuaLiteral::quote(innerCommand))};
+                hint = {qsl("%1: %2").arg(QObject::tr("Prompt"), UntrustedText::forTarget(innerCommand))};
+            } else {
+                QUrl qurl(baseUrl);
+                QString scheme = qurl.scheme().toLower();
+
+                if (scheme == qsl("http") || scheme == qsl("https") || scheme == qsl("ftp")) {
+                    mCurrentHyperlinkStyling.actionScheme = Mudlet::HyperlinkStyling::ActionOpenUrl;
+                    mCurrentHyperlinkStyling.baseCommand = baseUrl;
+                    command = {qsl("openUrl(%1)").arg(LuaLiteral::quote(baseUrl))};
+                    hint = {qsl("%1: %2").arg(QObject::tr("Open browser to"), UntrustedText::forTarget(baseUrl))};
+                } else {
+                    qWarning().noquote().nospace() << "TBuffer::decodeOSC(...) - Ignored untrusted or unsupported URI scheme: \"" << scheme << "\"";
+                    return;
+                }
+            }
+
+            // Add standalone tooltip support (for links without menus)
+            if (!customTooltip.isEmpty() && (mCurrentHyperlinkMenu.isEmpty() || mCurrentHyperlinkMenu.size() < 2)) {
+                // Replace the default hint with the custom tooltip
+                hint = {customTooltip};
+#if defined(DEBUG_OSC_PROCESSING)
+                qDebug() << "[OSC] Added standalone tooltip:" << customTooltip;
+#endif
+            }
+
+            // Handle menu functionality by extending commands and hints
+            if (!mCurrentHyperlinkMenu.isEmpty()) {
+#if defined(DEBUG_OSC_PROCESSING)
+                qDebug() << "[OSC] Building menu commands from" << mCurrentHyperlinkMenu.size() << "menu items";
+#endif
+                QStringList menuCommands;
+                QStringList menuHints;
+
+                // Add menu items in pairs (label, command)
+                // The first menu item becomes the primary left-click action (index 0)
+                // All items (including first) appear in the right-click menu (index 1+)
+                for (int i = 0; i < mCurrentHyperlinkMenu.size() - 1; i += 2) {
+                    QString menuLabel = mCurrentHyperlinkMenu[i];
+                    QString menuCommand = mCurrentHyperlinkMenu[i + 1];
+
+                    // Determine command type based on prefix
+                    if (menuCommand.startsWith(qsl("send:"))) {
+                        QString innerCommand = QUrl::fromPercentEncoding(menuCommand.mid(5).toUtf8());
+                        menuCommands.append(qsl("send(%1, false)").arg(LuaLiteral::quote(innerCommand)));
+                        menuHints.append(UntrustedText::forAuthoredText(menuLabel));
+                    } else if (menuCommand.startsWith(qsl("prompt:"))) {
+                        QString innerCommand = QUrl::fromPercentEncoding(menuCommand.mid(7).toUtf8());
+                        menuCommands.append(qsl("sendCmdLine(%1)").arg(LuaLiteral::quote(innerCommand)));
+                        menuHints.append(UntrustedText::forAuthoredText(menuLabel));
+                    } else if (menuCommand == qsl("-")) {
+                        // Special case: "-" creates a menu separator
+                        menuCommands.append(QString());
+                        menuHints.append(QString());
+                    } else {
+                        // Treat as direct command
+                        menuCommands.append(qsl("send(%1, false)").arg(LuaLiteral::quote(menuCommand)));
+                        menuHints.append(UntrustedText::forAuthoredText(menuLabel));
+                    }
+                }
+
+                // Set the tooltip for the link (what shows on hover)
+                // Use custom tooltip if provided, otherwise show "Right-click for menu" message
+                QString linkTooltip;
+                if (!customTooltip.isEmpty()) {
+                    // Custom tooltip explicitly provided
+                    linkTooltip = customTooltip;
+                } else {
+                    // Default tooltip for menu links
+                    linkTooltip = QObject::tr("Right-click for menu");
+                }
+
+                // For menus, we need tooltip as first hint, then menu labels
+                // This ensures tooltip.size() > commands.size() so only first hint shows in tooltip
+                // But menu labels are available for right-click menu display
+                QStringList finalHints;
+                finalHints.append(linkTooltip); // First: tooltip for hover
+                finalHints.append(menuHints);   // Rest: menu labels for right-click menu
+
+                command = menuCommands;
+                hint = finalHints;
+#if defined(DEBUG_OSC_PROCESSING)
+                qDebug() << "[OSC] Final menu commands:" << command;
+                qDebug() << "[OSC] Final menu hints:" << hint;
+#endif
+            }
+
+            mCurrentHyperlinkCommand = command;
+            mCurrentHyperlinkHint = hint;
+            mCurrentHyperlinkLinkId = mLinkStore.addLinks(command, hint, mpHost, QVector<int>());
+
+            // Store the styling for this link so it can be retrieved later
+            mLinkStore.setStyling(mCurrentHyperlinkLinkId, mCurrentHyperlinkStyling);
+
+            // Store the original background color for this link so we can restore it later
+            // when the link styling doesn't specify a background
+            mLinkOriginalBackgrounds[mCurrentHyperlinkLinkId] = mBackGroundColor;
+
+            // Initialize selection state if this link has selection settings
+            if (mCurrentHyperlinkStyling.selection.hasSelectionSettings && mpModel) {
+                const QString& group = mCurrentHyperlinkStyling.selection.group;
+                const QString& value = mCurrentHyperlinkStyling.selection.value;
+
+                // Configure group exclusivity mode
+                mpModel->mHyperlinkSelectionManager.setGroupExclusive(group, mCurrentHyperlinkStyling.selection.exclusive);
+
+                // Register the link with the selection manager
+                mpModel->mHyperlinkSelectionManager.setSelected(group, value, mCurrentHyperlinkStyling.selection.selected);
+
+                // Update link selection state (visual styling will be applied when link closes)
+                setLinkSelected(mCurrentHyperlinkLinkId, mCurrentHyperlinkStyling.selection.selected);
+                if (mCurrentHyperlinkStyling.selection.selected) {
+                    setLinkState(mCurrentHyperlinkLinkId, Mudlet::HyperlinkStyling::StateSelected);
+                } else if (mCurrentHyperlinkStyling.selection.disabled) {
+                    setLinkState(mCurrentHyperlinkLinkId, Mudlet::HyperlinkStyling::StateDisabled);
+                }
+#if defined(DEBUG_OSC_PROCESSING)
+                qDebug() << "[OSC] Link" << mCurrentHyperlinkLinkId << "initialized with selection state:" << "group=" << group << "value=" << value
+                         << "selected=" << mCurrentHyperlinkStyling.selection.selected << "disabled=" << mCurrentHyperlinkStyling.selection.disabled;
+#endif
+            }
+
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug().noquote() << "[OSC] Hyperlink activated:" << rawUrl.left(50) + (rawUrl.length() > 50 ? "..." : "");
+#endif
+            mHyperlinkActive = true;
+
+            // Record start position for visibility manager registration
+            // Use mMudLine.length() since that's where link text will be added
+            // (mMudLine is the current line being built, lineBuffer contains completed lines)
+            mCurrentHyperlinkStartLine = static_cast<int>(lineBuffer.size()) - 1;
+            mCurrentHyperlinkStartColumn = mMudLine.length();
+            mCurrentHyperlinkStartsAfterHeldText = !mServerWrapPendingLine.isEmpty();
+            mCurrentHyperlinkText.clear();
+
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] Hyperlink start position: line" << mCurrentHyperlinkStartLine << "column" << mCurrentHyperlinkStartColumn;
+#endif
+        }
+        break;
+    }
     default:
         qDebug().noquote().nospace() << "TBuffer::decodeOSC(\"" << sequence << "\") ERROR - Unhandled <OSC>?...<ST> code, Mudlet will ignore it.";
     }
+}
+
+QString TBuffer::appendQueryParameters(const QString& uri, const QMap<QString, QString>& parameters)
+{
+    if (parameters.isEmpty()) {
+        return uri;
+    }
+
+    QString result = uri;
+    bool hasExistingParams = uri.contains(qsl("?"));
+    QString separator = hasExistingParams ? qsl("&") : qsl("?");
+
+    QStringList paramStrings;
+    for (auto it = parameters.constBegin(); it != parameters.constEnd(); ++it) {
+        QString key = QUrl::toPercentEncoding(it.key());
+        QString value = QUrl::toPercentEncoding(it.value());
+        paramStrings.append(qsl("%1=%2").arg(key, value));
+    }
+
+    if (!paramStrings.isEmpty()) {
+        result += separator + paramStrings.join(qsl("&"));
+    }
+
+    return result;
+}
+
+bool TBuffer::parseUriQueryParameters(const QString& uri, Mudlet::HyperlinkStyling& styling, QMap<QString, QString>& parameters)
+{
+    parameters.clear();
+
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] parseUriQueryParameters called with uri:" << uri;
+#endif
+
+    // Find the query string part after '?'
+    int queryStart = uri.indexOf('?');
+    if (queryStart == -1) {
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] No query parameters found in URI";
+#endif
+        return true; // No query parameters is not an error
+    }
+
+    QString queryString = uri.mid(queryStart + 1);
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] Query string:" << queryString;
+#endif
+
+    // Extract config= and preset= from the query string. The split leaves the query undecoded
+    // and only the values taken from it are decoded (RFC 3986 2.4): decoding the whole query
+    // first would turn an escaped name - %63%6F%6E%66%69%67, the escape servers are told to use
+    // for a literal "config" in a web URL - back into "config" and consume it as styling. So a
+    // key counts as reserved only when it is raw and literal, which is the same key decodeOSC()
+    // compares when deciding what to strip out of the URL it opens.
+    QString configJson;
+    QString presetName;
+
+    for (const auto& parameter : splitOscQueryParameters(queryString)) {
+        if (!parameter.hasSeparator) {
+            continue;
+        }
+        if (parameter.key == qsl("config")) {
+            // Only an object counts, which is the same thing the split brace-scans for. Without
+            // this a second "config" carrying anything else - an empty value, or a word - would
+            // overwrite a valid one earlier in the query and take its styling with it
+            const QString value = QUrl::fromPercentEncoding(parameter.value.toUtf8());
+            if (value.trimmed().startsWith('{')) {
+                configJson = value;
+            }
+        } else if (parameter.key == qsl("preset")) {
+            presetName = QUrl::fromPercentEncoding(parameter.value.toUtf8());
+        }
+    }
+
+#if defined(DEBUG_OSC_PROCESSING)
+    if (!configJson.isEmpty()) {
+        qDebug() << "[OSC] Extracted config JSON:" << configJson;
+    }
+    if (!presetName.isEmpty()) {
+        qDebug() << "[OSC] Found preset:" << presetName;
+    }
+#endif
+
+    if (!presetName.isEmpty() || !configJson.isEmpty()) {
+        QJsonObject baseConfig;
+
+        if (!presetName.isEmpty() && mpModel) {
+            baseConfig = mpModel->mHyperlinkCompactManager.getPreset(presetName);
+#if defined(DEBUG_OSC_PROCESSING)
+            if (!baseConfig.isEmpty()) {
+                qDebug() << "[OSC] Resolved preset" << presetName;
+            } else {
+                qDebug() << "[OSC] Preset" << presetName << "not found or empty";
+            }
+#endif
+        } else {
+#if defined(DEBUG_OSC_PROCESSING)
+            if (!presetName.isEmpty()) {
+                qDebug() << "[OSC] Cannot resolve preset - no console model";
+            }
+#endif
+        }
+
+        // Merge with override config if present
+        if (!configJson.isEmpty()) {
+            QJsonParseError parseError;
+            QJsonDocument overrideDoc = QJsonDocument::fromJson(configJson.toUtf8(), &parseError);
+
+            if (parseError.error == QJsonParseError::NoError && overrideDoc.isObject()) {
+                QJsonObject overrideConfig = overrideDoc.object();
+
+                if (!baseConfig.isEmpty() && mpModel) {
+                    // Deep merge: override takes precedence
+                    baseConfig = mpModel->mHyperlinkCompactManager.mergeConfigs(baseConfig, overrideConfig);
+#if defined(DEBUG_OSC_PROCESSING)
+                    qDebug() << "[OSC] Merged preset with override config";
+#endif
+                } else {
+                    baseConfig = overrideConfig;
+                }
+            }
+        }
+
+        // Parse the final merged config
+        if (!baseConfig.isEmpty()) {
+            QJsonDocument finalDoc(baseConfig);
+            QString finalJson = QString::fromUtf8(finalDoc.toJson(QJsonDocument::Compact));
+            return parseJsonHyperlinkConfig(finalJson, parameters, styling);
+        }
+    }
+
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] Parsed JSON parameters:" << parameters;
+#endif
+
+    return true;
+}
+
+QJsonObject TBuffer::expandJsonShorthands(const QJsonObject& obj)
+{
+    if (!mpModel) {
+        return obj; // No manager available, return unchanged
+    }
+
+    QJsonObject result;
+
+    for (auto it = obj.begin(); it != obj.end(); ++it) {
+        QString originalKey = it.key();
+        QJsonValue value = it.value();
+
+        QMap<QString, QString> singleKeyMap;
+        singleKeyMap.insert(originalKey, qsl("placeholder")); // Value doesn't matter for key expansion
+        QMap<QString, QString> expandedMap = mpModel->mHyperlinkCompactManager.expandShorthand(singleKeyMap);
+
+        // Guard against empty or multi-key expanded maps to prevent assertion/UB
+        QString resultKey;
+        if (expandedMap.isEmpty()) {
+            // No expansion occurred - use original key
+            resultKey = originalKey;
+        } else if (expandedMap.size() == 1) {
+            // Normal case - single expanded key
+            resultKey = expandedMap.firstKey();
+        } else {
+            // Unexpected: multiple keys from single input - use first deterministically and log
+            resultKey = expandedMap.firstKey();
+#if defined(DEBUG_OSC_PROCESSING)
+            qWarning() << "[OSC] expandShorthand returned multiple keys for single input:" << originalKey << "-> expanded to:" << expandedMap.keys() << "using first key:" << resultKey;
+#endif
+        }
+
+        // Recursively expand nested objects
+        QJsonValue resultValue = value.isObject() ? expandJsonShorthands(value.toObject()) : value;
+
+        // Handle duplicate keys by merging objects (e.g., both "style" and "s" -> "style")
+        if (result.contains(resultKey) && result[resultKey].isObject() && resultValue.isObject()) {
+            // Merge the objects using the compact manager's deep merge functionality
+            QJsonObject existing = result[resultKey].toObject();
+            QJsonObject toAdd = resultValue.toObject();
+
+            // When both shorthand and full names exist, shorthand takes precedence
+            result[resultKey] = mpModel->mHyperlinkCompactManager.mergeConfigs(toAdd, existing);
+        } else {
+            result[resultKey] = resultValue;
+        }
+    }
+
+    return result;
+}
+
+bool TBuffer::parseJsonHyperlinkConfig(const QString& jsonString, QMap<QString, QString>& parameters, Mudlet::HyperlinkStyling& styling, QString* errorDetails)
+{
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] parseJsonHyperlinkConfig called with jsonString:" << jsonString;
+#endif
+
+    QJsonParseError parseError;
+    QJsonDocument doc = QJsonDocument::fromJson(jsonString.toUtf8(), &parseError);
+
+    if (parseError.error != QJsonParseError::NoError) {
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] JSON parse error:" << parseError.errorString();
+#endif
+        return false;
+    }
+
+    if (!doc.isObject()) {
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] JSON root is not an object";
+#endif
+        return false;
+    }
+
+    QJsonObject root = doc.object();
+
+    // Expand shorthands in the JSON object (recursive)
+    root = expandJsonShorthands(root);
+
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] After expansion, root contains:" << root.keys();
+    qDebug() << "[OSC] Has 'menu':" << root.contains(qsl("menu"));
+    qDebug() << "[OSC] Has 'tooltip':" << root.contains(qsl("tooltip"));
+#endif
+
+    if (root.contains(qsl("style")) && root[qsl("style")].isObject()) {
+        QJsonObject styleObj = root[qsl("style")].toObject();
+        parseJsonStyleToHyperlinkStyling(styleObj, styling);
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] Style parsed directly from JSON";
+#endif
+    }
+
+    if (root.contains(qsl("menu")) && root[qsl("menu")].isArray()) {
+        QJsonArray menuArray = root[qsl("menu")].toArray();
+        QString menuString = jsonMenuArrayToString(menuArray);
+        if (!menuString.isEmpty()) {
+            parameters.insert(qsl("menu"), menuString);
+            // Enable custom styling for links with menus
+            styling.hasCustomStyling = true;
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] Menu parameter added:" << menuString;
+#endif
+        }
+    }
+
+    if (root.contains(qsl("tooltip")) && root[qsl("tooltip")].isString()) {
+        parameters.insert(qsl("tooltip"), root[qsl("tooltip")].toString());
+        // Enable custom styling for links with tooltips
+        styling.hasCustomStyling = true;
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] Tooltip parameter added:" << root[qsl("tooltip")].toString();
+#endif
+    }
+
+    if (root.contains(qsl("title"))) {
+        QJsonValue titleValue = root[qsl("title")];
+        if (titleValue.isString()) {
+            styling.menuTitle = UntrustedText::forAuthoredText(titleValue.toString());
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] Title parameter added:" << titleValue.toString();
+#endif
+        } else if (titleValue.isObject()) {
+            QJsonObject titleObj = titleValue.toObject();
+            if (titleObj.contains(qsl("text")) && titleObj[qsl("text")].isString()) {
+                styling.menuTitle = UntrustedText::forAuthoredText(titleObj[qsl("text")].toString());
+            }
+            if (titleObj.contains(qsl("style")) && titleObj[qsl("style")].isObject()) {
+                parseJsonStateStyle(titleObj[qsl("style")].toObject(), styling.menuTitleStyle);
+            }
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] Title object parsed - text:" << styling.menuTitle << "hasColor:" << styling.menuTitleStyle.hasForegroundColor;
+#endif
+        }
+    }
+
+    if (root.contains(qsl("selection")) && root[qsl("selection")].isObject()) {
+        QJsonObject selectionObj = root[qsl("selection")].toObject();
+        parseJsonSelectionConfig(selectionObj, styling.selection);
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] Selection config parsed from JSON";
+#endif
+    }
+
+    if (root.contains(qsl("visibility")) && root[qsl("visibility")].isObject()) {
+        QJsonObject visibilityObj = root[qsl("visibility")].toObject();
+        if (!parseVisibilityFromJson(visibilityObj, styling.visibility)) {
+            qWarning() << "TBuffer::parseJsonHyperlinkConfig: Failed to parse visibility settings (continuing with other config)";
+            // Non-fatal: visibility settings ignored but other config parts still apply
+        }
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] Visibility config parsed from JSON";
+#endif
+    }
+
+    if (root.contains(qsl("spoiler"))) {
+        styling.isSpoiler = jsonBoolValue(root[qsl("spoiler")]);
+        if (styling.isSpoiler) {
+            styling.hasCustomStyling = true;
+
+            if (!styling.hasBackgroundColor) {
+                QColor spoilerBackground = mBackGroundColor;
+
+                qreal luminance = 0.2126 * spoilerBackground.redF() + 0.7152 * spoilerBackground.greenF() + 0.0722 * spoilerBackground.blueF();
+
+                QColor originalBackground = spoilerBackground;
+
+                if (luminance < 0.5) {
+                    if (luminance < 0.1) {
+                        spoilerBackground = QColor(40, 40, 40);
+                    } else {
+                        spoilerBackground = spoilerBackground.lighter(140);
+                    }
+                } else {
+                    spoilerBackground = spoilerBackground.darker(140);
+                }
+
+                styling.backgroundColor = spoilerBackground;
+                styling.hasBackgroundColor = true;
+
+#if defined(DEBUG_OSC_PROCESSING)
+                qDebug() << "[OSC] EARLY SPOILER BACKGROUND: Generated" << spoilerBackground.name() << "from original" << originalBackground.name() << "luminance:" << luminance;
+#endif
+            }
+        }
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] Spoiler config parsed from JSON:" << styling.isSpoiler;
+#endif
+    }
+
+    if (root.contains(qsl("disabled"))) {
+        styling.selection.disabled = jsonBoolValue(root[qsl("disabled")]);
+        if (styling.selection.disabled) {
+            styling.hasCustomStyling = true;
+        }
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] Disabled config parsed from JSON:" << styling.selection.disabled;
+#endif
+    }
+
+    if (styling.isSpoiler) {
+        if (!parameters.contains(qsl("tooltip"))) {
+            parameters.insert(qsl("tooltip"), QObject::tr("Click to reveal"));
+            styling.hasCustomStyling = true;
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] Auto-generated spoiler tooltip: Click to reveal for link - disabled:" << styling.selection.disabled;
+#endif
+        }
+#if defined(DEBUG_OSC_PROCESSING)
+        // NOLINTNEXTLINE(readability/braces) - else is conditional on DEBUG_OSC_PROCESSING
+        else {
+            qDebug() << "[OSC] Spoiler link has explicit tooltip:" << parameters.value(qsl("tooltip"));
+        }
+#endif
+    }
+
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] JSON converted to parameters:" << parameters;
+#endif
+
+    return true;
+}
+
+QString TBuffer::jsonMenuArrayToString(const QJsonArray& menuArray)
+{
+    QStringList menuItems;
+
+    for (const QJsonValue& item : menuArray) {
+        if (item.isString() && item.toString() == qsl("-")) {
+            // Separator
+            menuItems << qsl("Separator|-");
+        } else if (item.isObject()) {
+            QJsonObject menuObj = item.toObject();
+            // Each menu object should have one key-value pair: label -> command
+            for (auto it = menuObj.begin(); it != menuObj.end(); ++it) {
+                if (it.value().isString()) {
+                    menuItems << it.key() + qsl("|") + it.value().toString();
+                }
+            }
+        }
+    }
+
+    return menuItems.join(qsl("|"));
+}
+
+void TBuffer::parseJsonStateStyle(const QJsonObject& stateObj, Mudlet::HyperlinkStyling::StateStyle& stateStyle)
+{
+    bool hasAnyCustomStyling = false;
+
+    if (stateObj.contains(qsl("color")) && stateObj[qsl("color")].isString()) {
+        QColor color = parseColorValue(stateObj[qsl("color")].toString());
+        if (color.isValid()) {
+            stateStyle.foregroundColor = color;
+            stateStyle.hasForegroundColor = true;
+            hasAnyCustomStyling = true;
+        }
+    }
+
+    if (stateObj.contains(qsl("bg")) && stateObj[qsl("bg")].isString()) {
+        QColor color = parseColorValue(stateObj[qsl("bg")].toString());
+        if (color.isValid()) {
+            stateStyle.backgroundColor = color;
+            stateStyle.hasBackgroundColor = true;
+            hasAnyCustomStyling = true;
+        }
+    }
+
+    // Also support full CSS property name
+    if (stateObj.contains(qsl("background-color")) && stateObj[qsl("background-color")].isString()) {
+        QColor color = parseColorValue(stateObj[qsl("background-color")].toString());
+        if (color.isValid()) {
+            stateStyle.backgroundColor = color;
+            stateStyle.hasBackgroundColor = true;
+            hasAnyCustomStyling = true;
+        }
+    }
+
+    if (stateObj.contains(qsl("bold"))) {
+        stateStyle.isBold = jsonBoolValue(stateObj[qsl("bold")]);
+        hasAnyCustomStyling = true;
+    }
+
+    if (stateObj.contains(qsl("italic"))) {
+        stateStyle.isItalic = jsonBoolValue(stateObj[qsl("italic")]);
+        hasAnyCustomStyling = true;
+    }
+
+    if (stateObj.contains(qsl("underline"))) {
+        QJsonValue underlineVal = stateObj[qsl("underline")];
+        if (underlineVal.isBool() || underlineVal.isDouble()) {
+            stateStyle.isUnderlined = jsonBoolValue(underlineVal);
+            if (stateStyle.isUnderlined) {
+                stateStyle.underlineStyle = Mudlet::HyperlinkStyling::UnderlineSolid;
+            }
+            hasAnyCustomStyling = true;
+        } else if (underlineVal.isString()) {
+            stateStyle.isUnderlined = true;
+            QString style = underlineVal.toString().toLower();
+            if (style == qsl("wavy")) {
+                stateStyle.underlineStyle = Mudlet::HyperlinkStyling::UnderlineWavy;
+            } else if (style == qsl("dotted")) {
+                stateStyle.underlineStyle = Mudlet::HyperlinkStyling::UnderlineDotted;
+            } else if (style == qsl("dashed")) {
+                stateStyle.underlineStyle = Mudlet::HyperlinkStyling::UnderlineDashed;
+            } else {
+                stateStyle.underlineStyle = Mudlet::HyperlinkStyling::UnderlineSolid;
+            }
+            hasAnyCustomStyling = true;
+        }
+    }
+
+    if (stateObj.contains(qsl("overline"))) {
+        QJsonValue overlineVal = stateObj[qsl("overline")];
+        if (overlineVal.isBool() || overlineVal.isDouble()) {
+            stateStyle.isOverlined = jsonBoolValue(overlineVal);
+            hasAnyCustomStyling = true;
+        } else if (overlineVal.isString()) {
+            stateStyle.isOverlined = true;
+            hasAnyCustomStyling = true;
+        }
+    }
+
+    if (stateObj.contains(qsl("strikethrough"))) {
+        QJsonValue strikeVal = stateObj[qsl("strikethrough")];
+        if (strikeVal.isBool() || strikeVal.isDouble()) {
+            stateStyle.isStrikeOut = jsonBoolValue(strikeVal);
+            hasAnyCustomStyling = true;
+        } else if (strikeVal.isString()) {
+            stateStyle.isStrikeOut = true;
+            hasAnyCustomStyling = true;
+        }
+    }
+
+    if (stateObj.contains(qsl("text-decoration-color")) && stateObj[qsl("text-decoration-color")].isString()) {
+        QColor decorationColor = parseColorValue(stateObj[qsl("text-decoration-color")].toString());
+        if (decorationColor.isValid()) {
+            stateStyle.underlineColor = decorationColor;
+            stateStyle.hasUnderlineColor = true;
+            stateStyle.overlineColor = decorationColor;
+            stateStyle.hasOverlineColor = true;
+            stateStyle.strikeoutColor = decorationColor;
+            stateStyle.hasStrikeoutColor = true;
+            hasAnyCustomStyling = true;
+        }
+    }
+
+    stateStyle.hasCustomStyling = hasAnyCustomStyling;
+}
+
+void TBuffer::parseJsonSelectionConfig(const QJsonObject& selectionObj, Mudlet::HyperlinkStyling::SelectionSettings& settings)
+{
+    if (selectionObj.contains(qsl("group")) && selectionObj[qsl("group")].isString()) {
+        settings.group = selectionObj[qsl("group")].toString();
+        settings.hasSelectionSettings = true;
+    }
+
+    if (selectionObj.contains(qsl("value")) && selectionObj[qsl("value")].isString()) {
+        settings.value = selectionObj[qsl("value")].toString();
+    }
+
+    if (selectionObj.contains(qsl("toggle"))) {
+        settings.toggle = jsonBoolValue(selectionObj[qsl("toggle")]);
+    }
+
+    if (selectionObj.contains(qsl("selected"))) {
+        settings.selected = jsonBoolValue(selectionObj[qsl("selected")]);
+    }
+
+    if (selectionObj.contains(qsl("exclusive"))) {
+        settings.exclusive = jsonBoolValue(selectionObj[qsl("exclusive")]);
+    }
+}
+
+bool TBuffer::parseVisibilityFromJson(const QJsonObject& visibilityObj, Mudlet::HyperlinkStyling::VisibilitySettings& settings)
+{
+    if (!visibilityObj.contains(qsl("action"))) {
+        return true; // No action specified = no visibility settings
+    }
+
+    // Parse action field (can be string or array of strings)
+    QJsonValue actionValue = visibilityObj[qsl("action")];
+#if defined(DEBUG_OSC_PROCESSING)
+    qWarning() << "[OSC] Visibility action value:" << actionValue << "isString:" << actionValue.isString();
+#endif
+    if (actionValue.isString()) {
+        QString actionStr = actionValue.toString().toLower();
+#if defined(DEBUG_OSC_PROCESSING)
+        qWarning() << "[OSC] Action string:" << actionStr;
+#endif
+        if (actionStr == qsl("conceal")) {
+            settings.action = Mudlet::HyperlinkStyling::VisibilitySettings::Action::Conceal;
+            settings.isConcealed = false; // Start visible, will be concealed later
+        } else if (actionStr == qsl("reveal")) {
+#if defined(DEBUG_OSC_PROCESSING)
+            qWarning() << "[OSC] FOUND REVEAL ACTION - setting isConcealed=true";
+#endif
+            settings.action = Mudlet::HyperlinkStyling::VisibilitySettings::Action::Reveal;
+            settings.isConcealed = true; // Start concealed, will be revealed later
+#if defined(DEBUG_OSC_PROCESSING)
+            qWarning() << "[OSC] Setting reveal action: isConcealed=true, action=Reveal";
+#endif
+        } else if (actionStr == qsl("revealthenconceal") || actionStr == qsl("reveal-then-conceal")) {
+            settings.action = Mudlet::HyperlinkStyling::VisibilitySettings::Action::RevealThenConceal;
+            settings.isConcealed = true; // Start concealed, reveal after delay, then conceal on click
+        } else {
+            qWarning() << "TBuffer::parseVisibilityFromJson: Invalid action string:" << actionStr << "(ignoring visibility settings)";
+            settings.hasVisibilitySettings = false;
+            return true; // Non-fatal: allow other config parts to apply
+        }
+    } else if (actionValue.isArray()) {
+        QJsonArray actionArray = actionValue.toArray();
+        if (actionArray.size() == 2 && actionArray[0].isString() && actionArray[0].toString().toLower() == qsl("reveal") && actionArray[1].isString()
+            && actionArray[1].toString().toLower() == qsl("conceal")) {
+            settings.action = Mudlet::HyperlinkStyling::VisibilitySettings::Action::RevealThenConceal;
+            settings.isConcealed = true; // Start concealed, reveal after delay, then conceal on click
+        } else {
+            qWarning() << "TBuffer::parseVisibilityFromJson: Invalid action array (expected [\"reveal\", \"conceal\"]) (ignoring visibility settings)";
+            settings.hasVisibilitySettings = false;
+            return true; // Non-fatal: allow other config parts to apply
+        }
+    } else {
+        qWarning() << "TBuffer::parseVisibilityFromJson: Action must be string or array (ignoring visibility settings)";
+        settings.hasVisibilitySettings = false;
+        return true; // Non-fatal: allow other config parts to apply
+    }
+
+    settings.hasVisibilitySettings = true;
+
+    // Parse delay (optional)
+    if (visibilityObj.contains(qsl("delay"))) {
+        QJsonValue delayValue = visibilityObj[qsl("delay")];
+        if (delayValue.isDouble()) {
+            double delayDouble = delayValue.toDouble();
+            if (delayDouble < 0) {
+                qWarning() << "TBuffer::parseVisibilityFromJson: Delay cannot be negative:" << delayDouble << "(using 0)";
+                settings.delayMs = 0;
+            } else if (delayDouble > Mudlet::HyperlinkStyling::VisibilitySettings::MaxDelayMs) {
+                qWarning() << "TBuffer::parseVisibilityFromJson: Delay exceeds maximum (" << Mudlet::HyperlinkStyling::VisibilitySettings::MaxDelayMs << "ms):" << delayDouble
+                           << "(clamping to maximum)";
+                settings.delayMs = Mudlet::HyperlinkStyling::VisibilitySettings::MaxDelayMs;
+            } else {
+                settings.delayMs = static_cast<quint32>(delayDouble);
+            }
+        }
+    }
+
+    // Parse wholeline (optional)
+    if (visibilityObj.contains(qsl("wholeline"))) {
+        settings.deletesEntireLine = jsonBoolValue(visibilityObj[qsl("wholeline")]);
+    }
+
+    // Parse expire triggers (optional)
+    if (visibilityObj.contains(qsl("expire")) && visibilityObj[qsl("expire")].isObject()) {
+        QJsonObject expireObj = visibilityObj[qsl("expire")].toObject();
+
+        if (expireObj.contains(qsl("input"))) {
+            settings.expireOnInput = jsonBoolValue(expireObj[qsl("input")]);
+        }
+
+        if (expireObj.contains(qsl("prompt"))) {
+            settings.expireOnPrompt = jsonBoolValue(expireObj[qsl("prompt")]);
+        }
+
+        if (expireObj.contains(qsl("output"))) {
+            settings.expireOnOutput = jsonBoolValue(expireObj[qsl("output")]);
+        }
+
+        if (expireObj.contains(qsl("outputDelay"))) {
+            QJsonValue outputDelayValue = expireObj[qsl("outputDelay")];
+            if (outputDelayValue.isDouble()) {
+                double delayDouble = outputDelayValue.toDouble();
+                if (delayDouble < 0) {
+                    qWarning() << "TBuffer::parseVisibilityFromJson: outputDelay cannot be negative:" << delayDouble << "(using 0)";
+                    settings.outputDelayMs = 0;
+                } else if (delayDouble > Mudlet::HyperlinkStyling::VisibilitySettings::MaxDelayMs) {
+                    qWarning() << "TBuffer::parseVisibilityFromJson: outputDelay exceeds maximum (" << Mudlet::HyperlinkStyling::VisibilitySettings::MaxDelayMs << "ms):" << delayDouble
+                               << "(clamping to maximum)";
+                    settings.outputDelayMs = Mudlet::HyperlinkStyling::VisibilitySettings::MaxDelayMs;
+                } else {
+                    settings.outputDelayMs = static_cast<quint32>(delayDouble);
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+bool TBuffer::parseVisibilitySettings(const QString& jsonString, Mudlet::HyperlinkStyling::VisibilitySettings& settings, QString* errorDetails)
+{
+    QJsonParseError parseError;
+    QJsonDocument doc = QJsonDocument::fromJson(jsonString.toUtf8(), &parseError);
+
+    if (parseError.error != QJsonParseError::NoError) {
+        if (errorDetails) {
+            *errorDetails = qsl("JSON parse error: %1").arg(parseError.errorString());
+        }
+        return false;
+    }
+
+    if (!doc.isObject()) {
+        if (errorDetails) {
+            *errorDetails = qsl("Root must be a JSON object");
+        }
+        return false;
+    }
+
+    QJsonObject root = doc.object();
+    if (!root.contains(qsl("visibility"))) {
+        // No visibility settings = success
+        return true;
+    }
+
+    if (!root[qsl("visibility")].isObject()) {
+        if (errorDetails) {
+            *errorDetails = qsl("'visibility' field must be an object");
+        }
+        return false;
+    }
+
+    bool success = parseVisibilityFromJson(root[qsl("visibility")].toObject(), settings);
+    if (!success) {
+        if (errorDetails) {
+            if (errorDetails->isEmpty()) {
+                *errorDetails = qsl("Failed to parse visibility settings (non-fatal)");
+            }
+            // When errorDetails is provided, treat as warning only
+            return true;
+        }
+    }
+
+    return success;
+}
+
+void TBuffer::clearLinkIndices(int lineNumber, int startColumn, int length)
+{
+    if (lineNumber < 0 || lineNumber >= static_cast<int>(buffer.size())) {
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] clearLinkIndices: invalid line number" << lineNumber << "buffer size:" << buffer.size();
+#endif
+        return;
+    }
+
+    if (length <= 0) {
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] clearLinkIndices: non-positive length" << length << "- returning early";
+#endif
+        return;
+    }
+
+    materialisePreTriggerPassLine(lineNumber);
+    std::vector<TChar>& line = buffer[lineNumber];
+
+    // Extra safety: ensure we don't go out of bounds
+    if (line.empty()) {
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] clearLinkIndices: line" << lineNumber << "is empty";
+#endif
+        return;
+    }
+
+    startColumn = std::max(0, std::min(startColumn, static_cast<int>(line.size())));
+
+    int endColumn = std::min(static_cast<int>(line.size()), startColumn + std::max(0, length));
+
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] clearLinkIndices: line" << lineNumber << "startCol" << startColumn << "length" << length << "endCol" << endColumn << "lineSize" << line.size();
+#endif
+
+    for (int col = startColumn; col < endColumn; ++col) {
+        // Additional bounds check inside the loop
+        if (col >= static_cast<int>(line.size())) {
+            break;
+        }
+        int oldLinkIndex = line[col].mLinkIndex;
+        line[col].mLinkIndex = 0;
+#if defined(DEBUG_OSC_PROCESSING)
+        if (oldLinkIndex != 0) {
+            qDebug() << "[OSC] clearLinkIndices: cleared column" << col << "from linkIndex" << oldLinkIndex << "to 0";
+        }
+#endif
+    }
+}
+
+void TBuffer::restoreLinkIndices(int lineNumber, int startColumn, int length, int linkId)
+{
+    if (lineNumber < 0 || lineNumber >= static_cast<int>(buffer.size())) {
+        return;
+    }
+
+    if (length <= 0) {
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] restoreLinkIndices: non-positive length" << length << "- returning early";
+#endif
+        return;
+    }
+
+    materialisePreTriggerPassLine(lineNumber);
+    std::vector<TChar>& line = buffer[lineNumber];
+
+    // Extra safety: ensure we don't go out of bounds
+    if (line.empty()) {
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] restoreLinkIndices: line" << lineNumber << "is empty";
+#endif
+        return;
+    }
+
+    startColumn = std::max(0, std::min(startColumn, static_cast<int>(line.size())));
+
+    int endColumn = std::min(static_cast<int>(line.size()), startColumn + std::max(0, length));
+
+    for (int col = startColumn; col < endColumn; ++col) {
+        // Additional bounds check inside the loop
+        if (col >= static_cast<int>(line.size())) {
+            break;
+        }
+        line[col].mLinkIndex = linkId;
+    }
+
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] Link" << linkId << "restored";
+#endif
+}
+
+void TBuffer::parseJsonStyleToHyperlinkStyling(const QJsonObject& styleObj, Mudlet::HyperlinkStyling& styling)
+{
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] parseJsonStyleToHyperlinkStyling called with JSON object";
+#endif
+
+    // Parse base style properties directly into the default state
+    Mudlet::HyperlinkStyling::StateStyle baseStyle;
+    parseJsonStateStyle(styleObj, baseStyle);
+
+    // Apply base style to the main styling object
+    if (baseStyle.hasForegroundColor) {
+        styling.foregroundColor = baseStyle.foregroundColor;
+        styling.hasForegroundColor = true;
+    }
+
+    if (baseStyle.hasBackgroundColor) {
+        styling.backgroundColor = baseStyle.backgroundColor;
+        styling.hasBackgroundColor = true;
+    }
+
+    styling.isBold = baseStyle.isBold;
+    styling.isItalic = baseStyle.isItalic;
+    styling.isUnderlined = baseStyle.isUnderlined;
+    styling.underlineStyle = baseStyle.underlineStyle;
+    styling.isOverlined = baseStyle.isOverlined;
+
+    // CRITICAL: Set custom styling flags if any base properties were found
+    if (baseStyle.hasCustomStyling) {
+        styling.hasCustomStyling = true;
+        styling.hasBaseCustomStyling = true;
+    }
+    styling.isStrikeOut = baseStyle.isStrikeOut;
+
+    if (baseStyle.hasUnderlineColor) {
+        styling.underlineColor = baseStyle.underlineColor;
+        styling.hasUnderlineColor = true;
+    }
+
+    if (baseStyle.hasOverlineColor) {
+        styling.overlineColor = baseStyle.overlineColor;
+        styling.hasOverlineColor = true;
+    }
+
+    if (baseStyle.hasStrikeoutColor) {
+        styling.strikeoutColor = baseStyle.strikeoutColor;
+        styling.hasStrikeoutColor = true;
+    }
+
+    // Parse pseudo-class states
+    if (styleObj.contains(qsl("link")) && styleObj[qsl("link")].isObject()) {
+        parseJsonStateStyle(styleObj[qsl("link")].toObject(), styling.linkStyle);
+    }
+
+    if (styleObj.contains(qsl("visited")) && styleObj[qsl("visited")].isObject()) {
+        parseJsonStateStyle(styleObj[qsl("visited")].toObject(), styling.visitedStyle);
+    }
+
+    if (styleObj.contains(qsl("hover")) && styleObj[qsl("hover")].isObject()) {
+        parseJsonStateStyle(styleObj[qsl("hover")].toObject(), styling.hoverStyle);
+    }
+
+    if (styleObj.contains(qsl("active")) && styleObj[qsl("active")].isObject()) {
+        parseJsonStateStyle(styleObj[qsl("active")].toObject(), styling.activeStyle);
+    }
+
+    if (styleObj.contains(qsl("focus")) && styleObj[qsl("focus")].isObject()) {
+        parseJsonStateStyle(styleObj[qsl("focus")].toObject(), styling.focusStyle);
+    }
+
+    if (styleObj.contains(qsl("focus-visible")) && styleObj[qsl("focus-visible")].isObject()) {
+        parseJsonStateStyle(styleObj[qsl("focus-visible")].toObject(), styling.focusVisibleStyle);
+    }
+
+    if (styleObj.contains(qsl("any-link")) && styleObj[qsl("any-link")].isObject()) {
+        parseJsonStateStyle(styleObj[qsl("any-link")].toObject(), styling.anyLinkStyle);
+    }
+
+    if (styleObj.contains(qsl("selected")) && styleObj[qsl("selected")].isObject()) {
+        parseJsonStateStyle(styleObj[qsl("selected")].toObject(), styling.selectedStyle);
+    }
+
+    if (styleObj.contains(qsl("disabled")) && styleObj[qsl("disabled")].isObject()) {
+        parseJsonStateStyle(styleObj[qsl("disabled")].toObject(), styling.disabledStyle);
+    }
+
+    // Update hasCustomStyling flag if any pseudo-class states have custom styling
+    if (styling.linkStyle.hasCustomStyling || styling.visitedStyle.hasCustomStyling || styling.hoverStyle.hasCustomStyling || styling.activeStyle.hasCustomStyling
+        || styling.focusStyle.hasCustomStyling || styling.focusVisibleStyle.hasCustomStyling || styling.anyLinkStyle.hasCustomStyling || styling.selectedStyle.hasCustomStyling
+        || styling.disabledStyle.hasCustomStyling) {
+        styling.hasCustomStyling = true;
+    }
+
+    applyAccessibilityEnhancements(styling);
+}
+
+QColor TBuffer::parseColorValue(const QString& value)
+{
+    QString cleanValue = value.trimmed().toLower();
+
+    // Handle hex colors: #rrggbb (6-digit) or #rgb (3-digit shorthand)
+    // Qt's QColor constructor automatically expands 3-digit format (e.g., #f00 -> #ff0000)
+    if (cleanValue.startsWith('#')) {
+        QColor color(cleanValue);
+
+        if (color.isValid()) {
+            return color;
+        }
+    }
+
+    // Handle named colors
+    QColor namedColor(cleanValue);
+
+    if (namedColor.isValid()) {
+        return namedColor;
+    }
+
+    // Handle rgb() format: rgb(255, 0, 0) or rgb(100%, 0%, 0%)
+    // Supports both integer (0-255) and percentage (0%-100%) values
+    // Spaces after commas are optional: rgb(255,0,0) works too
+    if (cleanValue.startsWith("rgb(") && cleanValue.endsWith(')')) {
+        QString rgbContent = cleanValue.mid(4, cleanValue.length() - 5);
+        QStringList components = rgbContent.split(',');
+
+        if (components.size() == 3) {
+            auto parseComponent = [](const QString& comp, bool& ok) -> int {
+                QString trimmed = comp.trimmed();
+
+                if (trimmed.endsWith('%')) {
+                    // Percentage value: convert 0-100% to 0-255
+                    trimmed.chop(1); // Remove '%'
+                    double percent = trimmed.toDouble(&ok);
+
+                    if (ok && percent >= 0.0 && percent <= 100.0) {
+                        return qRound(percent * 2.55);
+                    }
+
+                    return -1;
+                }
+                // Integer value: 0-255
+                int value = trimmed.toInt(&ok);
+
+                if (ok && value >= 0 && value <= 255) {
+                    return value;
+                }
+                return -1;
+            };
+
+            bool ok1, ok2, ok3;
+            int r = parseComponent(components[0], ok1);
+            int g = parseComponent(components[1], ok2);
+            int b = parseComponent(components[2], ok3);
+
+            if (ok1 && ok2 && ok3 && r >= 0 && g >= 0 && b >= 0) {
+                return QColor(r, g, b);
+            }
+        }
+    }
+
+    return QColor(); // Invalid color
 }
 
 void TBuffer::resetColors()
@@ -2133,336 +5186,251 @@ void TBuffer::resetColors()
     // This will refresh the "main" console as it is only this class instance
     // associated with that one that will call this method from the
     // decodeOSC(...) method:
-    if (pHost->mpConsole) {
-        pHost->mpConsole->changeColors();
-    }
+    pHost->applyMainConsoleColors();
 
     // Also need to update the Lua sub-system's "color_table"
     pHost->updateAnsi16ColorsInTable();
 }
 
-void TBuffer::append(const QString& text, int sub_start, int sub_end, TChar format, int linkID)
+void TBuffer::append(const QString& text, int sub_start, int sub_end, const TChar& format, int linkID)
 {
-    // CHECK: What about other Unicode line breaks, e.g. soft-hyphen:
-    const QString lineBreaks = qsl(",.- ");
+    append(text, sub_start, sub_end, format.foreground(), format.background(), format.mFlags, linkID);
+}
+
+// A link index only means anything to the store that issued it, so an index from
+// another buffer is registered here and swapped for one of ours. The caller owns
+// remappedLinkIds, so one source index maps to one of ours for the whole of the
+// text being brought over, however many separate runs of it that text has.
+int TBuffer::remapLinkId(const TLinkStore& sourceLinkStore, const int sourceLinkId, QHash<int, int>& remappedLinkIds)
+{
+    if (sourceLinkId <= 0) {
+        return 0;
+    }
+
+    int destLinkId = remappedLinkIds.value(sourceLinkId);
+    if (destLinkId > 0) {
+        return destLinkId;
+    }
+
+    // a reference of this store's own, so freeing either store's leaves the other link working
+    QVector<int> luaReference;
+    for (const int sourceReference : sourceLinkStore.getReference(sourceLinkId)) {
+        luaReference.append(mpHost && sourceReference > 0 ? mpHost->mLuaInterpreter.duplicateLuaRegistryIndex(sourceReference) : 0);
+    }
+
+    destLinkId = mLinkStore.addLinks(sourceLinkStore.getLinksConst(sourceLinkId), sourceLinkStore.getHintsConst(sourceLinkId), mpHost, luaReference, sourceLinkStore.getExpireName(sourceLinkId));
+    if (sourceLinkStore.hasStyling(sourceLinkId)) {
+        mLinkStore.setStyling(destLinkId, sourceLinkStore.getStyling(sourceLinkId));
+    }
+    return remappedLinkIds.insert(sourceLinkId, destLinkId).value();
+}
+
+void TBuffer::appendFormatted(const QString& text, const std::vector<TChar>& formatting, const TLinkStore& sourceLinkStore)
+{
+    if (text.isEmpty()) {
+        return;
+    }
+
+    // Ensure we have a line to append to BEFORE computing line indices
+    if (buffer.empty()) {
+        appendEmptyLine();
+    }
+
+    // Check for text/formatting size mismatch - this is a programming error
+    if (text.size() != static_cast<qsizetype>(formatting.size())) {
+        qWarning() << "TBuffer::appendFormatted: text size" << text.size() << "differs from formatting size" << formatting.size()
+                   << "- missing entries get default formatting and extra ones are ignored";
+    }
+
+    const int lastLineBeforeWrap = buffer.size() - 1;
+    const int lastLineLength = lineBuffer.at(lastLineBeforeWrap).size();
+
+    materialisePreTriggerPassLine(lastLineBeforeWrap);
+
+    bool firstChar = lineBuffer.back().isEmpty();
+    // Only into an empty line: reserving exactly ahead of a line that keeps
+    // being added to would regrow it on every call rather than geometrically
+    if (firstChar) {
+        lineBuffer.back().reserve(text.size());
+        buffer.back().reserve(text.size());
+    }
+    QHash<int, int> remappedLinkIds;
+    const qsizetype formatted = std::min(text.size(), static_cast<qsizetype>(formatting.size()));
+    const TChar defaultChar;
+    // Each stretch between line feeds is copied whole, as copying it a
+    // character at a time cost more than everything else here put together
+    qsizetype runStart = 0;
+    while (true) {
+        qsizetype runEnd = text.indexOf(QChar::LineFeed, runStart);
+        if (runEnd < 0) {
+            runEnd = text.size();
+        }
+        if (const qsizetype runLength = runEnd - runStart; runLength > 0) {
+            lineBuffer.back().append(QStringView(text).sliced(runStart, runLength));
+            std::vector<TChar>& chars = buffer.back();
+            const size_t first = chars.size();
+            if (const qsizetype copied = std::clamp<qsizetype>(formatted - runStart, 0, runLength); copied > 0) {
+                const auto from = formatting.begin() + runStart;
+                chars.insert(chars.end(), from, from + copied);
+                for (TChar& ch : std::span(chars).subspan(first)) {
+                    if (ch.mLinkIndex) {
+                        ch.mLinkIndex = remapLinkId(sourceLinkStore, ch.mLinkIndex, remappedLinkIds);
+                    }
+                }
+            }
+            chars.resize(first + runLength, defaultChar);
+            if (firstChar) {
+                timeBuffer.back() = currentTimeStamp();
+                firstChar = false;
+            }
+        }
+        if (runEnd == text.size()) {
+            break;
+        }
+        firstChar = true;
+        appendEmptyLine();
+        runStart = runEnd + 1;
+    }
+
+    appendEmptyLine();
+
+    if (lastLineLength == lineBuffer.at(lastLineBeforeWrap).size()) {
+        log(lastLineBeforeWrap, lastLineBeforeWrap);
+        wrapLine(lastLineBeforeWrap + 1, mWrapAt, mWrapIndent, mWrapHangingIndent);
+    } else {
+        wrapLine(lastLineBeforeWrap, mWrapAt, mWrapIndent, mWrapHangingIndent);
+    }
 
     if (static_cast<int>(buffer.size()) > mLinesLimit) {
         shrinkBuffer();
     }
-    int last = buffer.size() - 1;
-    if (last < 0) {
-        // buffer is completely empty
-        std::deque<TChar> newLine;
-        // The ternary operator is used here to set/reset only the TChar::Echo bit in the flags:
-        const TChar c(format.mFgColor,
-                format.mBgColor,
-                (mEchoingText ? (TChar::Echo | (format.mFlags & TChar::TestMask))
-                 : (format.mFlags & TChar::TestMask)));
-        newLine.push_back(c);
-        buffer.push_back(newLine);
-        lineBuffer.push_back(QString());
-        timeBuffer << QTime::currentTime().toString(timeStampFormat);
-        promptBuffer << false;
-        last = 0;
+
+    if (mpModel) {
+        emit mpModel->mNotifier.linesAppended(lineBuffer.size());
     }
+}
+
+void TBuffer::append(const QString& text, int sub_start, int sub_end, const QColor& fgColor, const QColor& bgColor, TChar::AttributeFlags flags, int linkID, const QString& timeStampOverride)
+{
+    if (buffer.empty()) {
+        appendEmptyLine();
+    }
+    const int lastLineBeforeWrap = buffer.size() - 1;
+    const int lastLineLength = lineBuffer.at(lastLineBeforeWrap).size();
+    appendLine(text, sub_start, sub_end, fgColor, bgColor, flags, linkID, timeStampOverride);
     if (text.isEmpty()) {
         return;
     }
-    bool firstChar = (lineBuffer.back().isEmpty());
-#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-    const int length = std::min(text.size(), MAX_CHARACTERS_PER_ECHO);
-#else
-    // Qt 6 changed the return type of QLIST<T>::size() to qsizetype which is
-    // not directly comparable to a const int& without a cast:
-    const int length = std::min(static_cast<int>(text.size()), MAX_CHARACTERS_PER_ECHO);
-#endif
-    if (sub_end >= length) {
-        sub_end = text.size() - 1;
+    // optimization: if the lastLine length hasn't changed,
+    // skip it and wrap subsequent lines
+    if (lastLineLength == lineBuffer.at(lastLineBeforeWrap).size()) {
+        log(lastLineBeforeWrap, lastLineBeforeWrap);
+        wrapLine(lastLineBeforeWrap + 1, mWrapAt, mWrapIndent, mWrapHangingIndent);
+    } else {
+        wrapLine(lastLineBeforeWrap, mWrapAt, mWrapIndent, mWrapHangingIndent);
     }
-
-    for (int i = sub_start; i < length; ++i) {
-        //FIXME <=substart+sub_end must check whether sub-ranges are still needed
-        if (text.at(i) == QChar::LineFeed) {
-            log(size() - 1, size() - 1);
-            std::deque<TChar> const newLine;
-            buffer.push_back(newLine);
-            lineBuffer.push_back(QString());
-            timeBuffer << blankTimeStamp;
-            promptBuffer << false;
-            firstChar = true;
-            continue;
-        }
-
-        // FIXME: (I18n) Need to measure painted line width and compare that
-        // to "unit" character width (whatever we work THAT out to be)
-        // multiplied by mWrap:
-        if (lineBuffer.back().size() >= mWrapAt) {
-            for (int i = lineBuffer.back().size() - 1; i >= 0; --i) {
-                if (lineBreaks.indexOf(lineBuffer.back().at(i)) > -1) {
-                    const int linebreakPos = (i != 0) ? i + 1 : lineBuffer.back().size();
-                    const QString tmp = lineBuffer.back().mid(0, linebreakPos);
-                    const QString lineRest = lineBuffer.back().mid(linebreakPos);
-                    lineBuffer.back() = tmp;
-                    std::deque<TChar> newLine;
-
-                    int restOfLine = lineRest.size();
-                    if (restOfLine > 0) {
-                        while (restOfLine > 0) {
-                            newLine.push_front(buffer.back().back());
-                            buffer.back().pop_back();
-                            restOfLine--;
-                        }
-                    }
-
-                    buffer.push_back(newLine);
-                    if (lineRest.size() > 0) {
-                        lineBuffer.append(lineRest);
-                    } else {
-                        lineBuffer.append(QString());
-                    }
-                    timeBuffer << blankTimeStamp;
-                    promptBuffer << false;
-                    log(size() - 2, size() - 2);
-                    // Was absent causing loss of all but last line of wrapped
-                    // long lines of user input and some other console displayed
-                    // text from log file.
-                    break;
-                }
-            }
-        }
-        lineBuffer.back().append(text.at(i));
-        const TChar c(format.mFgColor,
-                format.mBgColor,
-                (mEchoingText ? (TChar::Echo | (format.mFlags & TChar::TestMask))
-                 : (format.mFlags & TChar::TestMask)),
-                linkID);
-        buffer.back().push_back(c);
-        if (firstChar) {
-            timeBuffer.back() = QTime::currentTime().toString(timeStampFormat);
-            firstChar = false;
-        }
+    if (static_cast<int>(buffer.size()) > mLinesLimit) {
+        shrinkBuffer();
     }
-
     // Whilst shrinkBuffer() is used when the buffer exceeds a user defined
     // limit to prevent it growing beyond a "reasonable" size we also
     // want to check - for TConsoles that have been set to be "non-scrollable"
     // - that the content has not exceeded the number of lines that can be
     // shown in the upper pane and to raise an event if it has
-    if (!mpConsole.isNull()) {
-        mpConsole->handleLinesOverflowEvent(lineBuffer.size());
+    if (mpModel) {
+        emit mpModel->mNotifier.linesAppended(lineBuffer.size());
     }
 }
 
-// Wraps text to max line length of mWrapAt
-// Applies indentation of mWrapIndent to wrapped lines
-// If wrapLength <= indentWidth, emits a warning and returns unmodified text
-QString TBuffer::wrapText(const QString& text) const
-{
-    if (mWrapAt <= mWrapIndent) {
-        qWarning() << "Wrap (" << mWrapAt << ") is too small to accommodate Indent (" << mWrapIndent << ")";
-        return text;
-    }
-
-    QString wrappedText;
-    qsizetype curIndent = 0;
-    QTextBoundaryFinder lineFinder(QTextBoundaryFinder::Line, text);
-    const QString indentText = QChar::LineFeed + QString(" ").repeated(mWrapIndent);
-
-    for (qsizetype curLineStart = 0; curLineStart < text.size(); curLineStart++) {
-        // Find where the next line break is.
-        // The end of the input text also counts as a line break.
-        qsizetype nextLineBreak = text.indexOf(QChar::LineFeed, curLineStart);
-        if (nextLineBreak == -1) {
-            nextLineBreak = text.size();
-        }
-
-        // Find where the wrap window ends
-        const qsizetype wrapWindowEnd = curLineStart + mWrapAt - curIndent;
-
-        // If linebreak happens within wrap window:
-        // Clear indentation, write the line, and skip the rest of the steps
-        if (nextLineBreak < wrapWindowEnd) {
-            curIndent = 0;
-            const qsizetype lineWidth = nextLineBreak - curLineStart + 1;
-            wrappedText += text.mid(curLineStart, lineWidth);
-            curLineStart = nextLineBreak;
-            continue;
-        }
-
-        // Find a good place to break up this line
-        lineFinder.setPosition(wrapWindowEnd + 1);
-        lineFinder.toPreviousBoundary();
-        qsizetype safeLineEnd = lineFinder.position();
-
-        // If a single word is too long to fit in the wrap window:
-        // Write as much of it as possible
-        if (safeLineEnd <= curLineStart) {
-            safeLineEnd = wrapWindowEnd;
-        }
-
-        // Move start point forward, set indention level
-        const qsizetype lineWidth = safeLineEnd - curLineStart;
-        wrappedText += text.mid(curLineStart, lineWidth);
-        curIndent = mWrapIndent;
-        curLineStart = safeLineEnd - 1;
-
-        // Apply indentation, unless we've reached the end of the text
-        if (curLineStart < text.size()) {
-            wrappedText += indentText;
-        }
-    }
-    return wrappedText;
-}
-
-
-void TBuffer::append(const QString& text, int sub_start, int sub_end, const QColor& fgColor, const QColor& bgColor, TChar::AttributeFlags flags, int linkID)
-{
-    // CHECK: What about other Unicode line breaks, e.g. soft-hyphen:
-    const QString lineBreaks = qsl(",.- ");
-
-    if (static_cast<int>(buffer.size()) > mLinesLimit) {
-        shrinkBuffer();
-    }
-    int last = buffer.size() - 1;
-    if (last < 0) {
-        std::deque<TChar> newLine;
-        const TChar c(fgColor, bgColor, (mEchoingText ? (TChar::Echo | flags) : flags));
-        newLine.push_back(c);
-        buffer.push_back(newLine);
-        lineBuffer.push_back(QString());
-        timeBuffer << QTime::currentTime().toString(timeStampFormat);
-        promptBuffer << false;
-        last = 0;
-    }
-    if (text.isEmpty()) {
-        return;
-    }
-    bool firstChar = (lineBuffer.back().isEmpty());
-#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-    const int length = std::min(text.size(), MAX_CHARACTERS_PER_ECHO);
-#else
-    const int length = std::min(static_cast<int>(text.size()), MAX_CHARACTERS_PER_ECHO);
-#endif
-    if (sub_end >= length) {
-        sub_end = text.size() - 1;
-    }
-
-    for (int i = sub_start; i < length; ++i) {
-        if (text.at(i) == '\n') {
-            log(size() - 1, size() - 1);
-            std::deque<TChar> const newLine;
-            buffer.push_back(newLine);
-            lineBuffer.push_back(QString());
-            timeBuffer << blankTimeStamp;
-            promptBuffer << false;
-            firstChar = true;
-            continue;
-        }
-
-        // FIXME: (I18n) Need to measure painted line width and compare that
-        // to "unit" character width (whatever we work THAT out to be)
-        // multiplied by mWrap:
-        if (lineBuffer.back().size() >= mWrapAt) {
-            for (int i = lineBuffer.back().size() - 1; i >= 0; --i) {
-                // insert linebreak either at linebreaking character location or at last character of line
-                if (lineBreaks.indexOf(lineBuffer.back().at(i)) > -1 || i == 0) {
-                    const int linebreakPos = (i != 0) ? i + 1 : lineBuffer.back().size();
-                    const QString tmp = lineBuffer.back().mid(0, linebreakPos);
-                    const QString lineRest = lineBuffer.back().mid(linebreakPos);
-                    lineBuffer.back() = tmp;
-                    std::deque<TChar> newLine;
-
-                    int restOfLine = lineRest.size();
-                    if (restOfLine > 0) {
-                        while (restOfLine > 0) {
-                            newLine.push_front(buffer.back().back());
-                            buffer.back().pop_back();
-                            restOfLine--;
-                        }
-                    }
-
-                    buffer.push_back(newLine);
-                    if (lineRest.size() > 0) {
-                        lineBuffer.append(lineRest);
-                    } else {
-                        lineBuffer.append(QString());
-                    }
-                    timeBuffer << blankTimeStamp;
-                    promptBuffer << false;
-                    log(size() - 2, size() - 2);
-                    // Was absent causing loss of all but last line of wrapped
-                    // long lines of user input and some other console displayed
-                    // text from log file.
-                    break;
-                }
-            }
-        }
-        lineBuffer.back().append(text.at(i));
-        const TChar c(fgColor, bgColor, (mEchoingText ? (TChar::Echo | flags) : flags), linkID);
-        buffer.back().push_back(c);
-        if (firstChar) {
-            timeBuffer.back() = QTime::currentTime().toString(timeStampFormat);
-            firstChar = false;
-        }
-    }
-    // Check - for "non-scrollable" TConsoles that the content has not exceeded
-    // the number of lines that can be shown and raise an event if it has:
-    if (!mpConsole.isNull()) {
-        mpConsole->handleLinesOverflowEvent(lineBuffer.size());
-    }
-}
-
-void TBuffer::appendLine(const QString& text, const int sub_start, const int sub_end,
-                         const QColor& fgColor, const QColor& bgColor,
-                         const TChar::AttributeFlags flags, const int linkID)
+void TBuffer::appendLine(const QString& text,
+                         const int sub_start,
+                         const int sub_end,
+                         const QColor& fgColor,
+                         const QColor& bgColor,
+                         const TChar::AttributeFlags flags,
+                         const int linkID,
+                         const QString& timeStampOverride)
 {
     if (sub_end < 0) {
         return;
     }
-    if (static_cast<int>(buffer.size()) > mLinesLimit) {
-        shrinkBuffer();
+
+    // Use a 1-second debounce to prevent duplicate injection from echo + server response
+    if (text.contains("!osc8-docs")) {
+        if (mpHost.isNull()) {
+            return; // Still don't display the trigger phrase itself
+        }
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        // The examples always go to the main console. Ask the model for it
+        // rather than the view: the injection is pure buffer work, so it still
+        // works when the profile has no main console widget.
+        TBuffer& mainBuffer = mpHost->mainConsoleModel().buffer;
+
+        if (now - mainBuffer.mLastOSC8DocsInjectionTime > 1000) {
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] Documentation examples trigger phrase detected";
+#endif
+            mainBuffer.mLastOSC8DocsInjectionTime = now;
+            mainBuffer.injectOSC8DocumentationExamples();
+        }
+        return; // Don't display the trigger phrase itself
     }
+
     int lastLine = buffer.size() - 1;
+    materialisePreTriggerPassLine(lastLine);
+
     if (Q_UNLIKELY(lastLine < 0)) {
         // There are NO lines in the buffer - so initialize with a new empty line
-        std::deque<TChar> newLine;
-        const TChar c(fgColor, bgColor, (mEchoingText ? (TChar::Echo | flags) : flags));
-        newLine.push_back(c);
-        buffer.push_back(newLine);
-        lineBuffer.push_back(QString());
-        timeBuffer << QTime::currentTime().toString(timeStampFormat);
-        promptBuffer << false;
+        appendEmptyLine();
         lastLine = 0;
+        // The ternary operator is used here to set/reset only the TChar::Echo bit in the flags:
+        const TChar styling(fgColor, bgColor, (mEchoingText ? (TChar::Echo | (flags & TChar::TestMask)) : (flags & TChar::TestMask)));
+        buffer.back().push_back(styling);
     }
 
     if (text.isEmpty()) {
         return;
     }
+
     bool firstChar = (lineBuffer.back().isEmpty());
-#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-    const int length = std::min(text.size(), MAX_CHARACTERS_PER_ECHO);
-#else
     const int length = std::min(static_cast<int>(text.size()), MAX_CHARACTERS_PER_ECHO);
-#endif
     int lineEndPos = sub_end;
+
     if (lineEndPos >= length) {
-        lineEndPos = text.size() - 1;
+        lineEndPos = length - 1;
     }
 
     for (int i = sub_start; i <= (sub_start + lineEndPos); i++) {
-        lineBuffer.back().append(text.at(i));
-        const TChar c(fgColor, bgColor, (mEchoingText ? (TChar::Echo | flags) : flags), linkID);
-        buffer.back().push_back(c);
+        const QChar thisChar = text.at(i);
+
+        if (thisChar == QChar::LineFeed) {
+            firstChar = true;
+            appendEmptyLine();
+            continue;
+        }
+
+        lineBuffer.back().append(thisChar);
+        const TChar styling(fgColor, bgColor, (mEchoingText ? (TChar::Echo | flags) : flags), linkID);
+        buffer.back().push_back(styling);
+
+        // Note: Original character storage for ANSI-styled OSC 8 links happens in
+        // translateToPlainText() where the TChar is created with ANSI formatting
+        // before JSON styling is applied
+
         if (firstChar) {
-            timeBuffer.back() = QTime::currentTime().toString(timeStampFormat);
+            // Replayed held-back content supplies its arrival time:
+            timeBuffer.back() = timeStampOverride.isEmpty() ? currentTimeStamp() : timeStampOverride;
             firstChar = false;
         }
     }
-    // Check - for "non-scrollable" TConsoles that the content has not exceeded
-    // the number of lines that can be shown and raise an event if it has:
-    if (!mpConsole.isNull()) {
-        mpConsole->handleLinesOverflowEvent(lineBuffer.size());
-    }
+}
+
+void TBuffer::appendEmptyLine()
+{
+    buffer.emplace_back();
+    lineBuffer.push_back(QString());
+    timeBuffer << currentTimeStamp();
+    promptBuffer << false;
 }
 
 // This was called "insert" but that is commonly used for built in methods and
@@ -2472,6 +5440,10 @@ bool TBuffer::insertInLine(QPoint& P, const QString& text, const TChar& format)
     if (text.isEmpty()) {
         return false;
     }
+    // Bound a single insert to the same limit the echo/append path uses
+    // (see appendLine()), so an oversized insertText() cannot consume unbounded
+    // memory or processing time.
+    const QString insertedText = (text.size() > MAX_CHARACTERS_PER_ECHO) ? text.left(MAX_CHARACTERS_PER_ECHO) : text;
     const int x = P.x();
     const int y = P.y();
     if ((y >= 0) && (y < static_cast<int>(buffer.size()))) {
@@ -2479,103 +5451,80 @@ bool TBuffer::insertInLine(QPoint& P, const QString& text, const TChar& format)
             return false;
         }
         if (x >= static_cast<int>(buffer.at(y).size())) {
-            TChar c(mpConsole);
+            TChar c = currentFormat();
             expandLine(y, x - buffer.at(y).size(), c);
         }
-        for (int i = 0, total = text.size(); i < total; ++i) {
-            lineBuffer[y].insert(x + i, text.at(i));
-            const TChar c = format;
-            auto it = buffer[y].begin();
-            buffer[y].insert(it + x + i, c);
-        }
+        // Insert the whole run in one operation. Inserting one character at a
+        // time into the middle of the QString/std::vector is O(n) per character,
+        // which is quadratic for large inserts.
+        lineBuffer[y].insert(x, insertedText);
+        buffer[y].insert(buffer[y].begin() + x, static_cast<std::size_t>(insertedText.size()), format);
+        syncPreTriggerPassLine(y);
     } else {
-        appendLine(text, 0, text.size(), format.mFgColor, format.mBgColor, format.mFlags);
+        appendLine(insertedText, 0, insertedText.size(), format.foreground(), format.background(), format.mFlags);
     }
     return true;
 }
 
-// This is very poorly designed as P2 is used to determine the last character to
-// copy BUT no consideration is given to P2.y() != p1.y() i.e. a copy of more
-// than a single line - and it copies a single QChar at a time....
-TBuffer TBuffer::copy(QPoint& P1, QPoint& P2)
+// P2 is exclusive: P2.x() is one past the last character copied, matching every
+// other consumer of a P_begin/P_end pair. Still poorly designed in that no
+// consideration is given to P2.y() != P1.y(), i.e. a copy of more than one line.
+// slice is cleared and refilled rather than built afresh: constructing a TBuffer
+// costs more than copying a line into one, and the clipboard is copied into a lot.
+void TBuffer::copyInto(const QPoint& P1, const QPoint& P2, TBuffer& slice) const
 {
-    TBuffer slice(mpHost);
     slice.clear();
     const int y = P1.y();
     int x = P1.x();
     if (y < 0 || y >= static_cast<int>(buffer.size())) {
-        return slice;
+        return;
     }
 
-    if ((x < 0) || (x >= static_cast<int>(buffer.at(y).size())) || (P2.x() < 0) || (P2.x() > static_cast<int>(buffer.at(y).size()))) {
-        x = 0;
+    // Ensure x starts within the valid range, and adjust P2.x() if it's out of bounds
+    if (x < 0 || x >= static_cast<int>(buffer.at(y).size())) {
+        x = 0; // Reset x to start of line if out of bounds
     }
-    int oldLinkId{}, id{};
-    for (const int total = P2.x(); x < total; ++x) {
-        const int linkId = buffer.at(y).at(x).linkIndex();
-        if (linkId && (linkId != oldLinkId)) {
-            id = slice.mLinkStore.addLinks(mLinkStore.getLinksConst(linkId), mLinkStore.getHintsConst(linkId), mpHost);
-            oldLinkId = linkId;
-        }
+    int P2x_corrected = std::min(P2.x(), static_cast<int>(buffer.at(y).size())); // Correct P2.x() to prevent out-of-bounds
 
-        if (!linkId) {
-            id = 0;
-        }
-        // This is rather inefficient as s is only ever one QChar long
-        const QString s(lineBuffer.at(y).at(x));
-        slice.append(s, 0, 1, buffer.at(y).at(x).mFgColor, buffer.at(y).at(x).mBgColor, buffer.at(y).at(x).mFlags, id);
+    if (x < P2x_corrected) {
+        const std::vector<TChar> formatting(buffer.at(y).cbegin() + x, buffer.at(y).cbegin() + P2x_corrected);
+        slice.appendFormatted(lineBuffer.at(y).mid(x, P2x_corrected - x), formatting, mLinkStore);
     }
-    return slice;
 }
 
 // This is constrained to P1.y() == P2.y()....
-TBuffer TBuffer::cut(QPoint& P1, QPoint& P2)
+void TBuffer::cutInto(QPoint& P1, QPoint& P2, TBuffer& slice)
 {
-    TBuffer slice = copy(P1, P2);
-    TChar format(mpConsole);
+    copyInto(P1, P2, slice);
+    TChar format = currentFormat();
     replaceInLine(P1, P2, QString(), format);
-    return slice;
 }
 
-// This only copies the first line of chunk's contents:
+// Only the first line of chunk is pasted, and it goes in at P:
 void TBuffer::paste(QPoint& P, const TBuffer& chunk)
 {
-    const bool needAppend = false;
-    bool hasAppended = false;
-    int y = P.y();
     const int x = P.x();
-    if (chunk.buffer.empty()) {
+    if (chunk.buffer.empty() || x < 0) {
         return;
     }
+    int y = P.y();
     if (y < 0 || y > getLastLineNumber()) {
         y = getLastLineNumber();
     }
-    // FIXME: RISK OF EXCEPTION getLastLineNumber() returns zero (not -1) if
-    // the buffer is empty, so y can never be less than zero here - however that
-    // will cause an exception with std::deque::at(size_t) - previously
-    // std::deque::operator[size_t] was used and that exhibits UNDEFINED
-    // BEHAVIOUR in the same situation:
-    if (x < 0 || x >= static_cast<int>(buffer.at(y).size())) {
-        return;
-    }
 
+    // Copying a link index across verbatim would resolve it against whatever
+    // this store holds at that id, which is a different link or none at all
+    QHash<int, int> remappedLinkIds;
     for (int cx = 0, total = static_cast<int>(chunk.buffer.at(0).size()); cx < total; ++cx) {
-        // This is rather inefficient as s is only ever one QChar long
-        QPoint P_current(cx, y);
-        if ((y < getLastLineNumber()) && (!needAppend)) {
-            const TChar& format = chunk.buffer.at(0).at(cx);
-            const QString s = QString(chunk.lineBuffer.at(0).at(cx));
-            insertInLine(P_current, s, format);
-        } else {
-            hasAppended = true;
-            const QString s(chunk.lineBuffer.at(0).at(cx));
-            append(s, 0, 1, chunk.buffer.at(0).at(cx).mFgColor, chunk.buffer.at(0).at(cx).mBgColor, chunk.buffer.at(0).at(cx).mFlags);
-        }
-    }
-
-    if (hasAppended && y != -1) {
-        TChar format(mpConsole);
-        wrapLine(y, mWrapAt, mWrapIndent, format);
+        // Character at a time because insertInLine() applies a single TChar to
+        // the whole run it is given, and every character here can differ
+        QPoint P_current(x + cx, y);
+        insertInLine(P_current,
+                     QString(chunk.lineBuffer.at(0).at(cx)),
+                     TChar(chunk.buffer.at(0).at(cx).foreground(),
+                           chunk.buffer.at(0).at(cx).background(),
+                           chunk.buffer.at(0).at(cx).mFlags,
+                           remapLinkId(chunk.mLinkStore, chunk.buffer.at(0).at(cx).linkIndex(), remappedLinkIds)));
     }
 }
 
@@ -2585,21 +5534,13 @@ void TBuffer::appendBuffer(const TBuffer& chunk)
     if (chunk.buffer.empty()) {
         return;
     }
-    int oldLinkId{}, id{};
-    for (int cx = 0, total = static_cast<int>(chunk.buffer.at(0).size()); cx < total; ++cx) {
-        const int linkId = chunk.buffer.at(0).at(cx).linkIndex();
-        if (linkId && (oldLinkId != linkId)) {
-            id = mLinkStore.addLinks(chunk.mLinkStore.getLinksConst(linkId), chunk.mLinkStore.getHintsConst(linkId), mpHost);
-            oldLinkId = linkId;
-        }
-        if (!linkId) {
-            id = 0;
-        }
-        const QString s(chunk.lineBuffer.at(0).at(cx));
-        append(s, 0, 1, chunk.buffer.at(0).at(cx).mFgColor, chunk.buffer.at(0).at(cx).mBgColor, chunk.buffer.at(0).at(cx).mFlags, id);
+    if (chunk.lineBuffer.at(0).isEmpty()) {
+        // appendFormatted() ignores empty text, but a chunk holding one empty
+        // line still has to terminate the destination's current line
+        append(QString(QChar::LineFeed), 0, 1, Qt::black, Qt::black, TChar::None);
+        return;
     }
-
-    append(QString(QChar::LineFeed), 0, 1, Qt::black, Qt::black, TChar::None);
+    appendFormatted(chunk.lineBuffer.at(0), chunk.buffer.at(0), chunk.mLinkStore);
 }
 
 int TBuffer::calculateWrapPosition(int lineNumber, int begin, int end)
@@ -2622,7 +5563,7 @@ int TBuffer::calculateWrapPosition(int lineNumber, int begin, int end)
     return lineSize;
 }
 
-inline int TBuffer::skipSpacesAtBeginOfLine(const int row, const int column)
+int TBuffer::skipSpacesAtBeginOfLine(const int row, const int column)
 {
     int offset = 0;
     int position = column;
@@ -2641,115 +5582,170 @@ inline int TBuffer::skipSpacesAtBeginOfLine(const int row, const int column)
     return offset;
 }
 
-inline int TBuffer::wrap(int startLine)
+// find lindbreaks and indents (if not necessary, return empty list)
+inline QList<WrapInfo> TBuffer::getWrapInfo(const QString& lineText, bool isNewline, const int maxWidth, const int indent, const int hangingIndent)
 {
-    if (static_cast<int>(buffer.size()) < startLine || startLine < 0) {
-        return 0;
-    }
-    std::queue<std::deque<TChar>> queue;
-    QStringList tempList;
-    QStringList timeList;
-    QList<bool> promptList;
-    int lineCount = 0;
-    const TChar pSpace(mpConsole);
-    for (int i = startLine, total = static_cast<int>(buffer.size()); i < total; ++i) {
-        const bool isPrompt = promptBuffer[i];
-        std::deque<TChar> newLine;
-        QString lineText = "";
-        const QString time = timeBuffer[i];
-        int indent = 0;
-        if (static_cast<int>(buffer[i].size()) >= mWrapAt) {
-            for (int i3 = 0; i3 < mWrapIndent; ++i3) {
-                newLine.push_back(pSpace);
-                lineText.append(" ");
-            }
-            indent = mWrapIndent;
-        }
-        int lastSpace = 0;
-        int wrapPos = 0;
-        const int length = buffer[i].size();
-        if (length == 0) {
-            tempList.append(QString());
-            std::deque<TChar> const emptyLine;
-            queue.push(emptyLine);
-            timeList.append(time);
-        }
-        for (int i2 = 0, total = static_cast<int>(buffer[i].size()); i2 < total;) {
-            if (length - i2 > mWrapAt - indent) {
-                wrapPos = calculateWrapPosition(i, i2, i2 + mWrapAt - indent);
-                lastSpace = qMax(0, wrapPos);
-            } else {
-                lastSpace = 0;
-            }
-            const int wrapPosition = (lastSpace) ? lastSpace : (mWrapAt - indent);
-            for (int i3 = 0; i3 < wrapPosition; ++i3) {
-                if (lastSpace > 0) {
-                    if (i2 > lastSpace) {
-                        break;
-                    }
-                }
-                if (i2 >= static_cast<int>(buffer[i].size())) {
-                    break;
-                }
-                if (lineBuffer[i].at(i2) == '\n') {
-                    i2++;
-                    break;
-                }
-                newLine.push_back(buffer[i][i2]);
-                lineText.append(lineBuffer[i].at(i2));
-                i2++;
-            }
-            if (newLine.empty()) {
-                tempList.append(QString());
-                std::deque<TChar> const emptyLine;
-                queue.push(emptyLine);
-                timeList.append(QString());
-                promptList.append(false);
-            } else {
-                queue.push(newLine);
-                tempList.append(lineText);
-                timeList.append(time);
-                promptList.append(isPrompt);
-            }
-            newLine.clear();
-            lineText = "";
-            indent = 0;
-            i2 += skipSpacesAtBeginOfLine(i, i2);
-        }
-        lineCount++;
-    }
-    for (int i = 0; i < lineCount; ++i) {
-        buffer.pop_back();
-        lineBuffer.pop_back();
-        timeBuffer.pop_back();
-        promptBuffer.pop_back();
+    QList<WrapInfo> output;
+    if (lineText.isEmpty()) {
+        return output;
     }
 
-    const int insertedLines = queue.size() - 1;
-    while (!queue.empty()) {
-        buffer.push_back(queue.front());
-        queue.pop();
-    }
-    for (int i = 0, total = tempList.size(); i < total; ++i) {
-        if (tempList[i].size() < 1) {
-            lineBuffer.append(QString());
-            timeBuffer.append(QString());
-            promptBuffer.push_back(false);
-        } else {
-            lineBuffer.append(tempList[i]);
-            timeBuffer.append(timeList[i]);
-            promptBuffer.push_back(promptList[i]);
-        }
+    // Safety check: during destruction, mpHost might be null
+    if (!mpHost) {
+        // Return a simple wrap info without character width calculations
+        output.append(WrapInfo(isNewline, false, 0, lineText.length()));
+        return output;
     }
 
-    log(startLine, startLine + tempList.size());
-    return insertedLines > 0 ? insertedLines : 0;
+    // The boundary finders below run a full Unicode analysis, the costliest part of appending a line. Printable
+    // ASCII is one column per QChar, so such a line no wider than the wrap column has no break to find.
+    // LineFeed and Tab are outside that range, so embedded breaks never take this path.
+    const qsizetype widthAvailable = std::min<qsizetype>(isNewline ? maxWidth - indent : maxWidth, mWrapAt);
+    const bool plainAscii = lineBreakInfo::printableAscii(lineText);
+    if (plainAscii && lineText.size() <= widthAvailable) {
+        return output;
+    }
+    // No grapheme is wider than graphemeInfo::maxWidth columns or shorter than one QChar, so this line
+    // can't reach the wrap column; only an embedded line feed can break it.
+    if (lineText.size() * graphemeInfo::maxWidth <= widthAvailable && !lineText.contains(QChar::LineFeed)) {
+        return output;
+    }
+
+    // Each finder runs its own analysis over the whole line. A plain-ASCII
+    // line's grapheme clusters are its characters, each one column wide, so
+    // it needs no grapheme finder, and lineBreakInfo::asciiLineBreaks() gives
+    // it the line-break finder's answers without building one.
+    std::optional<QTextBoundaryFinder> graphemeFinder;
+    std::optional<QTextBoundaryFinder> lineBreakFinder;
+    lineBreakInfo::Breaks asciiBreaks;
+    if (plainAscii) {
+        asciiBreaks = lineBreakInfo::asciiLineBreaks(lineText);
+    } else {
+        graphemeFinder.emplace(QTextBoundaryFinder::Grapheme, lineText);
+        lineBreakFinder.emplace(QTextBoundaryFinder::Line, lineText);
+    }
+    const auto setGraphemePosition = [&graphemeFinder](const int position) {
+        if (graphemeFinder) {
+            graphemeFinder->setPosition(position);
+        }
+    };
+    // The position itself when the line may break before it, otherwise the
+    // last position before it that the line may break at (0 when there is
+    // none): what QTextBoundaryFinder::isAtBoundary() and then
+    // toPreviousBoundary() answer, on both paths.
+    const auto lineBreakAtOrBefore = [&](const int position) -> int {
+        if (lineBreakFinder) {
+            lineBreakFinder->setPosition(position);
+            if (lineBreakFinder->isAtBoundary()) {
+                return position;
+            }
+            return lineBreakFinder->toPreviousBoundary();
+        }
+        if (position == 0 || asciiBreaks[position]) {
+            return position;
+        }
+        int previous = position - 1;
+        while (previous > 0 && !asciiBreaks[previous]) {
+            --previous;
+        }
+        return previous;
+    };
+    int xPos = 0;
+    int totalWidth = 0;
+    int firstChar = 0;
+    bool needsIndent = isNewline;
+    bool hasNewline = false;
+
+    // find all the appropriate wrap points assuming (hanging-)indentation prepended to each line
+    for (int indexOfChar = 0, total = lineText.size(); indexOfChar < total and indexOfChar >= 0;) {
+        const QChar c = lineText.at(indexOfChar);
+        // skip leading spaces for any wrapped lines
+        if (xPos == 0 and !isNewline and !output.isEmpty() and c == QChar::Space) {
+            indexOfChar++;
+            firstChar = indexOfChar;
+            setGraphemePosition(indexOfChar);
+            continue;
+        }
+        // handle embedded linefeed
+        if (c == QChar::LineFeed) {
+            hasNewline = true;
+            output.append(WrapInfo(isNewline, needsIndent, firstChar, indexOfChar));
+            indexOfChar++;
+            setGraphemePosition(indexOfChar);
+            firstChar = indexOfChar;
+            isNewline = true;
+            needsIndent = false;
+            xPos = 0;
+            continue;
+        }
+        int nextBoundary = indexOfChar + 1;
+        int charWidth = 1;
+        if (!plainAscii) {
+            nextBoundary = graphemeFinder->toNextBoundary();
+            const uint unicode = graphemeInfo::getBaseCharacter(QStringView(lineText).mid(indexOfChar, nextBoundary - indexOfChar));
+            // Safety check: during destruction, mpHost might be null
+            charWidth = graphemeInfo::getWidth(unicode, mpHost ? mpHost->wideAmbiguousEAsianGlyphs() : false);
+        }
+        const int indentationHere = isNewline ? indent : hangingIndent;
+        if (xPos + charWidth > maxWidth - (needsIndent ? indentationHere : 0)) {
+            if (isNewline) {
+                needsIndent = true;
+            }
+            // we check c == QChar::Space since we are happy to break at -any- space,
+            // unlike the indirect-linebreak permission of QTextBoundaryFinder::Line
+            // (see: https://www.unicode.org/reports/tr14/#LD9) which will only break at
+            // at the first char after 1+ space(s)
+            const int firstNonIndentChar = firstChar + (needsIndent ? 0 : indentationHere);
+            if (c != QChar::Space) {
+                const int wrapPoint = lineBreakAtOrBefore(indexOfChar);
+                if (wrapPoint > firstNonIndentChar) {
+                    indexOfChar = wrapPoint;
+                }
+            }
+            setGraphemePosition(indexOfChar);
+            if (indexOfChar <= firstChar) {
+                // no room for even one grapheme - either the wrap width is too
+                // narrow (or zero) or the indentation eats all of it. Breaking
+                // here would produce an empty segment and leave indexOfChar
+                // where it was, looping forever, so keep one grapheme on the
+                // line to guarantee the scan moves on
+                indexOfChar = (nextBoundary > firstChar) ? nextBoundary : firstChar + 1;
+                setGraphemePosition(indexOfChar);
+                totalWidth += charWidth;
+            }
+            output.append(WrapInfo(isNewline, needsIndent, firstChar, indexOfChar));
+            isNewline = false;
+            needsIndent = true;
+            xPos = 0;
+            firstChar = indexOfChar;
+            continue;
+        }
+        xPos += charWidth;
+        totalWidth += charWidth;
+        indexOfChar = nextBoundary;
+    }
+    // it's possible that no wrapping is needed
+    if (totalWidth <= mWrapAt && !hasNewline) {
+        output.clear();
+        return output;
+    }
+    // if the line has been wrapped, append last remaining bit
+    if (!output.isEmpty()) {
+        output.append(WrapInfo(isNewline, !isNewline, firstChar, lineText.size()));
+    }
+    return output;
 }
 
+// This only works on the Main Console for a profile
 void TBuffer::log(int fromLine, int toLine)
 {
-    TBuffer* pB = &mpHost->mpConsole->buffer;
-    if (pB != this || !mpHost->mpConsole->mLogToLogFile) {
+    // The log file, its stream and the on/off flag are core model state, so
+    // this needs a Host but no view - which is what lets a profile with no main
+    // console widget write a log at all.
+    // See TBuffer::clear() on why the model is reached through the
+    // null-tolerant accessor.
+    TConsoleModel* pModel = mpHost.isNull() ? nullptr : mpHost->mainConsoleModelOrNull();
+    if (!pModel || this != &pModel->buffer || !pModel->mLogToLogFile) {
         return;
     }
 
@@ -2766,162 +5762,263 @@ void TBuffer::log(int fromLine, int toLine)
     // if we've been called to log the same line - which can happen when the user
     // enters a command after in-game text - then skip recording the last line
     if (fromLine != lastLoggedFromLine && toLine != lastloggedToLine) {
-        mpHost->mpConsole->mLogStream << lastTextToLog;
-        mpHost->mpConsole->mLogStream.flush();
-    }
-
-    QStringList linesToLog;
-    for (int i = fromLine; i <= toLine; ++i) {
-        if (mpHost->mIsCurrentLogFileInHtmlFormat) {
-            // This only handles a single line of logged text at a time:
-            linesToLog << bufferToHtml(mpHost->mIsLoggingTimestamps, i);
-        } else {
-            linesToLog << ((mpHost->mIsLoggingTimestamps && !timeBuffer.at(i).isEmpty()) ? timeBuffer.at(i).left(timeStampFormat.length()) : QString()) % lineBuffer.at(i) % QChar::LineFeed;
-        }
+        pModel->mLogStream << lastTextToLog;
+        pModel->scheduleLogFlush();
     }
 
     // record the last log call into a temporary buffer - we'll actually log
     // on the next iteration after duplication detection has run
-    lastTextToLog = linesToLog.join(QString());
+    lastTextToLog = assembleLog(fromLine, toLine);
     lastLoggedFromLine = fromLine;
     lastloggedToLine = toLine;
+}
+
+QString TBuffer::assembleLog(int fromLine, int toLine)
+{
+    const bool html = mpHost->mIsCurrentLogFileInHtmlFormat;
+    const bool timestamps = mpHost->mIsLoggingTimestamps;
+    if (html && fromLine == toLine) {
+        return bufferToHtml(timestamps, fromLine);
+    }
+
+    QString text;
+    if (!html && fromLine == toLine) {
+        text.reserve(TBuffer::smTimeStampFormat.length() + lineBuffer.at(fromLine).size() + 1);
+    }
+    for (int i = fromLine; i <= toLine; ++i) {
+        if (html) {
+            text.append(bufferToHtml(timestamps, i));
+            continue;
+        }
+        if (timestamps && !timeBuffer.at(i).isEmpty()) {
+            text.append(QStringView(timeBuffer.at(i)).left(TBuffer::smTimeStampFormat.length()));
+        }
+        text.append(lineBuffer.at(i));
+        text.append(QChar::LineFeed);
+    }
+    return text;
 }
 
 // logs the remaining output when logging gets stopped, without duplication checks
 void TBuffer::logRemainingOutput()
 {
-    mpHost->mpConsole->mLogStream << lastTextToLog;
-    mpHost->mpConsole->mLogStream.flush();
+    // Reset the deferred logging state up front, before any bail-out: it is
+    // buffer state and needs no view, and leaving it behind would let a
+    // successor view replay this pending line and let the stale line indexes
+    // suppress a real flush in log()
+    const QString pendingText = lastTextToLog;
+    lastTextToLog.clear();
+    lastLoggedFromLine = -1;
+    lastloggedToLine = -1;
+
+    // No mLogToLogFile test on purpose: both callers have already decided the
+    // pending line must be flushed - toggleLogging() once it has cleared the
+    // flag, clear() while it is still set. The file being open is tested
+    // instead, because a QTextStream written to after its device closed latches
+    // WriteFailed and then silently keeps every later write in its own buffer,
+    // to be replayed into the next log file the moment setDevice() rearms it.
+    TConsoleModel* pModel = mpHost.isNull() ? nullptr : mpHost->mainConsoleModelOrNull();
+    if (!pModel || this != &pModel->buffer || !pModel->mLogFile.isOpen()) {
+        return;
+    }
+
+    pModel->mLogStream << pendingText;
+    pModel->mLogStream.flush();
 }
 
-// returns how many new lines have been inserted by the wrapping action
-int TBuffer::wrapLine(int startLine, int screenWidth, int indentSize, TChar& format)
+// logs a string directly to the log file
+void TBuffer::appendLog(const QString& text)
 {
-    if (startLine < 0) {
-        return 0;
-    }
-    if (static_cast<int>(buffer.size()) <= startLine) {
-        return 0;
-    }
-    std::queue<std::deque<TChar>> queue;
-    QStringList tempList;
-    int lineCount = 0;
-
-    for (int line = startLine, total = static_cast<int>(buffer.size()); line < total; ++line) {
-        if (line > startLine) {
-            break; //only wrap one line of text
-        }
-        std::deque<TChar> newLine;
-        QString lineText;
-
-        int indent = 0;
-        if (static_cast<int>(buffer[line].size()) >= screenWidth) {
-            for (int prependSpaces = 0; prependSpaces < indentSize; ++prependSpaces) {
-                const TChar pSpace = format;
-                newLine.push_back(pSpace);
-                lineText.append(QChar::Space);
-            }
-            indent = indentSize;
-        }
-        int lastSpace = -1;
-        int wrapPos = -1;
-        auto lineLength = static_cast<int>(buffer[line].size());
-
-        for (int characterPosition = 0, total = static_cast<int>(buffer[line].size()); characterPosition < total;) {
-            if (lineLength - characterPosition > screenWidth - indent) {
-                wrapPos = calculateWrapPosition(line, characterPosition, characterPosition + screenWidth - indent);
-                lastSpace = qMax(-1, wrapPos);
-            } else {
-                lastSpace = -1;
-            }
-            for (int i3 = 0, total = screenWidth - indent; i3 < total; ++i3) {
-                if (lastSpace > 0) {
-                    if (characterPosition >= lastSpace) {
-                        characterPosition++;
-                        break;
-                    }
-                }
-                if (characterPosition >= static_cast<int>(buffer[line].size())) {
-                    break;
-                }
-                if (lineBuffer[line][characterPosition] == QChar::LineFeed) {
-                    characterPosition++;
-
-                    if (newLine.empty()) {
-                        tempList.append(QString());
-                        std::deque<TChar> const emptyLine;
-                        queue.push(emptyLine);
-                    } else {
-                        queue.push(newLine);
-                        tempList.append(lineText);
-                    }
-                    goto OPT_OUT_CLEAN;
-                }
-                newLine.push_back(buffer[line][characterPosition]);
-                lineText.append(lineBuffer[line].at(characterPosition));
-                characterPosition++;
-            }
-            queue.push(newLine);
-            tempList.append(lineText);
-
-        OPT_OUT_CLEAN:
-            newLine.clear();
-            lineText.clear();
-            indent = 0;
-        }
-        lineCount++;
+    // See TBuffer::log() on why the model is reached this way:
+    TConsoleModel* pModel = mpHost.isNull() ? nullptr : mpHost->mainConsoleModelOrNull();
+    if (!pModel || this != &pModel->buffer || !pModel->mLogToLogFile) {
+        return;
     }
 
-    if (lineCount < 1) {
-        log(startLine, startLine);
-        return 0;
-    }
-
-    buffer.erase(buffer.begin() + startLine);
-    lineBuffer.removeAt(startLine);
-    const QString time = timeBuffer.at(startLine);
-    timeBuffer.removeAt(startLine);
-    const bool isPrompt = promptBuffer.at(startLine);
-    promptBuffer.removeAt(startLine);
-
-    const int insertedLines = queue.size() - 1;
-    int i = 0;
-    while (!queue.empty()) {
-        buffer.insert(buffer.begin() + startLine + i, queue.front());
-        queue.pop();
-        i++;
-    }
-
-    for (int i = 0, total = tempList.size(); i < total; ++i) {
-        lineBuffer.insert(startLine + i, tempList[i]);
-        timeBuffer.insert(startLine + i, time);
-        promptBuffer.insert(startLine + i, isPrompt);
-    }
-    log(startLine, startLine + tempList.size() - 1);
-    return insertedLines > 0 ? insertedLines : 0;
+    pModel->mLogStream << text;
 }
 
+// Rewraps everything from startLine to the end of the buffer, and answers where
+// the last line of the result sits relative to startLine: 0 for a single line
+// that needed no wrapping, 2 for one split into three, and for a range of
+// several lines its length less one whether any of them were split or not.
+// TConsoleModel::insertLink() and TConsole::printCommand() add it to startLine to
+// place the cursor and the repaint range.
+int TBuffer::wrapLine(int startLine, int maxWidth, int indentSize, int hangingIndentSize)
+{
+    if (static_cast<int>(buffer.size()) < startLine || startLine < 0) {
+        return 0;
+    }
+
+    // The Lua wrapLine() reaches here from inside a trigger pass, and rebuilding
+    // the line replaces the characters the pass is matching against:
+    materialisePreTriggerPassLine(startLine);
+
+    // Checked here, not in the setters, as the wrap width can change after them.
+    // Each wrapped line pads indent columns per (maxWidth - indent) of text, so an
+    // indent is held to half the width: near the width a long line becomes one
+    // padded line per character and exhausts memory. One as wide as the width is
+    // dropped, and so is a negative one, as the insert() applying it takes an
+    // unsigned count.
+    const int indent = (indentSize > 0 && indentSize < maxWidth) ? std::min(indentSize, maxWidth / 2) : 0;
+    const int hangingIndent = (hangingIndentSize > 0 && hangingIndentSize < maxWidth) ? std::min(hangingIndentSize, maxWidth / 2) : 0;
+    const int total = static_cast<int>(buffer.size());
+
+    // Leading lines that getWrapInfo() finds no break points in stay where they
+    // are. The loop below reproduces such a line unchanged, but only after
+    // moving it out of the buffer into a queue and back again and standing up
+    // four temporary containers to do it. A line with no TChars or no text is
+    // not left alone: the loop turns that one into appendEmptyLine(), which
+    // drops its TChars, restamps it and clears its prompt flag.
+    int firstRewrappedLine = startLine;
+    QList<WrapInfo> lineBreaks;
+    while (firstRewrappedLine < total) {
+        if (buffer[firstRewrappedLine].empty() || lineBuffer.at(firstRewrappedLine).isEmpty()) {
+            break;
+        }
+        // a blank timestamp indicates a wrapped line
+        lineBreaks = getWrapInfo(lineBuffer.at(firstRewrappedLine), timeBuffer.at(firstRewrappedLine) != TBuffer::smBlankTimeStamp, maxWidth, indent, hangingIndent);
+        if (!lineBreaks.isEmpty()) {
+            break;
+        }
+        ++firstRewrappedLine;
+    }
+    const int keptLines = firstRewrappedLine - startLine;
+    if (firstRewrappedLine >= total) {
+        const int lastLineOffset = keptLines - 1;
+        if (lastLineOffset > 0) {
+            // log all lines but the last one (in case further text is appended later)
+            log(startLine, startLine + lastLineOffset - 1);
+            return lastLineOffset;
+        }
+        return 0;
+    }
+
+    std::queue<std::vector<TChar>> queue;
+    QStringList tempList;
+    QStringList timeList;
+    QList<bool> promptList;
+    int lineCount = 0;
+    for (int i = firstRewrappedLine; i < total; ++i) {
+        lineCount++;
+        std::vector<TChar> newBufferLine;
+        QString newLineText;
+        const QString time = timeBuffer[i];
+        // trivial case
+        if (buffer[i].empty()) {
+            tempList.append(newLineText);
+            queue.push(std::move(newBufferLine));
+            timeList.append(time);
+            promptList.append(false);
+            continue;
+        }
+
+        // consider wrapping line
+        int newBufferCharPosition = 0;
+        const bool isPrompt = promptBuffer[i];
+        const QString lineText = lineBuffer[i];
+        // a blank timestamp indicates a wrapped line
+        const bool isNewline = (time != TBuffer::smBlankTimeStamp);
+        // The scan above computed this for the line it stopped on. It can also
+        // stop before computing anything, but only on a line with no TChars
+        // (which never reaches here) or with no text, and getWrapInfo() answers
+        // an empty list for empty text too - so the stale value is the right
+        // one either way.
+        if (i != firstRewrappedLine) {
+            lineBreaks = getWrapInfo(lineText, isNewline, maxWidth, indent, hangingIndent);
+        }
+        if (lineBreaks.isEmpty()) {
+            tempList.append(lineText);
+            queue.push(std::move(buffer[i]));
+            timeList.append(time);
+            promptList.append(isPrompt);
+            continue;
+        }
+        const QString qIndent(indent, QChar::Space);
+        const QString qHangingIndent(hangingIndent, QChar::Space);
+        // The source line is read through a cursor rather than consumed from
+        // its front, which a vector cannot do without shuffling every
+        // remaining TChar down one place per character. It is therefore left
+        // fully populated here; the loop below this one pops the whole range
+        // off the back of the buffer, which is what discards it.
+        const std::vector<TChar>& sourceChars = buffer[i];
+        const int sourceSize = static_cast<int>(sourceChars.size());
+        for (const WrapInfo w : std::as_const(lineBreaks)) {
+            // skip TChars as needed
+            if (newBufferCharPosition < w.firstChar) {
+                newBufferCharPosition = std::min(w.firstChar, sourceSize);
+            }
+            if (w.needsIndent && newBufferCharPosition < sourceSize) {
+                // indentation takes the styling of the character it precedes, so
+                // that it reads as part of the same run of text
+                const TChar& indentSpace = sourceChars[newBufferCharPosition];
+                // add indentation to TChar buffer and newLineText
+                if (w.isNewline) {
+                    newBufferLine.insert(newBufferLine.end(), indent, indentSpace);
+                    newLineText.append(qIndent);
+                } else {
+                    newBufferLine.insert(newBufferLine.end(), hangingIndent, indentSpace);
+                    newLineText.append(qHangingIndent);
+                }
+            }
+            // append TChars of the wrapped lineText to TChar buffer
+            const int copyEnd = std::min(w.lastChar, sourceSize);
+            if (newBufferCharPosition < copyEnd) {
+                newBufferLine.insert(newBufferLine.end(), sourceChars.cbegin() + newBufferCharPosition, sourceChars.cbegin() + copyEnd);
+                newBufferCharPosition = copyEnd;
+            }
+            // everything else
+            newLineText.append(lineText.mid(w.firstChar, w.lastChar - w.firstChar));
+            tempList.append(newLineText);
+            if (w.isNewline) {
+                timeList.append(time);
+            } else {
+                timeList.append(TBuffer::smBlankTimeStamp);
+            }
+            queue.push(std::move(newBufferLine));
+            promptList.append(isPrompt);
+            newBufferLine.clear();
+            newLineText = QString();
+        }
+    }
+    for (int i = 0; i < lineCount; ++i) {
+        buffer.pop_back();
+        lineBuffer.pop_back();
+        timeBuffer.pop_back();
+        promptBuffer.pop_back();
+    }
+
+    const int rewrappedLines = static_cast<int>(queue.size());
+    for (int i = 0; i < rewrappedLines; ++i) {
+        if (tempList[i].isEmpty()) {
+            queue.pop();
+            appendEmptyLine();
+        } else {
+            buffer.push_back(std::move(queue.front()));
+            queue.pop();
+            lineBuffer.append(tempList[i]);
+            timeBuffer.append(timeList[i]);
+            promptBuffer.push_back(promptList[i]);
+        }
+    }
+
+    const int lastLineOffset = keptLines + rewrappedLines - 1;
+    if (lastLineOffset > 0) {
+        // log all lines but the last one (in case further text is appended later)
+        log(startLine, startLine + lastLineOffset - 1);
+        return lastLineOffset;
+    }
+    return 0;
+}
+
+// Any column is accepted, even one past the end of the line: insertInLine() pads the gap when text lands there.
 bool TBuffer::moveCursor(QPoint& where)
 {
-    const int x = where.x();
     const int y = where.y();
-    if (y < 0) {
-        return false;
-    }
-    if (y >= static_cast<int>(buffer.size())) {
-        return false;
-    }
-
-    if (static_cast<int>(buffer[y].size()) - 1 > x) {
-        TChar c(mpConsole);
-        // CHECKME: should "buffer[cookedY].size() - 1" be bracketed - which would change the -1 to +1 in the following:
-        expandLine(y, x - buffer[y].size() - 1, c);
-    }
-    return true;
+    return y >= 0 && y < static_cast<int>(buffer.size());
 }
 
-// Needed, at least, as a filler for missing lines past end of the lineBuffer
-// requested by lua function getLines(...):
+// line() returns a reference, so a line number outside the buffer needs a string that outlives the call
 QString badLineError = qsl("ERROR: invalid line number");
 
 QString& TBuffer::line(int lineNumber)
@@ -2964,6 +6061,7 @@ QStringList TBuffer::split(int line, const QRegularExpression& splitter)
 
 void TBuffer::expandLine(int y, int count, TChar& pC)
 {
+    materialisePreTriggerPassLine(y);
     const int size = buffer[y].size() - 1;
     for (int i = size, total = size + count; i < total; ++i) {
         buffer[y].push_back(pC);
@@ -2986,33 +6084,34 @@ bool TBuffer::replaceInLine(QPoint& P_begin, QPoint& P_end, const QString& with,
     if (x1 < 0 || x2 < 0) {
         return false;
     }
-
-    int xb, xe, yb, ye;
-    if (y1 <= y2) {
-        yb = y1;
-        ye = y2;
-        xb = x1;
-        xe = x2;
-    } else {
-        yb = y2;
-        ye = y1;
-        xb = x2;
-        xe = x1;
+    // the erase() below is undefined behaviour when the start is past the end:
+    // it moves a range of negative length, writing beyond the allocation
+    if (y1 > y2 || (y1 == y2 && x1 > x2)) {
+        return false;
     }
 
-    for (int y = yb; y <= ye; y++) {
+    for (int y = y1; y <= y2; y++) {
         int x = 0;
-        if (y == yb) {
-            x = xb;
+        if (y == y1) {
+            x = x1;
         }
         int x_end = buffer[y].size() - 1;
-        if (y == ye) {
-            x_end = xe;
+        if (y == y2) {
+            x_end = x2;
+        }
+        // the guard above orders the range as a whole, but a line inside a
+        // multi-line one can still start past its own end: an empty line has
+        // an x_end of -1, and a first line selected from its very last column
+        // leaves x at buffer[y].size(). Either way there is nothing on the line
+        // to remove, and erase() over that range is the same reversed move.
+        if (x > x_end) {
+            continue;
         }
         lineBuffer[y].remove(x, x_end - x);
         auto it1 = buffer[y].begin() + x;
         auto it2 = buffer[y].begin() + x_end;
         buffer[y].erase(it1, it2);
+        syncPreTriggerPassLine(y);
     }
 
     // insert replacement
@@ -3020,18 +6119,300 @@ bool TBuffer::replaceInLine(QPoint& P_begin, QPoint& P_end, const QString& with,
     return true;
 }
 
+// Ends the active hyperlink, from either the OSC 8 terminator or the end of the
+// line for one the game never closed. Characters already stamped with the id
+// stay clickable.
+void TBuffer::finaliseActiveHyperlink()
+{
+    // Apply initial selection/disabled state styling when link closes (from selection branch)
+    // OR apply :link pseudo-class styling for preset-only links (from compact branch)
+    if (mCurrentHyperlinkLinkId > 0 && mCurrentHyperlinkStyling.selection.hasSelectionSettings) {
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] Queuing initial selection styling for link" << mCurrentHyperlinkLinkId << "selected:" << mCurrentHyperlinkStyling.selection.selected
+                 << "disabled:" << mCurrentHyperlinkStyling.selection.disabled << "selectedStyle.hasCustomStyling:" << mCurrentHyperlinkStyling.selectedStyle.hasCustomStyling;
+#endif
+        if (mCurrentHyperlinkStyling.selection.selected) {
+            setLinkState(mCurrentHyperlinkLinkId, Mudlet::HyperlinkStyling::StateSelected);
+            mPendingSelectionStyling.insert(mCurrentHyperlinkLinkId);
+        } else if (mCurrentHyperlinkStyling.selection.disabled) {
+            setLinkState(mCurrentHyperlinkLinkId, Mudlet::HyperlinkStyling::StateDisabled);
+            mPendingSelectionStyling.insert(mCurrentHyperlinkLinkId);
+        }
+    } else if (mCurrentHyperlinkLinkId > 0) {
+        // Set initial :link pseudo-class state for regular links
+        setLinkState(mCurrentHyperlinkLinkId, Mudlet::HyperlinkStyling::StateDefault);
+        // DON'T call updateLinkCharacters() here - the link text hasn't been added to
+        // the buffer yet! It gets added later during COMMIT_LINE. Calling it now would
+        // scan the entire buffer looking for characters that don't exist yet, causing
+        // severe performance degradation with many links.
+        // The :link styling will be applied when characters are created in COMMIT_LINE.
+    }
+
+    // For spoilers, capture original text BEFORE any visibility concealment
+    // This ensures spoiler reveal works even when combined with visibility actions
+    if (mCurrentHyperlinkLinkId > 0 && mCurrentHyperlinkStyling.isSpoiler) {
+        if (!mServerWrapPendingLine.isEmpty() && !mCurrentHyperlinkStartsAfterHeldText) {
+            mHeldSpoilerLinkId = mCurrentHyperlinkLinkId;
+            mHeldSpoilerStartColumn = mCurrentHyperlinkStartColumn;
+            mHeldSpoilerContinuationLength = static_cast<int>(mMudLine.length());
+        } else {
+            maskSpoilerText(mCurrentHyperlinkLinkId, mMudLine, mCurrentHyperlinkStartColumn, mMudLine.length() - mCurrentHyperlinkStartColumn);
+        }
+    }
+
+    // Register with visibility manager if visibility settings exist
+    // Visibility currently only supports single-line hyperlinks
+    // Multi-line links will not have visibility management applied
+    if (mCurrentHyperlinkLinkId > 0 && mCurrentHyperlinkStyling.visibility.hasVisibilitySettings) {
+        if (!mServerWrapPendingLine.isEmpty()) {
+            // Held text may yet be joined on in front, shifting the columns, or be committed on its
+            // own, leaving them as they are - so registered once that is known.
+            mHeldVisibility = {mCurrentHyperlinkLinkId, mCurrentHyperlinkStartColumn, static_cast<int>(mMudLine.length()), mCurrentHyperlinkStartsAfterHeldText, mCurrentHyperlinkStyling};
+        } else if (mCurrentHyperlinkStartLine == static_cast<int>(lineBuffer.size()) - 1) {
+            registerLinkVisibility(mCurrentHyperlinkLinkId, mCurrentHyperlinkStartColumn, mMudLine.length() - mCurrentHyperlinkStartColumn, mCurrentHyperlinkStyling);
+        } else {
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] Skipping visibility registration for multi-line hyperlink" << "(visibility only applies to single-line links)" << "- started on line" << mCurrentHyperlinkStartLine
+                     << "ending on line" << static_cast<int>(lineBuffer.size()) - 1;
+#endif
+        }
+    }
+
+    mCurrentHyperlinkCommand.clear();
+    mCurrentHyperlinkHint.clear();
+    mCurrentHyperlinkLinkId = 0;
+    mHyperlinkActive = false;
+    // Reset enhanced styling
+    mCurrentHyperlinkStyling = Mudlet::HyperlinkStyling();
+    mCurrentHyperlinkMenu.clear();
+    // Reset visibility tracking
+    mCurrentHyperlinkStartLine = 0;
+    mCurrentHyperlinkStartColumn = 0;
+    mCurrentHyperlinkStartsAfterHeldText = false;
+    mCurrentHyperlinkText.clear();
+}
+
+// Registers a link on the line being built with the visibility manager, and conceals its text there
+// if it should start concealed.
+void TBuffer::registerLinkVisibility(const int linkId, const int column, const int length, const Mudlet::HyperlinkStyling& styling)
+{
+    if (!mpModel) {
+        return;
+    }
+    if (length <= 0) {
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] Skipping registration for hyperlink with invalid length:" << length;
+#endif
+        return;
+    }
+    const QString linkText = mMudLine.mid(column, length);
+    const int line = static_cast<int>(lineBuffer.size()) - 1;
+
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] Registering hyperlink" << linkId << "line:" << line << "col:" << column << "length:" << length << "text:" << linkText;
+#endif
+    const bool shouldStartConcealed = mpModel->mHyperlinkVisibilityManager.registerHyperlink(linkId, line, column, length, linkText, styling);
+
+    // If link should start concealed, replace its text with spaces in mMudLine
+    // Skip if spoiler already did this to avoid double-replacement
+    if (shouldStartConcealed && !styling.isSpoiler) {
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] Link starts concealed - replacing text with spaces";
+#endif
+        // CRITICAL: Maintain exact character length to preserve buffer consistency
+        // Even though emojis have different visual widths, we must keep the same
+        // character count to avoid disrupting buffer indices and causing crashes.
+        mMudLine.replace(column, length, QString(length, ' '));
+    }
+}
+
+// Mudlet's own flush marker commits line part way through the active link,
+// which carries on into the text after it: a spoiler's text so far is masked
+// here, where finaliseActiveHyperlink() will not reach it, and the link's
+// columns count from the start of the next line.
+void TBuffer::carryActiveHyperlinkPastFlush(QString& line)
+{
+    if (mCurrentHyperlinkLinkId > 0 && mCurrentHyperlinkStyling.isSpoiler) {
+        maskSpoilerText(mCurrentHyperlinkLinkId, line, mCurrentHyperlinkStartColumn, line.length() - mCurrentHyperlinkStartColumn);
+    }
+    mCurrentHyperlinkStartColumn = 0;
+}
+
+// Sets a spoiler's text aside and masks it space for space. One spread over
+// several lines is set aside a piece at a time, in the order
+// revealSpoilerLink() restores it.
+void TBuffer::maskSpoilerText(const int linkId, QString& line, const int column, const int length)
+{
+    if (length <= 0) {
+        return;
+    }
+    mLinkOriginalText[linkId] += line.mid(column, length);
+    line.replace(column, length, QString(length, QChar::Space));
+}
+
+// A scratch buffer has no model, so it cannot reach - and drop - the links of
+// the buffer it was copied from.
+THyperlinkVisibilityManager* TBuffer::hyperlinkVisibilityManagerOrNull()
+{
+    return mpModel ? &mpModel->mHyperlinkVisibilityManager : nullptr;
+}
+
+// What pads a short line and fills a cut: the model's current format without
+// its link, or the built-in default for a buffer that is nobody's model's.
+TChar TBuffer::currentFormat() const
+{
+    TChar format;
+    if (mpModel) {
+        format.mFgColor = mpModel->mFormatCurrent.mFgColor;
+        format.mBgColor = mpModel->mFormatCurrent.mBgColor;
+        format.mFlags = mpModel->mFormatCurrent.allDisplayAttributes();
+    }
+    return format;
+}
+
 void TBuffer::clear()
 {
+    // Clearing the display is not gagging: flush any deferred log text before
+    // the deleteLines() calls below would discard it, so a received line that
+    // was still pending for logging is not lost from the log file.
+    // mainConsoleModelOrNull() rather than mainConsoleModel() because this runs
+    // from the TBuffer constructor, and the main console's buffer is built
+    // inside the very model Host has not taken hold of yet.
+    TConsoleModel* pModel = mpHost.isNull() ? nullptr : mpHost->mainConsoleModelOrNull();
+    if (pModel && this == &pModel->buffer && pModel->mLogToLogFile) {
+        logRemainingOutput();
+
+        // A line whose own trigger calls clearWindow() has been committed and
+        // displayed, but commitLine() defers its log() call until runTriggers()
+        // returns - and the deleteLines() below will reset its commit index to
+        // -1, suppressing that call. Log those still-pending lines now so they
+        // are not lost. mCommitLineIndices holds them in display order.
+        for (const int commitLineIndex : mCommitLineIndices) {
+            if (commitLineIndex >= 0 && commitLineIndex < static_cast<int>(lineBuffer.size())) {
+                pModel->mLogStream << assembleLog(commitLineIndex, commitLineIndex);
+            }
+        }
+        pModel->mLogStream.flush();
+
+        lastTextToLog.clear();
+        lastLoggedFromLine = -1;
+        lastloggedToLine = -1;
+    }
+
+    mCurrentHyperlinkCommand.clear();
+    mCurrentHyperlinkHint.clear();
+    mCurrentHyperlinkLinkId = 0;
+    mHyperlinkActive = false;
+
+    // every line is about to go, so the tracked links and any announcement queued for them go with it
+    if (auto* pHyperlinkManager = hyperlinkVisibilityManagerOrNull()) {
+        pHyperlinkManager->clear();
+    }
+
     while (!buffer.empty()) {
         if (!deleteLines(0, 0)) {
             break;
         }
     }
-    std::deque<TChar> const newLine;
-    buffer.push_back(newLine);
+
+    // After deleting all lines, clear all links (none are referenced)
+    clearLinkState();
+
+    buffer.emplace_back();
     lineBuffer << QString();
     timeBuffer << QString();
     promptBuffer.push_back(false);
+}
+
+void TBuffer::clearLinkState(const QSet<int>& stillLiveLinkIds)
+{
+    if (mLinkStore.pristine() && mLinkStates.isEmpty() && mVisitedLinks.isEmpty() && mLinkSelectionState.isEmpty() && mLinkOriginalBackgrounds.isEmpty() && mLinkOriginalCharacters.isEmpty()
+        && mLinkOriginalText.isEmpty() && mPendingSelectionStyling.isEmpty() && !mCurrentHoveredLinkIndex && !mCurrentActiveLinkIndex && !mCurrentFocusedLinkIndex && !mLastClickedLinkIndex) {
+        return;
+    }
+
+    Host* pH = mpHost;
+    const QSet<int> activeLinkIds = collectActiveLinkIds() | stillLiveLinkIds;
+
+    if (pH) {
+        mLinkStore.removeUnreferencedLinks(activeLinkIds, pH);
+    } else {
+        qWarning() << "TBuffer::clearLinkState() WARNING - mpHost is null, cannot remove unreferenced links from store";
+    }
+
+    QSet<int> staleIds;
+
+    auto collectStale = [&activeLinkIds, &staleIds](const auto& map) {
+        for (auto it = map.constBegin(); it != map.constEnd(); ++it) {
+            if (!activeLinkIds.contains(it.key())) {
+                staleIds.insert(it.key());
+            }
+        }
+    };
+
+    collectStale(mLinkStates);
+    collectStale(mVisitedLinks);
+    collectStale(mLinkSelectionState);
+    collectStale(mLinkOriginalBackgrounds);
+    collectStale(mLinkOriginalCharacters);
+    collectStale(mLinkOriginalText);
+
+    for (int key : staleIds) {
+        mLinkStates.remove(key);
+        mVisitedLinks.remove(key);
+        mLinkSelectionState.remove(key);
+        mLinkOriginalBackgrounds.remove(key);
+        mLinkOriginalCharacters.remove(key);
+        mLinkOriginalText.remove(key);
+    }
+
+    // Prevent applyPendingSelectionStyling from updating non-existent links
+    mPendingSelectionStyling &= activeLinkIds;
+
+    // Reset hover/active/focus state if those links are gone
+    if (!activeLinkIds.contains(mCurrentHoveredLinkIndex)) {
+        mCurrentHoveredLinkIndex = 0;
+    }
+
+    if (!activeLinkIds.contains(mCurrentActiveLinkIndex)) {
+        mCurrentActiveLinkIndex = 0;
+    }
+
+    if (!activeLinkIds.contains(mCurrentFocusedLinkIndex)) {
+        mCurrentFocusedLinkIndex = 0;
+    }
+
+    if (!activeLinkIds.contains(mLastClickedLinkIndex)) {
+        mLastClickedLinkIndex = 0;
+    }
+}
+
+QSet<int> TBuffer::collectActiveLinkIds() const
+{
+    QSet<int> activeLinkIds;
+
+    for (const auto& line : buffer) {
+        for (const TChar& tchar : line) {
+            int linkId = tchar.linkIndex();
+
+            if (linkId > 0) {
+                activeLinkIds.insert(linkId);
+            }
+        }
+    }
+
+    return activeLinkIds;
+}
+
+void TBuffer::clearLastLine()
+{
+    if (!buffer.empty()) {
+        materialisePreTriggerPassLine(static_cast<int>(buffer.size()) - 1);
+        buffer.back().clear();
+        if (!lineBuffer.isEmpty()) {
+            lineBuffer.back().clear();
+        }
+    }
 }
 
 bool TBuffer::deleteLine(int y)
@@ -3042,6 +6423,15 @@ bool TBuffer::deleteLine(int y)
 void TBuffer::shrinkBuffer()
 {
     for (int i = 0; i < mBatchDeleteSize; ++i) {
+        // The lines going away were written a whole buffer ago, so freeing each
+        // one stalls on a cache miss for its allocator header. Asking for the
+        // headers a few lines ahead overlaps those misses with the frees in
+        // front of them.
+        constexpr int prefetchDistance = 8;
+        if (prefetchDistance < lineBuffer.size() && static_cast<size_t>(prefetchDistance) < buffer.size()) {
+            prefetchAllocatorHeader(lineBuffer.at(prefetchDistance).constData(), sizeof(QArrayData));
+            prefetchAllocatorHeader(buffer[prefetchDistance].data(), 0);
+        }
         lineBuffer.pop_front();
         promptBuffer.pop_front();
         timeBuffer.pop_front();
@@ -3050,14 +6440,54 @@ void TBuffer::shrinkBuffer()
     }
     // We need to adjust the search result line as some lines have now gone
     // away:
-    mpConsole->mCurrentSearchResult = qMax(0, mpConsole->mCurrentSearchResult - mBatchDeleteSize);
+    if (mpModel) {
+        mpModel->mCurrentSearchResult = qMax(0, mpModel->mCurrentSearchResult - mBatchDeleteSize);
+    }
+    mPreTriggerPassLineNumber = -1;
 
-    if (mpConsole->getType() & (TConsole::MainConsole|TConsole::UserWindow|TConsole::SubConsole|TConsole::Buffer)) {
+    // The removed leading lines shift every remaining index down; keep the
+    // deferred logging state pointing at the same lines
+    if (lastloggedToLine >= mBatchDeleteSize) {
+        lastLoggedFromLine = qMax(0, lastLoggedFromLine - mBatchDeleteSize);
+        lastloggedToLine -= mBatchDeleteSize;
+    } else if (lastLoggedFromLine >= 0) {
+        lastLoggedFromLine = -1;
+        lastloggedToLine = -1;
+    }
+    for (auto& commitLineIndex : mCommitLineIndices) {
+        if (commitLineIndex >= 0) {
+            commitLineIndex = (commitLineIndex < mBatchDeleteSize) ? -1 : commitLineIndex - mBatchDeleteSize;
+        }
+    }
+
+    // Tracked OSC 8 hyperlinks are addressed by line number, so they shift with
+    // everything else - any whose line just went away are dropped
+    QSet<int> trackedLinkIds;
+    if (mpModel) {
+        auto& hyperlinkManager = mpModel->mHyperlinkVisibilityManager;
+        hyperlinkManager.adjustLineNumbers(0, mBatchDeleteSize);
+        trackedLinkIds = hyperlinkManager.trackedLinkIds();
+    }
+
+    // Clean up unreferenced links after removing old lines. A concealed link's
+    // characters carry no index, so it has to be named to survive the sweep
+    clearLinkState(trackedLinkIds);
+
+    // Everything below needs the Host, whether or not there is a view: on app
+    // quit the profile is destroyed while its widgets are still only queued for
+    // deletion, so a live view is no promise that mpHost survived with it.
+    if (mpHost.isNull()) {
+        return;
+    }
+
+    // Scripts keep their own line-index bookkeeping, so they have to be told
+    // the indexes shifted whether or not anyone is watching the text:
+    if (mpModel && mpModel->mScriptAddressable) {
         // Signal to lua subsystem that indexes into the Console will need adjusting
         TEvent bufferShrinkEvent{};
         bufferShrinkEvent.mArgumentList.append(QLatin1String("sysBufferShrinkEvent"));
         bufferShrinkEvent.mArgumentTypeList.append(ARGUMENT_TYPE_STRING);
-        bufferShrinkEvent.mArgumentList.append(mpConsole->mConsoleName);
+        bufferShrinkEvent.mArgumentList.append(mpModel->mConsoleName);
         bufferShrinkEvent.mArgumentTypeList.append(ARGUMENT_TYPE_STRING);
         bufferShrinkEvent.mArgumentList.append(QString::number(mBatchDeleteSize));
         bufferShrinkEvent.mArgumentTypeList.append(ARGUMENT_TYPE_NUMBER);
@@ -3067,7 +6497,7 @@ void TBuffer::shrinkBuffer()
 
 bool TBuffer::deleteLines(int from, int to)
 {
-    if ((from >= 0) && (from < static_cast<int>(buffer.size())) && (from <= to) && (to >= 0) && (to < static_cast<int>(buffer.size()))) {
+    if ((from >= 0) && (from < static_cast<int>(buffer.size())) && (from <= to) && (to < static_cast<int>(buffer.size()))) {
         const int delta = to - from + 1;
 
         for (int i = from, total = from + delta; i < total; ++i) {
@@ -3077,10 +6507,44 @@ bool TBuffer::deleteLines(int from, int to)
         }
 
         buffer.erase(buffer.begin() + from, buffer.begin() + to + 1);
+        if (mPreTriggerPassLineNumber >= from) {
+            mPreTriggerPassLineNumber = -1;
+        }
+
+        // Keep the deferred logging state in step with the removed lines so
+        // pending text is only dropped when the lines it holds were deleted
+        if (lastloggedToLine >= from && lastLoggedFromLine <= to) {
+            if ((from <= lastLoggedFromLine && lastloggedToLine <= to) || lastTextToLog.isEmpty() || mpHost.isNull()) {
+                lastTextToLog.clear();
+                lastLoggedFromLine = -1;
+                lastloggedToLine = -1;
+            } else {
+                // only part of the pending range was deleted - rebuild the
+                // pending text from the lines that survived
+                lastLoggedFromLine = (lastLoggedFromLine < from) ? lastLoggedFromLine : from;
+                lastloggedToLine = (lastloggedToLine > to) ? lastloggedToLine - delta : from - 1;
+                lastTextToLog = assembleLog(lastLoggedFromLine, lastloggedToLine);
+            }
+        } else if (lastLoggedFromLine > to) {
+            lastLoggedFromLine -= delta;
+            lastloggedToLine -= delta;
+        }
+        for (auto& commitLineIndex : mCommitLineIndices) {
+            if (commitLineIndex >= from && commitLineIndex <= to) {
+                commitLineIndex = -1;
+            } else if (commitLineIndex > to) {
+                commitLineIndex -= delta;
+            }
+        }
+
+        // Tracked OSC 8 hyperlinks are addressed by line number too, so they
+        // shift with everything else - any whose line just went away are dropped
+        if (auto* pHyperlinkManager = hyperlinkVisibilityManagerOrNull()) {
+            pHyperlinkManager->adjustLineNumbers(from, delta);
+        }
         return true;
-    } else {
-        return false;
     }
+    return false;
 }
 
 bool TBuffer::applyLink(const QPoint& P_begin, const QPoint& P_end, const QStringList& linkFunction, const QStringList& linkHint, QVector<int> luaReference)
@@ -3105,6 +6569,7 @@ bool TBuffer::applyLink(const QPoint& P_begin, const QPoint& P_end, const QStrin
          * && ( x2 < static_cast<int>(buffer.at(y2).size()) ) )
          */
         for (int y = y1; y <= y2; ++y) {
+            materialisePreTriggerPassLine(y);
             int x = 0;
             if (y == y1) {
                 x = x1;
@@ -3122,9 +6587,8 @@ bool TBuffer::applyLink(const QPoint& P_begin, const QPoint& P_end, const QStrin
             }
         }
         return true;
-    } else {
-        return false;
     }
+    return false;
 }
 
 // Replaces (bool)TBuffer::applyXxxx(QPoint& P_begin, QPoint& P_end, bool state)
@@ -3151,6 +6615,8 @@ bool TBuffer::applyAttribute(const QPoint& P_begin, const QPoint& P_end, const T
          * && ( x2 < static_cast<int>(buffer.at(y2).size()) ) )
          */
 
+        // No materialisePreTriggerPassLine(): color matching reads only foreground()/background(), and
+        // snapshotting would copy every line for a script that styles all of them.
         for (int y = y1; y <= y2; ++y) {
             int x = 0;
             if (y == y1) {
@@ -3162,14 +6628,13 @@ bool TBuffer::applyAttribute(const QPoint& P_begin, const QPoint& P_end, const T
                         return true;
                     }
                 }
-                buffer.at(y).at(x).mFlags = (buffer.at(y).at(x).mFlags &~(attributes)) | (state ? attributes : TChar::None);
+                buffer.at(y).at(x).mFlags = (buffer.at(y).at(x).mFlags & ~(attributes)) | (state ? attributes : TChar::None);
                 ++x;
             }
         }
         return true;
-    } else {
-        return false;
     }
+    return false;
 }
 
 bool TBuffer::applyFgColor(const QPoint& P_begin, const QPoint& P_end, const QColor& newColor)
@@ -3194,6 +6659,7 @@ bool TBuffer::applyFgColor(const QPoint& P_begin, const QPoint& P_end, const QCo
          */
 
         for (int y = y1; y <= y2; ++y) {
+            materialisePreTriggerPassLine(y);
             int x = 0;
             if (y == y1) {
                 // Override position start column if on first line to given start column
@@ -3205,13 +6671,12 @@ bool TBuffer::applyFgColor(const QPoint& P_begin, const QPoint& P_end, const QCo
                     return true;
                 }
 
-                buffer.at(y).at(x++).mFgColor = newColor;
+                buffer.at(y).at(x++).setForeground(newColor);
             }
         }
         return true;
-    } else {
-        return false;
     }
+    return false;
 }
 
 bool TBuffer::applyBgColor(const QPoint& P_begin, const QPoint& P_end, const QColor& newColor)
@@ -3236,6 +6701,7 @@ bool TBuffer::applyBgColor(const QPoint& P_begin, const QPoint& P_end, const QCo
          */
 
         for (int y = y1; y <= y2; ++y) {
+            materialisePreTriggerPassLine(y);
             int x = 0;
             if (y == y1) {
                 // Override position start column if on first line to given start column
@@ -3247,7 +6713,7 @@ bool TBuffer::applyBgColor(const QPoint& P_begin, const QPoint& P_end, const QCo
                     return true;
                 }
 
-                buffer.at(y).at(x++).mBgColor = newColor;
+                buffer.at(y).at(x++).setBackground(newColor);
             }
         }
         return true;
@@ -3272,9 +6738,7 @@ QStringList TBuffer::getEndLines(int n)
 // Note: spacePadding is expected to be non-zero on ONLY the first call to this
 // method - it is needed to pad the first line out when the first line of a
 // selection is not a complete line of text and there are more lines to follow
-QString TBuffer::bufferToHtml(const bool showTimeStamp /*= false*/, const int row /*= -1*/,
-                              const int endColumn /*= -1*/, const int startColumn /*= 0*/,
-                              int spacePadding /*= 0*/)
+QString TBuffer::bufferToHtml(const bool showTimeStamp /*= false*/, const int row /*= -1*/, const int endColumn /*= -1*/, const int startColumn /*= 0*/, int spacePadding /*= 0*/)
 {
     int pos = startColumn;
     QString s;
@@ -3283,9 +6747,9 @@ QString TBuffer::bufferToHtml(const bool showTimeStamp /*= false*/, const int ro
         return s;
     }
 
-    // std:deque uses std::deque:size_type as index type which is an unsigned
-    // long int, but row (and pos) are signed ints...!
-    auto cookedRow = static_cast<unsigned long>(row);
+    // std:deque uses std::deque:size_type as index type which is unsigned,
+    // but row (and pos) are signed ints...!
+    auto cookedRow = static_cast<size_t>(row);
 
     if ((pos < 0) || (pos >= static_cast<int>(buffer.at(cookedRow).size()))) {
         pos = 0;
@@ -3297,10 +6761,14 @@ QString TBuffer::bufferToHtml(const bool showTimeStamp /*= false*/, const int ro
         // row - this can have been triggered by a -1 argument
         lastPos = static_cast<int>(buffer.at(cookedRow).size());
     }
+    // Room for the text and a span or two of markup, so most lines are built
+    // without regrowing the string
+    s.reserve(160 + 2 * (lastPos - pos));
 
     TChar::AttributeFlags currentFlags = TChar::None;
-    QColor currentFgColor(Qt::black);
-    QColor currentBgColor(Qt::black);
+    QRgb currentFgColor = qRgb(0, 0, 0);
+    QRgb currentBgColor = qRgb(0, 0, 0);
+    int currentLinkIndex = 0;
     // This combination of color values (black on black) cannot usefully be used in practice
     // - so use as initialization values
 
@@ -3311,13 +6779,18 @@ QString TBuffer::bufferToHtml(const bool showTimeStamp /*= false*/, const int ro
     // then we need:
     // <span timestamp format>Timestamp (13 chars)</span><span default>___padding spaces___</span><span first chunk style>first chunk...
     // we will NOT need a closing "</span>"
+    const QColor consoleBgColor{mpModel ? mpModel->mBgColor : QColor(Qt::black)};
     if (showTimeStamp && !timeBuffer.at(row).isEmpty()) {
-        // TODO: formatting according to TTextEdit.cpp: if( i2 < timeOffset ) - needs updating if we allow the colours to be user set:
-        s.append(qsl("<span style=\"color: rgb(200,150,0); background: rgb(22,22,22); \">%1").arg(timeBuffer.at(row).left(timeStampFormat.length())));
+        // Use the console's background so the timestamp blends in with the
+        // rest of the text, as done in TTextEdit::layoutLine(...).
+        s.append(QLatin1StringView("<span style=\"color: rgb(200,150,0); background: "));
+        s.append(consoleBgColor.name());
+        s.append(QLatin1StringView("; \">"));
+        s.append(QStringView(timeBuffer.at(row)).left(TBuffer::smTimeStampFormat.length()));
         // Set the current idea of what the formatting is so we can spot if it
         // changes:
-        currentFgColor = QColor(200, 150, 0);
-        currentBgColor = QColor(22, 22, 22);
+        currentFgColor = qRgb(200, 150, 0);
+        currentBgColor = consoleBgColor.rgba();
         currentFlags = TChar::None;
         // We are no longer before the first span - so we need to flag that
         // there will be one to close:
@@ -3338,59 +6811,109 @@ QString TBuffer::bufferToHtml(const bool showTimeStamp /*= false*/, const int ro
         s.append(qsl("<span>%1").arg(QString(spacePadding, QChar::Space)));
     }
 
-    for (auto cookedPos = static_cast<unsigned long>(pos); pos < lastPos; ++cookedPos, ++pos) {
+    const std::vector<TChar>& lineChars = buffer.at(cookedRow);
+    const QString& lineText = lineBuffer.at(row);
+    // Text is read in runs straight from the QString, so never past its end
+    lastPos = std::min(lastPos, static_cast<int>(lineText.size()));
+    const bool enableBlink = (mpHost != nullptr) && mpHost->getEnableBlinkText();
+    int textRunStart = pos;
+    for (; pos < lastPos; ++pos) {
+        const TChar& ch = lineChars[static_cast<size_t>(pos)];
+        const int charLinkIndex = ch.linkIndex();
+        QRgb charBgColor = ch.backgroundRgba();
+        if (qAlpha(charBgColor) == 0) {
+            // A transparent cell (e.g. a system message) has no colour of its
+            // own on screen - it shows the console's background through it -
+            // so fall back to that rather than exporting alpha-0 as black.
+            charBgColor = consoleBgColor.rgba();
+        }
         // Do we need to start a new span?
-        if (firstSpan
-            || buffer.at(cookedRow).at(cookedPos).mFgColor != currentFgColor
-            || buffer.at(cookedRow).at(cookedPos).mBgColor != currentBgColor
-            || (buffer.at(cookedRow).at(cookedPos).mFlags & TChar::TestMask) != currentFlags) {
-
+        if (firstSpan || ch.foregroundRgba() != currentFgColor || charBgColor != currentBgColor || (ch.mFlags & TChar::TestMask) != currentFlags || charLinkIndex != currentLinkIndex) {
+            appendHtmlEscaped(s, lineText.constData() + textRunStart, pos - textRunStart);
+            textRunStart = pos;
             if (firstSpan) {
                 firstSpan = false; // The first span - won't need to close the previous one
             } else {
                 s.append(QLatin1String("</span>"));
             }
-            currentFgColor = buffer.at(cookedRow).at(cookedPos).mFgColor;
-            currentBgColor = buffer.at(cookedRow).at(cookedPos).mBgColor;
-            currentFlags = buffer.at(cookedRow).at(cookedPos).mFlags & TChar::TestMask;
+            currentFgColor = ch.foregroundRgba();
+            currentBgColor = charBgColor;
+            currentFlags = ch.mFlags & TChar::TestMask;
+            currentLinkIndex = charLinkIndex;
 
             // clang-format off
-            if (currentFlags & TChar::Reverse) {
-                // Swap the fore and background colours:
-                s.append(qsl("<span style=\"color: rgb(%1,%2,%3); background: rgb(%4,%5,%6); %7%8%9\">")
-                         .arg(QString::number(currentBgColor.red()), QString::number(currentBgColor.green()), QString::number(currentBgColor.blue()), // args 1 to 3
-                              QString::number(currentFgColor.red()), QString::number(currentFgColor.green()), QString::number(currentFgColor.blue()), // args 4 to 6
-                              currentFlags & TChar::Bold ? QLatin1String(" font-weight: bold;") : QString(), // arg 7
-                              currentFlags & TChar::Italic ? QLatin1String(" font-style: italic;") : QString(), // arg 8
-                              currentFlags & (TChar::Underline | TChar::StrikeOut | TChar::Overline ) // remainder is arg 9
-                              ? qsl(" text-decoration:%1%2%3")
-                                .arg(currentFlags & TChar::Underline ? QLatin1String(" underline") : QString(),
-                                     currentFlags & TChar::StrikeOut ? QLatin1String(" line-through") : QString(),
-                                     currentFlags & TChar::Overline ? QLatin1String(" overline") : QString())
-                              : QString()));
-            } else {
-                s.append(qsl("<span style=\"color: rgb(%1,%2,%3); background: rgb(%4,%5,%6); %7%8%9\">")
-                         .arg(QString::number(currentFgColor.red()), QString::number(currentFgColor.green()), QString::number(currentFgColor.blue()), // args 1 to 3
-                              QString::number(currentBgColor.red()), QString::number(currentBgColor.green()), QString::number(currentBgColor.blue()), // args 4 to 6
-                              currentFlags & TChar::Bold ? QLatin1String(" font-weight: bold;") : QString(), // arg 7
-                              currentFlags & TChar::Italic ? QLatin1String(" font-style: italic;") : QString(), // arg 8
-                              currentFlags & (TChar::Underline | TChar::StrikeOut | TChar::Overline ) // remainder is arg 9
-                              ? qsl(" text-decoration:%1%2%3")
-                                .arg(currentFlags & TChar::Underline ? QLatin1String(" underline") : QString(),
-                                     currentFlags & TChar::StrikeOut ? QLatin1String(" line-through") : QString(),
-                                     currentFlags & TChar::Overline ? QLatin1String(" overline") : QString())
-                              : QString()));
+            // Build text-decoration CSS including decoration colors from TLinkStore
+            QString textDecorationCss;
+            if (currentFlags & (TChar::Underline | TChar::StrikeOut | TChar::Overline)) {
+                QString decorations;
+                if (currentFlags & TChar::Underline) {
+                    decorations.append(QLatin1String(" underline"));
+                }
+                if (currentFlags & TChar::StrikeOut) {
+                    decorations.append(QLatin1String(" line-through"));
+                }
+                if (currentFlags & TChar::Overline) {
+                    decorations.append(QLatin1String(" overline"));
+                }
+                textDecorationCss = qsl(" text-decoration:%1;").arg(decorations);
+
+                // Look up decoration color from TLinkStore if available
+                if (currentLinkIndex > 0 && mLinkStore.hasStyling(currentLinkIndex)) {
+                    Mudlet::HyperlinkStyling styling = mLinkStore.getStyling(currentLinkIndex);
+                    styling.currentState = getLinkState(currentLinkIndex);
+                    Mudlet::HyperlinkStyling::StateStyle effectiveStyle = styling.getEffectiveStyle();
+
+                    // CSS text-decoration-color applies a single color to all
+                    // decoration lines, so pick the most visually prominent one
+                    // (underline > strikeout > overline). The render path in
+                    // drawCustomDecorations can apply each color independently.
+                    QColor decorationColor;
+                    bool hasDecorationColor = false;
+                    if (effectiveStyle.hasUnderlineColor && (currentFlags & TChar::Underline)) {
+                        decorationColor = effectiveStyle.underlineColor;
+                        hasDecorationColor = true;
+                    } else if (effectiveStyle.hasStrikeoutColor && (currentFlags & TChar::StrikeOut)) {
+                        decorationColor = effectiveStyle.strikeoutColor;
+                        hasDecorationColor = true;
+                    } else if (effectiveStyle.hasOverlineColor && (currentFlags & TChar::Overline)) {
+                        decorationColor = effectiveStyle.overlineColor;
+                        hasDecorationColor = true;
+                    }
+
+                    if (hasDecorationColor) {
+                        textDecorationCss.append(QLatin1StringView(" text-decoration-color: "));
+                        appendHtmlRgb(textDecorationCss, decorationColor.rgb());
+                        textDecorationCss.append(QLatin1Char(';'));
+                    }
+                }
             }
+
             // clang-format on
-        }
-        if (lineBuffer.at(row).at(pos) == QChar('<')) {
-            s.append(QLatin1String("&lt;"));
-        } else if (lineBuffer.at(row).at(pos) == QChar('>')) {
-            s.append("&gt;");
-        } else {
-            s.append(lineBuffer.at(row).at(pos));
+            s.append(QLatin1StringView("<span"));
+            if (enableBlink) {
+                if (currentFlags & TChar::FastBlink) {
+                    s.append(QLatin1StringView(" class='blink-fast'"));
+                } else if (currentFlags & TChar::Blink) {
+                    s.append(QLatin1StringView(" class='blink-slow'"));
+                }
+            }
+            const bool reverse = currentFlags.testFlag(TChar::Reverse);
+            s.append(QLatin1StringView(" style=\"color: "));
+            appendHtmlRgb(s, reverse ? currentBgColor : currentFgColor);
+            s.append(QLatin1StringView("; background: "));
+            appendHtmlRgb(s, reverse ? currentFgColor : currentBgColor);
+            s.append(QLatin1Char(';'));
+            if (currentFlags & TChar::Bold) {
+                s.append(QLatin1StringView(" font-weight: bold;"));
+            }
+            if (currentFlags & TChar::Italic) {
+                s.append(QLatin1StringView(" font-style: italic;"));
+            }
+            s.append(textDecorationCss);
+            s.append(QLatin1StringView("\">"));
         }
     }
+    appendHtmlEscaped(s, lineText.constData() + textRunStart, pos - textRunStart);
     if (!s.isEmpty()) {
         s.append(QLatin1String("</span>"));
         // Needed to balance the very first open <span>, but only if we have
@@ -3441,21 +6964,48 @@ bool TBuffer::processUtf8Sequence(const std::string& bufferData, const bool isFr
             utf8SequenceLength = 6;
         }
 
+        // A byte that is not a continuation byte cannot be part of this
+        // sequence, so the sequence ends malformed just before it - and that
+        // byte, which may be a line ending or the ESC opening a control
+        // sequence, is left for the caller to handle rather than taken with it:
+        const size_t available = std::min(utf8SequenceLength, len - pos);
+        for (size_t i = 1; i < available; ++i) {
+            if ((static_cast<quint8>(bufferData[pos + i]) & 0xC0) != 0x80) {
+#if defined(DEBUG_UTF8_PROCESSING)
+                qDebug().nospace() << "TBuffer::processUtf8Sequence(...) " << utf8SequenceLength << "-byte UTF-8 sequence cut short after " << i << " byte(s) by <" << Qt::hex
+                                   << static_cast<int>(static_cast<quint8>(bufferData.at(pos + i))) << Qt::dec << ">, rejected!";
+#endif
+                mMudLine.append(QChar::ReplacementCharacter);
+                pos += i - 1;
+                return true;
+            }
+        }
+
         if ((pos + utf8SequenceLength) > len) {
             // Not enough bytes left in bufferData to complete the utf-8
-            // sequence - need to save and prepend onto incoming data next
-            // time around.
-            // The absence of a second argument takes all the available
-            // bytes - this is only for data from the Server NOT from
-            // locally generated material from Lua feedTriggers(...)
+            // sequence. Everything the decoder was allowed to look at is taken
+            // - see decodableLength() for why that can stop short of the end of
+            // bufferData.
             if (isFromServer) {
+                // Save it to prepend onto the next packet:
 #if defined(DEBUG_UTF8_PROCESSING)
                 qDebug() << "TBuffer::processUtf8Sequence(...) Insufficient bytes in buffer to complete UTF-8 sequence, need:" << utf8SequenceLength
-                         << " but we currently only have: " << bufferData.substr(pos).length() << " bytes (which we will store for next call to this method)...";
+                         << " but we currently only have: " << bufferData.substr(pos, len - pos).length() << " bytes (which we will store for next call to this method)...";
 #endif
-                mIncompleteSequenceBytes = bufferData.substr(pos);
+                mIncompleteSequenceBytes = bufferData.substr(pos, len - pos);
+                return false; // Bail out
             }
-            return false; // Bail out
+
+            // Locally generated text, such as from Lua feedTriggers(...), is
+            // never continued by the next call, so this is the end of its
+            // input and the unfinished sequence is malformed:
+#if defined(DEBUG_UTF8_PROCESSING)
+            qDebug().nospace() << "TBuffer::processUtf8Sequence(...) " << utf8SequenceLength << "-byte UTF-8 sequence cut short after " << len - pos
+                               << " byte(s) by the end of locally generated text, rejected!";
+#endif
+            mMudLine.append(QChar::ReplacementCharacter);
+            pos = len - 1;
+            return true;
         }
 
         // If we have got here we have enough bytes to work with:
@@ -3464,26 +7014,20 @@ bool TBuffer::processUtf8Sequence(const std::string& bufferData, const bool isFr
         bool isToUseByteOrderMark = false; // When BOM seen in stream it transcodes as zero characters
         switch (utf8SequenceLength) {
         case 4:
-            if ((bufferData.at(pos + 3) & 0xC0) != 0x80) {
-#if defined(DEBUG_UTF8_PROCESSING)
-                qDebug() << "TBuffer::processUtf8Sequence(...) 4th byte in UTF-8 sequence is invalid!";
-#endif
-                isValid = false;
-                isToUseReplacementMark = true;
-            } else if (((bufferData.at(pos) & 0x07) > 0x04) || (((bufferData.at(pos) & 0x07) == 0x04) && ((bufferData.at(pos + 1) & 0x3F) > 0x0F))) {
-// For 4 byte values the bits are distributed:
-//  Byte 1    Byte 2    Byte 3    Byte 4
-// 11110ABC  10DEFGHI  10JKLMNO  10PQRSTU   A is MSB
-// U+10FFFF in binary is: 1 0000 1111 1111 1111 1111
-// So this (the maximum valid character) is:
-//      ABC    DEFGHI    JKLMNO    PQRSTU
-//      100    001111    111111    111111
-// So if the first byte bufferData.at(pos] & 0x07 is:
-//  < 0x04 then must be in range
-//  > 0x04 then must be out of range
-// == 0x04 then consider bufferData.at(pos+1] & 0x3F:
-//     <= 001111 0x0F then must be in range
-//      > 001111 0x0F then must be out of range
+            if (((bufferData.at(pos) & 0x07) > 0x04) || (((bufferData.at(pos) & 0x07) == 0x04) && ((bufferData.at(pos + 1) & 0x3F) > 0x0F))) {
+                // For 4 byte values the bits are distributed:
+                //  Byte 1    Byte 2    Byte 3    Byte 4
+                // 11110ABC  10DEFGHI  10JKLMNO  10PQRSTU   A is MSB
+                // U+10FFFF in binary is: 1 0000 1111 1111 1111 1111
+                // So this (the maximum valid character) is:
+                //      ABC    DEFGHI    JKLMNO    PQRSTU
+                //      100    001111    111111    111111
+                // So if the first byte bufferData.at(pos] & 0x07 is:
+                //  < 0x04 then must be in range
+                //  > 0x04 then must be out of range
+                // == 0x04 then consider bufferData.at(pos+1] & 0x3F:
+                //     <= 001111 0x0F then must be in range
+                //      > 001111 0x0F then must be out of range
 
 #if defined(DEBUG_UTF8_PROCESSING)
                 qDebug() << "TBuffer::processUtf8Sequence(...) 4 byte UTF-8 sequence is valid but is beyond range of legal codepoints!";
@@ -3492,16 +7036,10 @@ bool TBuffer::processUtf8Sequence(const std::string& bufferData, const bool isFr
                 isToUseReplacementMark = true;
             }
 
-        // Fall-through
+            // Fall-through
             [[fallthrough]];
         case 3:
-            if ((bufferData.at(pos + 2) & 0xC0) != 0x80) {
-#if defined(DEBUG_UTF8_PROCESSING)
-                qDebug() << "TBuffer::processUtf8Sequence(...) 3rd byte in UTF-8 sequence is invalid!";
-#endif
-                isValid = false;
-                isToUseReplacementMark = true;
-            } else if ((bufferData.at(pos) & 0x0F) == 0x0D) {
+            if ((bufferData.at(pos) & 0x0F) == 0x0D && (bufferData.at(pos + 1) & 0x20) == 0x20) {
 // For 3 byte values the bits are distributed:
 //  Byte 1    Byte 2    Byte 3
 // 1110ABCD  10DEFGHI  10JKLMNO   A is MSB
@@ -3528,18 +7066,24 @@ bool TBuffer::processUtf8Sequence(const std::string& bufferData, const bool isFr
     * followed by a low surrogate). The majority of UTF-16 encoder and decoder
     * implementations translate between encodings as though this were the case
     * and Windows allows such sequences in filenames."
+    *
+    * So test for and, considering the LS Nibble of first byte:
+    * * accept if LS Nibble of first byte is             less than 0xD
+    * * accept if LS Nibble of first byte is greater than/equal to 0xE
+    * * otherwise (if LS Nibble of first byte IS 0xD)
+    *   * accept if 6 LS Bits of second byte is 0x1F of or less
+    * Conversely this can be stated as:
+    * * reject if LS Nibble of first byte is 0xD AND 6th MS Bit of second byte is set
     */
-// So test for and reject if LSN of first byte is 0xD!
 #if defined(DEBUG_UTF8_PROCESSING)
                 qDebug() << "TBuffer::processUtf8Sequence(...) 3 byte UTF-8 sequence is a High or Low UTF-16 Surrogate and is not valid in UTF-8!";
 #endif
                 isValid = false;
                 isToUseReplacementMark = true;
-            } else if (   (static_cast<quint8>(bufferData.at(pos + 2)) == 0xBF)
-                       && (static_cast<quint8>(bufferData.at(pos + 1)) == 0xBB)
-                       && (static_cast<quint8>(bufferData.at(pos    )) == 0xEF)) {
-// Got caught out by this one - it is the UTF-8 BOM and
-// needs to be ignored as it transcodes to NO codepoints!
+            } else if ((static_cast<quint8>(bufferData.at(pos + 2)) == 0xBF) && (static_cast<quint8>(bufferData.at(pos + 1)) == 0xBB) && (static_cast<quint8>(bufferData.at(pos)) == 0xEF)) {
+                // Got caught out by this one - it is the UTF-8 BOM (or
+                // Zero-Width No-Break Space) and needs to be detected specially
+                // as Qt's codec ignores it and transcodes it to NO codepoints!
 #if defined(DEBUG_UTF8_PROCESSING)
                 qDebug() << "TBuffer::processUtf8Sequence(...) UTF-8 BOM sequence seen and handled!";
 #endif
@@ -3547,27 +7091,21 @@ bool TBuffer::processUtf8Sequence(const std::string& bufferData, const bool isFr
                 isToUseByteOrderMark = true;
             }
 
-        // Fall-through
+            // Fall-through
             [[fallthrough]];
-        case 2:
-            if ((static_cast<quint8>(bufferData.at(pos + 1)) & 0xC0) != 0x80) {
-#if defined(DEBUG_UTF8_PROCESSING)
-                qDebug() << "TBuffer::processUtf8Sequence(...) 2nd byte in UTF-8 sequence is invalid!";
-#endif
-                isValid = false;
-                isToUseReplacementMark = true;
-            }
+        case 2: {
+            // Test for (and reject) overlong sequences - 5 and 6 byte ones do
+            // not get here, the default case rejects them
+            const auto firstByte = static_cast<quint8>(bufferData.at(pos));
+            const auto secondByte = static_cast<quint8>(bufferData.at(pos + 1));
+            // Overlong 2-byte: C0/C1 xx (could be encoded in 1 byte)
+            const bool twoByteOverlong = (firstByte & 0xFE) == 0xC0;
+            // Overlong 3-byte: E0 80-9F xx (could be encoded in 2 bytes)
+            const bool threeByteOverlong = (firstByte == 0xE0) && ((secondByte & 0xE0) == 0x80);
+            // Overlong 4-byte: F0 80-8F xx xx (could be encoded in 3 bytes)
+            const bool fourByteOverlong = (firstByte == 0xF0) && ((secondByte & 0xF0) == 0x80);
 
-            // clang-format off
-            // Disable code reformatting as it would destroy layout that helps
-            // to explain the grouping of the tests
-            // Also test for (and reject) overlong sequences - don't
-            // need to check 5 or 6 ones as those are already rejected:
-            if (  ( ((static_cast<quint8>(bufferData.at(pos    )) & 0xFE) == 0xC0) && ( ( static_cast<quint8>(bufferData.at(pos + 1)) & 0xC0) == 0x80) )
-                ||( ( static_cast<quint8>(bufferData.at(pos    )        ) == 0xE0) && ( ( static_cast<quint8>(bufferData.at(pos + 1)) & 0xE0) == 0x80) )
-                ||( ( static_cast<quint8>(bufferData.at(pos    )        ) == 0xF0) && ( ( static_cast<quint8>(bufferData.at(pos + 1)) & 0xF0) == 0x80) ) ) {
-// clang-format on
-
+            if (twoByteOverlong || threeByteOverlong || fourByteOverlong) {
 #if defined(DEBUG_UTF8_PROCESSING)
                 qDebug().nospace() << "TBuffer::processUtf8Sequence(...) Overlong " << utf8SequenceLength << "-byte sequence as UTF-8 rejected!";
 #endif
@@ -3575,6 +7113,7 @@ bool TBuffer::processUtf8Sequence(const std::string& bufferData, const bool isFr
                 isToUseReplacementMark = true;
             }
             break;
+        }
 
         default:
 #if defined(DEBUG_UTF8_PROCESSING)
@@ -3586,31 +7125,23 @@ bool TBuffer::processUtf8Sequence(const std::string& bufferData, const bool isFr
 
         // Will be one (BMP codepoint) or two (non-BMP codepoints) QChar(s)
         if (isValid) {
-            const QString codePoint = QString(bufferData.substr(pos, utf8SequenceLength).c_str());
-            switch (codePoint.size()) {
-            default:
-                Q_UNREACHABLE(); // This can't happen, unless we got start or length wrong in std::string::substr()
-                qWarning().nospace() << "TBuffer::processUtf8Sequence(...) " << utf8SequenceLength << "-byte UTF-8 sequence accepted, and it encoded to " << codePoint.size()
-                                     << " QChars which does not make sense!!!";
-                isValid = false;
-                isToUseReplacementMark = true;
-                break;
-            case 2:
-                isNonBMPCharacter = true;
-                // Fall-through
-                [[fallthrough]];
-            case 1:
+            // Every malformation (bad continuation, overlong, surrogate, past U+10FFFF, 5/6 bytes, BOM) was
+            // rejected above, so gather the bits directly rather than build a QString per character:
+            char32_t codePoint = static_cast<quint8>(bufferData.at(pos)) & (utf8SequenceLength == 2 ? 0x1F : (utf8SequenceLength == 3 ? 0x0F : 0x07));
+            for (size_t i = 1; i < utf8SequenceLength; ++i) {
+                codePoint = (codePoint << 6) | (static_cast<quint8>(bufferData.at(pos + i)) & 0x3F);
+            }
+            const bool nonBMP = QChar::requiresSurrogates(codePoint);
 #if defined(DEBUG_UTF8_PROCESSING)
-                qDebug().nospace() << "TBuffer::processUtf8Sequence(...) " << utf8SequenceLength << "-byte UTF-8 sequence accepted, it was " << codePoint.size() << " QChar(s) long [" << codePoint
-                                   << "]";
+            qDebug().nospace() << "TBuffer::processUtf8Sequence(...) " << utf8SequenceLength << "-byte UTF-8 sequence accepted, it was " << (nonBMP ? 2 : 1) << " QChar(s) long [U+" << Qt::hex
+                               << static_cast<quint32>(codePoint) << Qt::dec << "]";
 #endif
-                mMudLine.append(codePoint);
-                break;
-            case 0:
-                qWarning().nospace() << "TBuffer::processUtf8Sequence(...) " << utf8SequenceLength << "-byte UTF-8 sequence accepted, but it did not encode to "
-                                                                                                      "ANY QChar(s)!!!";
-                isValid = false;
-                isToUseReplacementMark = true;
+            if (nonBMP) {
+                isNonBMPCharacter = true;
+                mMudLine.append(QChar(QChar::highSurrogate(codePoint)));
+                mMudLine.append(QChar(QChar::lowSurrogate(codePoint)));
+            } else {
+                mMudLine.append(QChar(static_cast<char16_t>(codePoint)));
             }
         }
 
@@ -3642,15 +7173,15 @@ bool TBuffer::processUtf8Sequence(const std::string& bufferData, const bool isFr
 
 bool TBuffer::processGBSequence(const std::string& bufferData, const bool isFromServer, const bool isGB18030, const size_t len, size_t& pos, bool& isNonBmpCharacter)
 {
-// In GBK/GB18030 mode we have to process the data more than one byte at a
-// time because there is not necessarily a one-byte to one TChar
-// mapping, instead we use one TChar per QChar - and that has to be
-// tweaked for non-BMP characters that use TWO QChars per codepoint.
-// GB2312 is the predecessor to both and - according to Wikipedia (EN) covers
-// over 99% of the characters of contemporary usage.
-// GBK is a sub-set of GB18030 so can be processed in the same method
-// Assume we are at the first byte of a single (ASCII), pair (GBK/GB18030)
-// or four byte (GB18030) sequence
+    // In GBK/GB18030 mode we have to process the data more than one byte at a
+    // time because there is not necessarily a one-byte to one TChar
+    // mapping, instead we use one TChar per QChar - and that has to be
+    // tweaked for non-BMP characters that use TWO QChars per codepoint.
+    // GB2312 is the predecessor to both and - according to Wikipedia (EN) covers
+    // over 99% of the characters of contemporary usage.
+    // GBK is a sub-set of GB18030 so can be processed in the same method
+    // Assume we are at the first byte of a single (ASCII), pair (GBK/GB18030)
+    // or four byte (GB18030) sequence
 
 #if defined(DEBUG_GB_PROCESSING)
     std::string dataIdentity;
@@ -3671,7 +7202,7 @@ bool TBuffer::processGBSequence(const std::string& bufferData, const bool isFrom
         // there is no need to tweak pos in THIS case
 
         return true;
-    } else if (static_cast<quint8>(bufferData.at(pos)) == 0x80) {
+    } else if (static_cast<quint8>(bufferData.at(pos)) == 0x80) { // NOLINT(readability-else-after-return)
         // Invalid as first byte
         isValid = false;
         isToUseReplacementMark = true;
@@ -3688,99 +7219,76 @@ bool TBuffer::processGBSequence(const std::string& bufferData, const bool isFrom
         if ((pos + gbSequenceLength - 1) < len) {
             // We have enough bytes to look at the second one - let's see which
             // range it is in:
-            // clang-format off
-            if        (  (static_cast<quint8>(bufferData.at(pos    )) >= 0x81) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xA0)
-                      && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0x40) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0xFE)
-                      && (static_cast<quint8>(bufferData.at(pos + 1)) != 0x7F) ) {
-// clang-format on
-// GBK Area 3 sequence
+            const auto byte1 = static_cast<quint8>(bufferData.at(pos));
+            const auto byte2 = static_cast<quint8>(bufferData.at(pos + 1));
 
+            // GBK Area 3: byte1 81-A0, byte2 40-FE (excluding 7F)
+            const bool gbkArea3 = (byte1 >= 0x81) && (byte1 <= 0xA0) && (byte2 >= 0x40) && (byte2 <= 0xFE) && (byte2 != 0x7F);
+            // GBK Area 1 (& GB2312): byte1 A1-A9, byte2 A1-FE
+            const bool gbkArea1 = (byte1 >= 0xA1) && (byte1 <= 0xA9) && (byte2 >= 0xA1) && (byte2 <= 0xFE);
+            // GBK Area 2 (& GB2312): byte1 B0-F7, byte2 A1-FE
+            const bool gbkArea2 = (byte1 >= 0xB0) && (byte1 <= 0xF7) && (byte2 >= 0xA1) && (byte2 <= 0xFE);
+            // GBK Area 5: byte1 A8-A9, byte2 40-A0 (excluding 7F)
+            const bool gbkArea5 = (byte1 >= 0xA8) && (byte1 <= 0xA9) && (byte2 >= 0x40) && (byte2 <= 0xA0) && (byte2 != 0x7F);
+            // GBK Area 4: byte1 AA-FE, byte2 40-A0 (excluding 7F)
+            const bool gbkArea4 = (byte1 >= 0xAA) && (byte1 <= 0xFE) && (byte2 >= 0x40) && (byte2 <= 0xA0) && (byte2 != 0x7F);
+            // User Defined (PU) Area 1: byte1 AA-AF, byte2 A1-FE
+            const bool userArea1 = (byte1 >= 0xAA) && (byte1 <= 0xAF) && (byte2 >= 0xA1) && (byte2 <= 0xFE);
+            // User Defined (PU) Area 2: byte1 F8-FE, byte2 A1-FE
+            const bool userArea2 = (byte1 >= 0xF8) && (byte1 <= 0xFE) && (byte2 >= 0xA1) && (byte2 <= 0xFE);
+            // User Defined (PU) Area 3: byte1 A1-A7, byte2 A1-FE (excluding 7F)
+            const bool userArea3 = (byte1 >= 0xA1) && (byte1 <= 0xA7) && (byte2 >= 0xA1) && (byte2 <= 0xFE) && (byte2 != 0x7F);
+            // Looks like first pair of 4-byte GB18030 non-BMP sequence: byte1 90-E3, byte2 30-39
+            const bool looksLikeGB18030NonBMP = (byte1 >= 0x90) && (byte1 <= 0xE3) && (byte2 >= 0x30) && (byte2 <= 0x39);
+            // Looks like first pair of 4-byte GB18030 Private Use sequence: byte1 FD-FE, byte2 30-39
+            const bool looksLikeGB18030PrivateUse = (byte1 >= 0xFD) && (byte1 <= 0xFE) && (byte2 >= 0x30) && (byte2 <= 0x39);
+
+            if (gbkArea3) {
+                // GBK Area 3 sequence
 #if defined(DEBUG_GB_PROCESSING)
                 dataIdentity = "GBK Area 3";
 #endif
-
-                // clang-format off
-            } else if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0xA1) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xA9)
-                      && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0xA1) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0xFE) ) {
-// clang-format on
-// GBK Area 1 (& GB2312) sequence
-
+            } else if (gbkArea1) {
+                // GBK Area 1 (& GB2312) sequence
 #if defined(DEBUG_GB_PROCESSING)
                 dataIdentity = "GBK Area 1 (or GB2312)";
 #endif
-
-                // clang-format off
-            } else if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0xB0) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xF7)
-                      && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0xA1) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0xFE) ) {
-// clang-format on
-// GBK Area 2 (& GB2312) sequence
-
+            } else if (gbkArea2) {
+                // GBK Area 2 (& GB2312) sequence
 #if defined(DEBUG_GB_PROCESSING)
                 dataIdentity = "GBK Area 2 (or GB2312)";
 #endif
-
-                // clang-format off
-            } else if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0xA8) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xA9)
-                      && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0x40) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0xA0)
-                      && (static_cast<quint8>(bufferData.at(pos + 1)) != 0x7F) ) {
-// clang-format on
-// GBK/5 sequence
-
+            } else if (gbkArea5) {
+                // GBK/5 sequence
 #if defined(DEBUG_GB_PROCESSING)
                 dataIdentity = "GBK Area 5";
 #endif
-
-                // clang-format off
-            } else if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0xAA) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xFE)
-                      && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0x40) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0xA0)
-                      && (static_cast<quint8>(bufferData.at(pos + 1)) != 0x7F) ) {
-// clang-format on
-// GBK/4 sequence
-
+            } else if (gbkArea4) {
+                // GBK/4 sequence
 #if defined(DEBUG_GB_PROCESSING)
                 dataIdentity = "GBK Area 4";
 #endif
-
-                // clang-format off
-            } else if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0xAA) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xAF)
-                      && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0xA1) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0xFE) ) {
-// clang-format on
-// User Defined 1 sequence - possibly invalid for us but if the
-// MUD supplies their own font it could be used:
-
+            } else if (userArea1) {
+                // User Defined 1 sequence - possibly invalid for us but if the
+                // MUD supplies their own font it could be used:
 #if defined(DEBUG_GB_PROCESSING)
                 dataIdentity = "User Defined (PU) Area 1";
 #endif
-
-                // clang-format off
-            } else if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0xF8) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xFE)
-                      && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0xA1) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0xFE) ) {
-// clang-format on
-// User Defined 2 sequence - possibly invalid for us but if the
-// MUD supplies their own font it could be used:
-
+            } else if (userArea2) {
+                // User Defined 2 sequence - possibly invalid for us but if the
+                // MUD supplies their own font it could be used:
 #if defined(DEBUG_GB_PROCESSING)
                 dataIdentity = "User Defined (PU) Area 2";
 #endif
-
-                // clang-format off
-            } else if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0xA1) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xA7)
-                      && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0xA1) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0xFE)
-                      && (static_cast<quint8>(bufferData.at(pos + 1)) != 0x7F) ) {
-// clang-format on
-// User Defined 3 sequence - possibly invalid for us but if the
-// MUD supplies their own font it could be used:
-
+            } else if (userArea3) {
+                // User Defined 3 sequence - possibly invalid for us but if the
+                // MUD supplies their own font it could be used:
 #if defined(DEBUG_GB_PROCESSING)
                 dataIdentity = "User Defined (PU) Area 3";
 #endif
-
-                // clang-format off
-            } else if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0x90) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xE3)
-                      && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0x30) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0x39) ) {
-// clang-format on
-// First two bytes of a 4-byte GB18030 sequence - for a non-BMP mapped Unicode
-// codepoint if byte 3 is within 0x81-00xFE and byte 4 is within 0x30-0x39
+            } else if (looksLikeGB18030NonBMP) {
+                // First two bytes of a 4-byte GB18030 sequence - for a non-BMP mapped Unicode
+                // codepoint if byte 3 is within 0x81-0xFE and byte 4 is within 0x30-0x39
                 isValid = false;
                 isToUseReplacementMark = true;
 #if defined(DEBUG_GB_PROCESSING)
@@ -3788,12 +7296,9 @@ bool TBuffer::processGBSequence(const std::string& bufferData, const bool isFrom
                                       "GB2312/GBK rejected because it is seems to be the "
                                       "first pair of a 4-byte GB18030 non-BMP Unicode sequence!";
 #endif
-                // clang-format off
-            } else if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0xFD) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xFE)
-                      && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0x30) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0x39) ) {
-// clang-format on
-// First two bytes of a 4-byte GB18030 sequence - for a non-BMP mapped Unicode
-// codepoint if byte 3 is within 0x81-00xFE and byte 4 is within 0x30-0x39
+            } else if (looksLikeGB18030PrivateUse) {
+                // First two bytes of a 4-byte GB18030 sequence - for a non-BMP mapped Unicode
+                // codepoint if byte 3 is within 0x81-0xFE and byte 4 is within 0x30-0x39
                 isValid = false;
                 isToUseReplacementMark = true;
 #if defined(DEBUG_GB_PROCESSING)
@@ -3803,7 +7308,6 @@ bool TBuffer::processGBSequence(const std::string& bufferData, const bool isFrom
 #endif
             } else {
                 // Outside expected ranges
-
                 isValid = false;
                 isToUseReplacementMark = true;
 #if defined(DEBUG_GB_PROCESSING)
@@ -3820,9 +7324,10 @@ bool TBuffer::processGBSequence(const std::string& bufferData, const bool isFrom
 #if defined(DEBUG_GB_PROCESSING)
                 qDebug().nospace() << "TBuffer::processGBSequence(...) Insufficient bytes in buffer to "
                                       "complete GB2312/GBK sequence, need at least: "
-                                   << gbSequenceLength << " but we currently only have: " << bufferData.substr(pos).length() << " bytes (which we will store for next call to this method)...";
+                                   << gbSequenceLength << " but we currently only have: " << bufferData.substr(pos, len - pos).length()
+                                   << " bytes (which we will store for next call to this method)...";
 #endif
-                mIncompleteSequenceBytes = bufferData.substr(pos);
+                mIncompleteSequenceBytes = bufferData.substr(pos, len - pos);
             }
             return false; // Bail out
         }
@@ -3838,12 +7343,14 @@ bool TBuffer::processGBSequence(const std::string& bufferData, const bool isFrom
         if ((pos + gbSequenceLength - 1) < len) {
             // We have enough bytes to look at the second one - let's see which
             // range it is in:
-            // clang-format off
-            if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0x81) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xFE)
-               && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0x30) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0x39) ) {
-                // clang-format on
-                // This IS a 4-byte sequence
+            const auto byte1 = static_cast<quint8>(bufferData.at(pos));
+            const auto byte2 = static_cast<quint8>(bufferData.at(pos + 1));
 
+            // Check if this is a 4-byte sequence: byte1 81-FE, byte2 30-39
+            const bool fourByteSequence = (byte1 >= 0x81) && (byte1 <= 0xFE) && (byte2 >= 0x30) && (byte2 <= 0x39);
+
+            if (fourByteSequence) {
+                // This IS a 4-byte sequence
                 gbSequenceLength = 4;
 
                 if ((pos + gbSequenceLength - 1) >= len) {
@@ -3852,26 +7359,27 @@ bool TBuffer::processGBSequence(const std::string& bufferData, const bool isFrom
 #if defined(DEBUG_GB_PROCESSING)
                         qDebug().nospace() << "TBuffer::processGBSequence(...) Insufficient bytes in buffer to "
                                               "complete GB18030 sequence, need at least: "
-                                           << gbSequenceLength << " but we currently only have: " << bufferData.substr(pos).length() << " bytes (which we will store for next call to this method)...";
+                                           << gbSequenceLength << " but we currently only have: " << bufferData.substr(pos, len - pos).length()
+                                           << " bytes (which we will store for next call to this method)...";
 #endif
-                        mIncompleteSequenceBytes = bufferData.substr(pos);
+                        mIncompleteSequenceBytes = bufferData.substr(pos, len - pos);
                     }
 
                     return false; // Bail out
                 }
 
-                // clang-format off
                 // Continue with four-byte sequence validation processing as we
                 // have all four bytes to work with:
-                if (   ((  /* 1st group low limit 0x81 is already done*/        (static_cast<quint8>(bufferData.at(pos    )) <= 0x84))
-                        ||((static_cast<quint8>(bufferData.at(pos)) >= 0x90) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xE3)))
-                    /*
-                     * Only the above 1st byte ranges are currently used - others are reserved
-                     * Second byte range is 0x30-0x39 for all and has already been checked
-                     */
-                    && (static_cast<quint8>(bufferData.at(pos + 2)) >= 0x81) && (static_cast<quint8>(bufferData.at(pos + 2)) <= 0xFE)
-                    && (static_cast<quint8>(bufferData.at(pos + 3)) >= 0x30) && (static_cast<quint8>(bufferData.at(pos + 3)) <= 0x39) ) {
+                const auto byte3 = static_cast<quint8>(bufferData.at(pos + 2));
+                const auto byte4 = static_cast<quint8>(bufferData.at(pos + 3));
 
+                // Valid 4-byte: byte1 in (81-84 or 90-E3), byte2 30-39 (already checked),
+                // byte3 81-FE, byte4 30-39
+                const bool byte1InValidRange = (byte1 <= 0x84) || ((byte1 >= 0x90) && (byte1 <= 0xE3));
+                const bool byte3Valid = (byte3 >= 0x81) && (byte3 <= 0xFE);
+                const bool byte4Valid = (byte4 >= 0x30) && (byte4 <= 0x39);
+
+                if (byte1InValidRange && byte3Valid && byte4Valid) {
                     // Okay we should have a valid four byte sequence now
 #if defined(DEBUG_GB_PROCESSING)
                     dataIdentity = "Non-BMP mapped Unicode";
@@ -3881,8 +7389,6 @@ bool TBuffer::processGBSequence(const std::string& bufferData, const bool isFrom
                     // unicode codepoint but it is academic as it is not
                     // currently defined as a valid codepoint value and will be
                     // substituted with the replacement character anyway:
-                    // clang-format on
-
                     isValid = false;
                     isToUseReplacementMark = true;
 
@@ -3897,96 +7403,69 @@ bool TBuffer::processGBSequence(const std::string& bufferData, const bool isFrom
             } else {
                 // Looks as though it is a two-byte sequence after all - so
                 // validate it as that:
-                // clang-format off
-                if        (  (static_cast<quint8>(bufferData.at(pos    )) >= 0x81) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xA0)
-                          && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0x40) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0xFE)
-                          && (static_cast<quint8>(bufferData.at(pos + 1)) != 0x7F) ) {
-                    // clang-format on
-                    // GBK/3 sequence
 
+                // GBK Area 3: byte1 81-A0, byte2 40-FE (excluding 7F)
+                const bool isGBKArea3 = (byte1 >= 0x81) && (byte1 <= 0xA0) && (byte2 >= 0x40) && (byte2 <= 0xFE) && (byte2 != 0x7F);
+                // GBK Area 1 (& GB2312): byte1 A1-A9, byte2 A1-FE
+                const bool isGBKArea1 = (byte1 >= 0xA1) && (byte1 <= 0xA9) && (byte2 >= 0xA1) && (byte2 <= 0xFE);
+                // GBK Area 2 (& GB2312): byte1 B0-F7, byte2 A1-FE
+                const bool isGBKArea2 = (byte1 >= 0xB0) && (byte1 <= 0xF7) && (byte2 >= 0xA1) && (byte2 <= 0xFE);
+                // GBK Area 5: byte1 A8-A9, byte2 40-A0 (excluding 7F)
+                const bool isGBKArea5 = (byte1 >= 0xA8) && (byte1 <= 0xA9) && (byte2 >= 0x40) && (byte2 <= 0xA0) && (byte2 != 0x7F);
+                // GBK Area 4: byte1 AA-FE, byte2 40-A0 (excluding 7F)
+                const bool isGBKArea4 = (byte1 >= 0xAA) && (byte1 <= 0xFE) && (byte2 >= 0x40) && (byte2 <= 0xA0) && (byte2 != 0x7F);
+                // User Defined (PU) Area 1: byte1 AA-AF, byte2 A1-FE
+                const bool isUserArea1 = (byte1 >= 0xAA) && (byte1 <= 0xAF) && (byte2 >= 0xA1) && (byte2 <= 0xFE);
+                // User Defined (PU) Area 2: byte1 F8-FE, byte2 A1-FE
+                const bool isUserArea2 = (byte1 >= 0xF8) && (byte1 <= 0xFE) && (byte2 >= 0xA1) && (byte2 <= 0xFE);
+                // User Defined (PU) Area 3: byte1 A1-A7, byte2 A1-FE (excluding 7F)
+                const bool isUserArea3 = (byte1 >= 0xA1) && (byte1 <= 0xA7) && (byte2 >= 0xA1) && (byte2 <= 0xFE) && (byte2 != 0x7F);
+
+                if (isGBKArea3) {
+                    // GBK/3 sequence
 #if defined(DEBUG_GB_PROCESSING)
                     dataIdentity = "GBK Area 3";
 #endif
-
-                // clang-format off
-                } else if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0xA1) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xA9)
-                          && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0xA1) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0xFE) ) {
-                    // clang-format on
+                } else if (isGBKArea1) {
                     // GBK/1 (& GB2312) sequence
-
 #if defined(DEBUG_GB_PROCESSING)
                     dataIdentity = "GBK Area 1";
 #endif
-
-                // clang-format off
-                } else if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0xB0) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xF7)
-                          && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0xA1) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0xFE) ) {
-                    // clang-format on
+                } else if (isGBKArea2) {
                     // GBK/2 (& GB2312) sequence
-
 #if defined(DEBUG_GB_PROCESSING)
                     dataIdentity = "GBK Area 2";
 #endif
-
-                // clang-format off
-                } else if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0xA8) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xA9)
-                          && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0x40) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0xA0)
-                          && (static_cast<quint8>(bufferData.at(pos + 1)) != 0x7F) ) {
-                    // clang-format on
+                } else if (isGBKArea5) {
                     // GBK/5 sequence
-
 #if defined(DEBUG_GB_PROCESSING)
                     dataIdentity = "GBK Area 5";
 #endif
-
-                // clang-format off
-                } else if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0xAA) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xFE)
-                          && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0x40) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0xA0)
-                          && (static_cast<quint8>(bufferData.at(pos + 1)) != 0x7F) ) {
-                    // clang-format on
+                } else if (isGBKArea4) {
                     // GBK/4 sequence
-
 #if defined(DEBUG_GB_PROCESSING)
                     dataIdentity = "GBK Area 4";
 #endif
-
-                // clang-format off
-                } else if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0xAA) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xAF)
-                          && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0xA1) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0xFE) ) {
-                    // clang-format on
+                } else if (isUserArea1) {
                     // User Defined 1 sequence - possibly invalid for us but if the
                     // MUD supplies their own font it could be used:
-
 #if defined(DEBUG_GB_PROCESSING)
                     dataIdentity = "User Defined (PU) Area 1";
 #endif
-
-                // clang-format off
-                } else if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0xF8) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xFE)
-                          && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0xA1) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0xFE) ) {
-                    // clang-format on
+                } else if (isUserArea2) {
                     // User Defined 2 sequence - possibly invalid for us but if the
                     // MUD supplies their own font it could be used:
-
 #if defined(DEBUG_GB_PROCESSING)
                     dataIdentity = "User Defined (PU) Area 2";
 #endif
-
-                // clang-format off
-                } else if (  (static_cast<quint8>(bufferData.at(pos    )) >= 0xA1) && (static_cast<quint8>(bufferData.at(pos    )) <= 0xA7)
-                          && (static_cast<quint8>(bufferData.at(pos + 1)) >= 0xA1) && (static_cast<quint8>(bufferData.at(pos + 1)) <= 0xFE)
-                          && (static_cast<quint8>(bufferData.at(pos + 1)) != 0x7F) ) {
-                    // clang-format on
+                } else if (isUserArea3) {
                     // User Defined 3 sequence - possibly invalid for us but if the
                     // MUD supplies their own font it could be used:
-
 #if defined(DEBUG_GB_PROCESSING)
                     dataIdentity = "User Defined (PU) Area 3";
 #endif
-
                 } else {
                     // Outside expected range
-
                     isValid = false;
                     isToUseReplacementMark = true;
 #if defined(DEBUG_GB_PROCESSING)
@@ -4003,11 +7482,10 @@ bool TBuffer::processGBSequence(const std::string& bufferData, const bool isFrom
             // we only have one - so store what we have and return
             if (isFromServer) {
 #if defined(DEBUG_GB_PROCESSING)
-                qDebug().nospace() << "TBuffer::processGBSequence(...) Insufficient bytes in buffer to complete GB18030 sequence, need at least:"
-                                   << gbSequenceLength << " but we currently only have: " << bufferData.substr(pos).length()
-                                   << " bytes (which we will store for next call to this method)...";
+                qDebug().nospace() << "TBuffer::processGBSequence(...) Insufficient bytes in buffer to complete GB18030 sequence, need at least:" << gbSequenceLength
+                                   << " but we currently only have: " << bufferData.substr(pos, len - pos).length() << " bytes (which we will store for next call to this method)...";
 #endif
-                mIncompleteSequenceBytes = bufferData.substr(pos);
+                mIncompleteSequenceBytes = bufferData.substr(pos, len - pos);
             }
             return false; // Bail out
         }
@@ -4021,13 +7499,10 @@ bool TBuffer::processGBSequence(const std::string& bufferData, const bool isFrom
         // decoder - and check number of codepoints returned
 
         QString codePoint;
-        if (mMainIncomingCodec) {
-            // Third argument is 0 to indicate we do NOT wish to store the state:
-            codePoint = mMainIncomingCodec->toUnicode(bufferData.substr(pos, gbSequenceLength).c_str(), static_cast<int>(gbSequenceLength),
-                                                      nullptr);
+        if (decodeMultibyteSequence(QByteArrayView(bufferData.data() + pos, gbSequenceLength), codePoint)) {
             switch (codePoint.size()) {
             default:
-                Q_UNREACHABLE(); // This can't happen, unless we got start or length wrong in std::string::substr()
+                Q_UNREACHABLE(); // This can't happen, unless we got pos or gbSequenceLength wrong
                 qWarning().nospace() << "TBuffer::processGBSequence(...) " << gbSequenceLength << "-byte " << (isGB18030 ? "GB18030" : "GB2312/GBK") << " sequence accepted, and it encoded to "
                                      << codePoint.size() << " QChars which does not make sense!!!";
                 isValid = false;
@@ -4035,7 +7510,7 @@ bool TBuffer::processGBSequence(const std::string& bufferData, const bool isFrom
                 break;
             case 2:
                 isNonBmpCharacter = true;
-            // Fall-through
+                // Fall-through
                 [[fallthrough]];
             case 1:
 #if defined(DEBUG_GB_PROCESSING)
@@ -4097,7 +7572,7 @@ bool TBuffer::processBig5Sequence(const std::string& bufferData, const bool isFr
         // there is no need to tweak pos in THIS case
 
         return true;
-    } else if (static_cast<quint8>(bufferData.at(pos)) == 0x80 || static_cast<quint8>(bufferData.at(pos)) > 0xFE) {
+    } else if (static_cast<quint8>(bufferData.at(pos)) == 0x80 || static_cast<quint8>(bufferData.at(pos)) > 0xFE) { // NOLINT(readability-else-after-return)
         // Invalid as first byte
         isValid = false;
         isToUseReplacementMark = true;
@@ -4113,12 +7588,13 @@ bool TBuffer::processBig5Sequence(const std::string& bufferData, const bool isFr
 #if defined(DEBUG_BIG5_PROCESSING)
                 qDebug().nospace() << "TBuffer::processBig5Sequence(...) Insufficient bytes in buffer to "
                                       "complete Big5 sequence, need at least: "
-                                   << big5SequenceLength << " but we currently only have: " << bufferData.substr(pos).length() << " bytes (which we will store for next call to this method)...";
+                                   << big5SequenceLength << " but we currently only have: " << bufferData.substr(pos, len - pos).length()
+                                   << " bytes (which we will store for next call to this method)...";
 #endif
-                mIncompleteSequenceBytes = bufferData.substr(pos);
+                mIncompleteSequenceBytes = bufferData.substr(pos, len - pos);
             }
             return false; // Bail out
-        } else {
+        } else {          // NOLINT(readability-else-after-return)
             // check if second byte range is valid
             auto val2 = static_cast<quint8>(bufferData.at(pos + 1));
             if (val2 < 0x40 || (val2 > 0x7E && val2 < 0xA1) || val2 > 0xFE) {
@@ -4127,7 +7603,6 @@ bool TBuffer::processBig5Sequence(const std::string& bufferData, const bool isFr
                 isToUseReplacementMark = true;
             }
         }
-
     }
 
     // At this point we know how many bytes to consume, and whether they are in
@@ -4138,39 +7613,36 @@ bool TBuffer::processBig5Sequence(const std::string& bufferData, const bool isFr
         // decoder - and check number of codepoints returned
 
         QString codePoint;
-        if (mMainIncomingCodec) {
-            // Third argument is 0 to indicate we do NOT wish to store the state:
-            codePoint = mMainIncomingCodec->toUnicode(bufferData.substr(pos, big5SequenceLength).c_str(), static_cast<int>(big5SequenceLength),
-                                                      nullptr);
+        if (decodeMultibyteSequence(QByteArrayView(bufferData.data() + pos, big5SequenceLength), codePoint)) {
             switch (codePoint.size()) {
-                default:
-                    Q_UNREACHABLE(); // This can't happen, unless we got start or length wrong in std::string::substr()
-                    qWarning().nospace() << "TBuffer::processBig5Sequence(...) " << big5SequenceLength << "-byte Big5 sequence accepted, and it encoded to "
-                                         << codePoint.size() << " QChars which does not make sense!!!";
+            default:
+                Q_UNREACHABLE(); // This can't happen, unless we got pos or big5SequenceLength wrong
+                qWarning().nospace() << "TBuffer::processBig5Sequence(...) " << big5SequenceLength << "-byte Big5 sequence accepted, and it encoded to " << codePoint.size()
+                                     << " QChars which does not make sense!!!";
+                isValid = false;
+                isToUseReplacementMark = true;
+                break;
+            case 2:
+                // Fall-through
+                [[fallthrough]];
+            case 1:
+                // If Qt's decoder found bad characters, update status flags to reflect that.
+                if (codePoint.contains(QChar::ReplacementCharacter)) {
                     isValid = false;
                     isToUseReplacementMark = true;
                     break;
-                case 2:
-                    // Fall-through
-                    [[fallthrough]];
-                case 1:
-                    // If Qt's decoder found bad characters, update status flags to reflect that.
-                    if (codePoint.contains(QChar::ReplacementCharacter)) {
-                        isValid = false;
-                        isToUseReplacementMark = true;
-                        break;
-                    }
+                }
 #if defined(DEBUG_BIG5_PROCESSING)
-                    qDebug().nospace() << "TBuffer::processBig5Sequence(...) " << big5SequenceLength << "-byte Big5 sequence accepted, it is " << codePoint.size()
-                                   << " QChar(s) long [" << codePoint << "] and is in the " << dataIdentity.c_str() << " range";
+                qDebug().nospace() << "TBuffer::processBig5Sequence(...) " << big5SequenceLength << "-byte Big5 sequence accepted, it is " << codePoint.size() << " QChar(s) long [" << codePoint
+                                   << "] and is in the " << dataIdentity.c_str() << " range";
 #endif
-                    mMudLine.append(codePoint);
-                    break;
-                case 0:
-                    qWarning().nospace() << "TBuffer::processBig5Sequence(...) " << big5SequenceLength << "-byte Big5"
-                                   << "sequence accepted, but it did not encode to ANY QChar(s)!!!";
-                    isValid = false;
-                    isToUseReplacementMark = true;
+                isNonBmpCharacter = codePoint.size() == 2;
+                mMudLine.append(codePoint);
+                break;
+            case 0:
+                qWarning().nospace() << "TBuffer::processBig5Sequence(...) " << big5SequenceLength << "-byte Big5" << "sequence accepted, but it did not encode to ANY QChar(s)!!!";
+                isValid = false;
+                isToUseReplacementMark = true;
             }
         } else {
             // Unable to decode it - no Qt decoder...!
@@ -4222,7 +7694,7 @@ bool TBuffer::processEUC_KRSequence(const std::string& bufferData, const bool is
         // there is no need to tweak pos in THIS case
 
         return true;
-    } else if (static_cast<quint8>(bufferData.at(pos)) < 0xA1 || static_cast<quint8>(bufferData.at(pos)) == 0xFF) {
+    } else if (static_cast<quint8>(bufferData.at(pos)) < 0xA1 || static_cast<quint8>(bufferData.at(pos)) == 0xFF) { // NOLINT(readability-else-after-return)
         // Invalid as first byte
         isValid = false;
         isToUseReplacementMark = true;
@@ -4236,23 +7708,23 @@ bool TBuffer::processEUC_KRSequence(const std::string& bufferData, const bool is
             // Not enough bytes to process yet - so store what we have and return
             if (isFromServer) {
 #if defined(DEBUG_EUC_KR_PROCESSING)
-                    qDebug().nospace() << "TBuffer::processEUC_KRSequence(...) Insufficient bytes in buffer to "
-                                          "complete EUC-KR sequence, need at least: "
-                                       << eucSequenceLength << " but we currently only have: " << bufferData.substr(pos).length() << " bytes (which we will store for next call to this method)...";
+                qDebug().nospace() << "TBuffer::processEUC_KRSequence(...) Insufficient bytes in buffer to "
+                                      "complete EUC-KR sequence, need at least: "
+                                   << eucSequenceLength << " but we currently only have: " << bufferData.substr(pos, len - pos).length()
+                                   << " bytes (which we will store for next call to this method)...";
 #endif
-                    mIncompleteSequenceBytes = bufferData.substr(pos);
+                mIncompleteSequenceBytes = bufferData.substr(pos, len - pos);
             }
             return false; // Bail out
-        } else {
+        } else {          // NOLINT(readability-else-after-return)
             // check if second byte range is valid
             auto val2 = static_cast<quint8>(bufferData.at(pos + 1));
             if (val2 < 0xA1 || val2 == 0xFF) {
-                    // second byte range is invalid
-                    isValid = false;
-                    isToUseReplacementMark = true;
+                // second byte range is invalid
+                isValid = false;
+                isToUseReplacementMark = true;
             }
         }
-
     }
 
     // At this point we know how many bytes to consume, and whether they are in
@@ -4263,39 +7735,36 @@ bool TBuffer::processEUC_KRSequence(const std::string& bufferData, const bool is
         // decoder - and check number of codepoints returned
 
         QString codePoint;
-        if (mMainIncomingCodec) {
-            // Third argument is 0 to indicate we do NOT wish to store the state:
-            codePoint = mMainIncomingCodec->toUnicode(bufferData.substr(pos, eucSequenceLength).c_str(), static_cast<int>(eucSequenceLength),
-                                                      nullptr);
+        if (decodeMultibyteSequence(QByteArrayView(bufferData.data() + pos, eucSequenceLength), codePoint)) {
             switch (codePoint.size()) {
             default:
-                    Q_UNREACHABLE(); // This can't happen, unless we got start or length wrong in std::string::substr()
-                    qWarning().nospace() << "TBuffer::processEUC_KRSequence(...) " << eucSequenceLength << "-byte EUC-KR sequence accepted, and it encoded to "
-                                         << codePoint.size() << " QChars which does not make sense!!!";
-                    isValid = false;
-                    isToUseReplacementMark = true;
-                    break;
+                Q_UNREACHABLE(); // This can't happen, unless we got pos or eucSequenceLength wrong
+                qWarning().nospace() << "TBuffer::processEUC_KRSequence(...) " << eucSequenceLength << "-byte EUC-KR sequence accepted, and it encoded to " << codePoint.size()
+                                     << " QChars which does not make sense!!!";
+                isValid = false;
+                isToUseReplacementMark = true;
+                break;
             case 2:
-                    // Fall-through
-                    [[fallthrough]];
+                // Fall-through
+                [[fallthrough]];
             case 1:
-                    // If Qt's decoder found bad characters, update status flags to reflect that.
-                    if (codePoint.contains(QChar::ReplacementCharacter)) {
-                        isValid = false;
-                        isToUseReplacementMark = true;
-                        break;
-                    }
-#if defined(DEBUG_EUC_KR_PROCESSING)
-                    qDebug().nospace() << "TBuffer::processEUC_KRSequence(...) " << eucSequenceLength << "-byte EUC-KR sequence accepted, it is " << codePoint.size()
-                                       << " QChar(s) long [" << codePoint << "] and is in the " << dataIdentity.c_str() << " range";
-#endif
-                    mMudLine.append(codePoint);
-                    break;
-            case 0:
-                    qWarning().nospace() << "TBuffer::processEUC_KRSequence(...) " << eucSequenceLength << "-byte EUC-KR"
-                                         << "sequence accepted, but it did not encode to ANY QChar(s)!!!";
+                // If Qt's decoder found bad characters, update status flags to reflect that.
+                if (codePoint.contains(QChar::ReplacementCharacter)) {
                     isValid = false;
                     isToUseReplacementMark = true;
+                    break;
+                }
+#if defined(DEBUG_EUC_KR_PROCESSING)
+                qDebug().nospace() << "TBuffer::processEUC_KRSequence(...) " << eucSequenceLength << "-byte EUC-KR sequence accepted, it is " << codePoint.size() << " QChar(s) long [" << codePoint
+                                   << "] and is in the " << dataIdentity.c_str() << " range";
+#endif
+                isNonBmpCharacter = codePoint.size() == 2;
+                mMudLine.append(codePoint);
+                break;
+            case 0:
+                qWarning().nospace() << "TBuffer::processEUC_KRSequence(...) " << eucSequenceLength << "-byte EUC-KR" << "sequence accepted, but it did not encode to ANY QChar(s)!!!";
+                isValid = false;
+                isToUseReplacementMark = true;
             }
         } else {
             // Unable to decode it - no Qt decoder...!
@@ -4327,21 +7796,69 @@ bool TBuffer::processEUC_KRSequence(const std::string& bufferData, const bool is
     return true;
 }
 
+TBuffer::Decoder TBuffer::decoderFor(const QByteArray& encoding)
+{
+    if (encoding == "UTF-8") {
+        return Decoder::Utf8;
+    }
+    if (encoding == "ISO 8859-1") {
+        return Decoder::Latin1;
+    }
+    if (encoding == "GBK") {
+        return Decoder::Gbk;
+    }
+    if (encoding == "GB18030") {
+        return Decoder::Gb18030;
+    }
+    if (encoding == "EUC-KR") {
+        return Decoder::EucKr;
+    }
+    if (encoding == "BIG5" || encoding == "BIG5-HKSCS") {
+        return Decoder::Big5;
+    }
+    return Decoder::Ascii;
+}
+
+QStringDecoder TBuffer::multibyteDecoderFor(const Decoder decoder, const QByteArray& encoding)
+{
+    switch (decoder) {
+    case Decoder::Gbk:
+    case Decoder::Gb18030:
+    case Decoder::EucKr:
+    case Decoder::Big5:
+        return QStringDecoder(encoding.constData());
+    default:
+        return {};
+    }
+}
+
+// Falls back to TEncodingHelper (lookup tables, Qt5Compat codecs) for Qt builds without ICU
+bool TBuffer::decodeMultibyteSequence(QByteArrayView bytes, QString& decoded)
+{
+    if (mMultibyteDecoder.isValid()) {
+        mMultibyteDecoder.resetState();
+        decoded = mMultibyteDecoder.decode(bytes);
+        return true;
+    }
+    if (!TEncodingHelper::isEncodingAvailable(mEncoding)) {
+        return false;
+    }
+    decoded = TEncodingHelper::decode(bytes.toByteArray(), mEncoding);
+    return true;
+}
+
 void TBuffer::encodingChanged(const QByteArray& newEncoding)
 {
     if (mEncoding != newEncoding) {
         mEncoding = newEncoding;
+        mDecoder = decoderFor(mEncoding);
+        mMultibyteDecoder = multibyteDecoderFor(mDecoder, mEncoding);
         if (mEncoding == "GBK" || mEncoding == "GB18030" || mEncoding == "BIG5" || mEncoding == "BIG5-HKSCS" || mEncoding == "EUC-KR") {
-            mMainIncomingCodec = QTextCodec::codecForName(mEncoding);
-            if (!mMainIncomingCodec) {
+            if (!TEncodingHelper::isEncodingAvailable(mEncoding)) {
                 qCritical().nospace() << "encodingChanged(" << newEncoding << ") ERROR: This encoding cannot be handled as a required codec was not found in the system!";
             } else {
-                qDebug().nospace() << "encodingChanged(" << newEncoding << ") INFO: Installing a codec that can handle:" << mMainIncomingCodec->aliases();
+                qDebug().nospace() << "encodingChanged(" << newEncoding << ") INFO: Encoding is available and will be used.";
             }
-        } else if (mMainIncomingCodec) {
-            qDebug().nospace() << "encodingChanged(" << newEncoding << ") INFO: Uninstall a codec that can handle:" << mMainIncomingCodec->aliases() << " as the new encoding setting of: "
-                               << mEncoding << " does not need a dedicated one explicitly set...";
-            mMainIncomingCodec = nullptr;
         }
     }
 }
@@ -4365,7 +7882,7 @@ int TBuffer::lengthInGraphemes(const QString& text)
 
 const QList<QByteArray> TBuffer::getEncodingNames()
 {
-     return csmEncodingTable.getEncodingNames();
+    return csmEncodingTable.getEncodingNames();
 }
 
 void TBuffer::clearSearchHighlights()
@@ -4374,5 +7891,1029 @@ void TBuffer::clearSearchHighlights()
         for (auto& character : line) {
             character.mFlags &= ~TChar::AttributeFlag::Found;
         }
+    }
+}
+
+void TBuffer::injectOSC8DocumentationExamples()
+{
+    // Inject OSC 8 hyperlink examples - concise, progressive, matching wiki docs
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] injectOSC8DocumentationExamples() called";
+#endif
+
+    QString output = "\n";
+    output += "╔══════════════════════════════════════════════════════════════════════╗\n";
+    output += "║              OSC 8 Hyperlink Examples - Try them all!                ║\n";
+    output += "╚══════════════════════════════════════════════════════════════════════╝\n\n";
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 1. FUNDAMENTALS - Basic links with color
+    // ═══════════════════════════════════════════════════════════════════
+    output += "── FUNDAMENTALS ───────────────────────────────────────────────────────\n";
+    output += "Basic: ";
+    output += "\x1b]8;;send:look\x1b\\\x1b[34mLook\x1b[0m\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;prompt:cast%20fireball\x1b\\\x1b[33mCast Spell\x1b[0m\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;https://mudlet.org\x1b\\\x1b[36mWebsite\x1b[0m\x1b]8;;\x1b\\\n";
+    output += "       send:CMD  prompt:CMD (editable)  https://URL (browser)\n";
+    output += "URLs:  ";
+    output += "\x1b]8;;https://mudlet.org/?id=42&lang=en\x1b\\\x1b[36mWith params\x1b[0m\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;https://mudlet.org/?%63%6F%6E%66%69%67=value\x1b\\\x1b[36mEncoded config\x1b[0m\x1b]8;;\x1b\\\n";
+    output += "       query params preserved (?id=42&lang=en)  percent-encoded reserved names kept\n\n";
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 2. JSON CONFIGURATION - Show the structure early
+    // ═══════════════════════════════════════════════════════════════════
+    output += "── JSON CONFIG (append ?config={...} to URI) ───────────────────────────\n";
+    output += "Structure: send:cmd?config={\"style\":{...},\"menu\":[...],\"tooltip\":\"...\"}\n";
+    output += "Example:   \x1b]8;;send:attack?config={\"style\":{\"color\":\"red\",\"bold\":true}}\x1b\\Attack\x1b]8;;\x1b\\ ← ";
+    output += "{\"style\":{\"color\":\"red\",\"bold\":true}}\n\n";
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 3. STYLING - Colors, decorations, states
+    // ═══════════════════════════════════════════════════════════════════
+    output += "── STYLING ────────────────────────────────────────────────────────────\n";
+    output += "Colors: ";
+    output += "\x1b]8;;send:c1?config={\"style\":{\"color\":\"red\"}}\x1b\\red\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:c2?config={\"style\":{\"color\":\"#0066ff\"}}\x1b\\#0066ff\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:c3?config={\"style\":{\"color\":\"rgb(0,200,100)\"}}\x1b\\rgb()\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:c4?config={\"style\":{\"bg\":\"yellow\",\"color\":\"black\"}}\x1b\\bg:yellow\x1b]8;;\x1b\\\n";
+    output += "Text:   ";
+    output += "\x1b]8;;send:t1?config={\"style\":{\"bold\":true}}\x1b\\bold\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:t2?config={\"style\":{\"italic\":true}}\x1b\\italic\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:t3?config={\"style\":{\"underline\":true}}\x1b\\underline\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:t4?config={\"style\":{\"underline\":\"wavy\",\"text-decoration-color\":\"red\"}}\x1b\\wavy-red\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:t5?config={\"style\":{\"strikethrough\":true}}\x1b\\strike\x1b]8;;\x1b\\\n";
+    output += "States: ";
+    output += "\x1b]8;;send:s1?config={\"style\":{\"color\":\"blue\",\"hover\":{\"color\":\"red\"}}}\x1b\\hover:red\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:s2?config={\"style\":{\"bg\":\"green\",\"active\":{\"bg\":\"darkgreen\"}}}\x1b\\active:dark\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:s3?config={\"style\":{\"link\":{\"color\":\"blue\"},\"visited\":{\"color\":\"purple\"}}}\x1b\\visited:purple\x1b]8;;\x1b\\\n\n";
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 4. MENUS & TOOLTIPS
+    // ═══════════════════════════════════════════════════════════════════
+    output += "── MENUS & TOOLTIPS ───────────────────────────────────────────────────\n";
+    output += "Menu: \x1b]8;;send:attack?config={\"menu\":[{\"Strike\":\"send:strike\"},{\"Power\":\"send:power\"},\"-\",{\"Flee\":\"send:flee\"}]}\x1b\\⚔️ Combat\x1b]8;;\x1b\\ ← right-click "
+              "(left=primary, \"-\"=separator)\n";
+    output += "Tip:  \x1b]8;;send:item?config={\"tooltip\":\"Legendary sword +5 damage\",\"style\":{\"color\":\"orange\"}}\x1b\\🗡️ Flaming Blade\x1b]8;;\x1b\\ ← hover for tooltip\n";
+    output += "Both: \x1b]8;;send:spell?config={\"menu\":[{\"Fire\":\"send:fireball\"},{\"Ice\":\"send:icebolt\"}],\"tooltip\":\"Magic spells\",\"style\":{\"color\":\"#9966ff\"}}\x1b\\✨ "
+              "Magic\x1b]8;;\x1b\\\n\n";
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 5. VISIBILITY - Hide/reveal
+    // ═══════════════════════════════════════════════════════════════════
+    output += "── VISIBILITY (auto-hide/reveal) ──────────────────────────────────────\n";
+    output += "Click-hide: \x1b]8;;send:h1?config={\"style\":{\"color\":\"yellow\"},\"visibility\":{\"action\":\"conceal\",\"delay\":2000}}\x1b\\I vanish 2s after click\x1b]8;;\x1b\\\n";
+    output += "Expire:     \x1b]8;;send:h2?config={\"style\":{\"color\":\"cyan\"},\"visibility\":{\"action\":\"conceal\",\"expire\":{\"input\":true}}}\x1b\\Send any command to hide\x1b]8;;\x1b\\\n";
+    output += "Reveal:     Wait... \x1b]8;;send:h3?config={\"style\":{\"color\":\"lime\",\"bold\":true},\"visibility\":{\"action\":\"reveal\",\"delay\":5000}}\x1b\\I APPEAR!\x1b]8;;\x1b\\ (5 "
+              "seconds)\n";
+    output += "Wide chars: \x1b]8;;send:h4?config={\"style\":{\"bg\":\"blue\"},\"visibility\":{\"action\":\"conceal\",\"delay\":2000}}\x1b\\🎉🚀💎\x1b]8;;\x1b\\ ← emojis handled correctly\n\n";
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 6. SPOILERS - Click to reveal
+    // ═══════════════════════════════════════════════════════════════════
+    output += "── SPOILERS (click-to-reveal) ─────────────────────────────────────────\n";
+    output += "The answer is: \x1b]8;;send:sp1?config={\"spoiler\":true,\"disabled\":true}\x1b\\42\x1b]8;;\x1b\\  ";
+    output += "Secret code: \x1b]8;;https://www.mudlet.org?config={\"spoiler\":true,\"style\":{\"color\":\"yellow\"}}\x1b\\XYZZY\x1b]8;;\x1b\\  ";
+    output += "Emoji secret: \x1b]8;;send:sp3?config={\"spoiler\":true,\"disabled\":true}\x1b\\🔮💀🗝️\x1b]8;;\x1b\\\n\n";
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 7. DISABLED - Non-clickable
+    // ═══════════════════════════════════════════════════════════════════
+    output += "── DISABLED LINKS ─────────────────────────────────────────────────────\n";
+    output += "\x1b]8;;send:d1?config={\"disabled\":true,\"style\":{\"color\":\"gray\",\"strikethrough\":true}}\x1b\\Locked\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:d2?config={\"disabled\":true,\"style\":{\"color\":\"#666\"},\"tooltip\":\"Requires level 10\"}\x1b\\Premium\x1b]8;;\x1b\\ ";
+    output += "← click/right-click blocked, tooltip works\n\n";
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 8. SELECTION - Toggle states
+    // ═══════════════════════════════════════════════════════════════════
+    output += "── SELECTION (stateful toggles) ───────────────────────────────────────\n";
+    output += "Radio:    ";
+    output += "\x1b]8;;send:easy?config={\"selection\":{\"group\":\"diff\",\"value\":\"easy\",\"exclusive\":true},\"style\":{\"color\":\"#8f8\",\"selected\":{\"bg\":\"green\",\"bold\":true}}}"
+              "\x1b\\Easy\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:hard?config={\"selection\":{\"group\":\"diff\",\"value\":\"hard\",\"exclusive\":true},\"style\":{\"color\":\"#f88\",\"selected\":{\"bg\":\"red\",\"bold\":true}}}"
+              "\x1b\\Hard\x1b]8;;\x1b\\ (one at a time)\n";
+    output += "Checkbox: ";
+    output += "\x1b]8;;send:b1?config={\"selection\":{\"group\":\"buffs\",\"value\":\"str\",\"exclusive\":false},\"style\":{\"selected\":{\"bg\":\"#f60\",\"bold\":true}}}\x1b\\[STR]\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:b2?config={\"selection\":{\"group\":\"buffs\",\"value\":\"dex\",\"exclusive\":false},\"style\":{\"selected\":{\"bg\":\"#08f\",\"bold\":true}}}\x1b\\[DEX]\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:b3?config={\"selection\":{\"group\":\"buffs\",\"value\":\"int\",\"exclusive\":false},\"style\":{\"selected\":{\"bg\":\"#a0f\",\"bold\":true}}}\x1b\\[INT]\x1b]8;;\x1b\\ "
+              "(multi-select)\n";
+    output += "Server receives: &selected=true/false in callback\n\n";
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 9. COMPACT SYNTAX - Shorthand keys
+    // ═══════════════════════════════════════════════════════════════════
+    output += "── COMPACT SYNTAX (shorthand) ─────────────────────────────────────────\n";
+    output += "Full:  {\"style\":{\"color\":\"red\",\"bold\":true},\"tooltip\":\"info\"}\n";
+    output += "Short: {\"s\":{\"c\":\"red\",\"b\":true},\"t\":\"info\"}  ";
+    output += "\x1b]8;;send:sh1?config={\"s\":{\"c\":\"red\",\"b\":true},\"t\":\"Shorthand!\"}\x1b\\Try me\x1b]8;;\x1b\\\n";
+    output += "Keys: s=style c=color bg=bg b=bold i=italic u=underline t=tooltip m=menu\n\n";
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 10. PRESETS - Reusable styles
+    // ═══════════════════════════════════════════════════════════════════
+    output += "── PRESETS (define once, reuse) ───────────────────────────────────────\n";
+    // Define presets (invisible)
+    output += "\x1b]8;;preset:btn?config={\"s\":{\"bg\":\"#07f\",\"c\":\"white\",\"b\":true},\"t\":\"Button preset\"}\x1b\\\x1b]8;;\x1b\\";
+    output += "\x1b]8;;preset:warn?config={\"s\":{\"bg\":\"orange\",\"c\":\"black\",\"b\":true}}\x1b\\\x1b]8;;\x1b\\";
+    output += "\x1b]8;;preset:danger?config={\"s\":{\"bg\":\"red\",\"c\":\"white\",\"b\":true}}\x1b\\\x1b]8;;\x1b\\";
+    output += "Define: preset:NAME?config={...}  Use: ?preset=NAME\n";
+    output += "Usage:  ";
+    output += "\x1b]8;;send:p1?preset=btn\x1b\\Button\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:p2?preset=warn\x1b\\Warning\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:p3?preset=danger\x1b\\Danger\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:p4?preset=btn&config={\"s\":{\"c\":\"yellow\"}}\x1b\\Override\x1b]8;;\x1b\\\n\n";
+
+    // ═══════════════════════════════════════════════════════════════════
+    // REAL-WORLD SHOWCASE
+    // ═══════════════════════════════════════════════════════════════════
+    output += "── REAL-WORLD EXAMPLE ─────────────────────────────────────────────────\n";
+    output += "Nav: ";
+    output += "\x1b]8;;send:north?config={\"s\":{\"c\":\"#0af\",\"b\":true,\"h\":{\"u\":true}}}\x1b\\North\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:south?config={\"s\":{\"c\":\"#0af\",\"b\":true,\"h\":{\"u\":true}}}\x1b\\South\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:east?config={\"s\":{\"c\":\"#0af\",\"b\":true,\"h\":{\"u\":true}}}\x1b\\East\x1b]8;;\x1b\\ ";
+    output += "\x1b]8;;send:west?config={\"s\":{\"c\":\"#0af\",\"b\":true,\"h\":{\"u\":true}}}\x1b\\West\x1b]8;;\x1b\\\n";
+    output += "Item: "
+              "\x1b]8;;send:sword?config={\"style\":{\"color\":\"#f80\",\"bold\":true,\"hover\":{\"bg\":\"#fc9\",\"color\":\"black\"}},\"menu\":[{\"Equip\":\"send:equip\"},{\"Examine\":\"send:exam\"}"
+              ",\"-\",{\"Drop\":\"send:drop\"}],\"tooltip\":\"+5 Fire Damage\"}\x1b\\🗡️ Flaming Sword\x1b]8;;\x1b\\\n\n";
+
+    output += "───────────────────────────────────────────────────────────────────────\n";
+    output += "Docs: https://wiki.mudlet.org/w/Area_51#OSC_8:_Hyperlink_Protocol\n";
+
+    // Process the output through the normal text processing pipeline
+    // Skip trigger processing to avoid re-entrancy issues during injection
+    std::string outputBytes = output.toStdString();
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] About to process documentation examples through translateToPlainText, length:" << outputBytes.length();
+#endif
+    mSkipTriggerProcessing = true;
+    translateToPlainText(outputBytes, true); // Mark as from server
+    mSkipTriggerProcessing = false;
+}
+
+// ============================================================================
+// Link States Implementation with Accessibility Best Practices
+// ============================================================================
+
+Mudlet::HyperlinkStyling::StateStyle Mudlet::HyperlinkStyling::getEffectiveStyle() const
+{
+    Mudlet::HyperlinkStyling::StateStyle effective;
+
+    // Start with base/default styling
+    effective.foregroundColor = foregroundColor;
+    effective.backgroundColor = backgroundColor;
+    effective.underlineColor = underlineColor;
+    effective.overlineColor = overlineColor;
+    effective.strikeoutColor = strikeoutColor;
+    effective.hasForegroundColor = hasForegroundColor;
+    effective.hasBackgroundColor = hasBackgroundColor;
+    effective.hasUnderlineColor = hasUnderlineColor;
+    effective.hasOverlineColor = hasOverlineColor;
+    effective.hasStrikeoutColor = hasStrikeoutColor;
+    effective.isBold = isBold;
+    effective.isItalic = isItalic;
+    effective.isUnderlined = isUnderlined;
+    effective.isStrikeOut = isStrikeOut;
+    effective.isOverlined = isOverlined;
+    effective.underlineStyle = underlineStyle;
+
+    // Apply :any-link styles (applies to both :link and :visited)
+    if (anyLinkStyle.hasCustomStyling) {
+        if (anyLinkStyle.hasForegroundColor)
+            effective.foregroundColor = anyLinkStyle.foregroundColor;
+        if (anyLinkStyle.hasBackgroundColor)
+            effective.backgroundColor = anyLinkStyle.backgroundColor;
+        if (anyLinkStyle.hasUnderlineColor)
+            effective.underlineColor = anyLinkStyle.underlineColor;
+        if (anyLinkStyle.hasOverlineColor)
+            effective.overlineColor = anyLinkStyle.overlineColor;
+        if (anyLinkStyle.hasStrikeoutColor)
+            effective.strikeoutColor = anyLinkStyle.strikeoutColor;
+        effective.isBold = anyLinkStyle.isBold;
+        effective.isItalic = anyLinkStyle.isItalic;
+        effective.isUnderlined = anyLinkStyle.isUnderlined;
+        effective.isStrikeOut = anyLinkStyle.isStrikeOut;
+        effective.isOverlined = anyLinkStyle.isOverlined;
+        effective.underlineStyle = anyLinkStyle.underlineStyle;
+    }
+
+    // Apply state-specific styles with proper cascade order
+    // Priority: disabled > selected > active > focus-visible > focus > hover > visited > link > default
+    const StateStyle* stateStyle = nullptr;
+
+    switch (currentState) {
+    case StateDisabled:
+        if (disabledStyle.hasCustomStyling) {
+            stateStyle = &disabledStyle;
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] Using disabled style - hasCustomStyling:" << disabledStyle.hasCustomStyling << "hasForegroundColor:" << disabledStyle.hasForegroundColor
+                     << "foregroundColor:" << (disabledStyle.hasForegroundColor ? disabledStyle.foregroundColor.name() : "none") << "hasBackgroundColor:" << disabledStyle.hasBackgroundColor
+                     << "backgroundColor:" << (disabledStyle.hasBackgroundColor ? disabledStyle.backgroundColor.name() : "none") << "isBold:" << disabledStyle.isBold
+                     << "isStrikeOut:" << disabledStyle.isStrikeOut;
+#endif
+        } else {
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] Disabled style has no custom styling - hasCustomStyling:" << disabledStyle.hasCustomStyling;
+#endif
+        }
+        break;
+    case StateSelected:
+        if (selectedStyle.hasCustomStyling) {
+            stateStyle = &selectedStyle;
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] Using selected style - hasCustomStyling:" << selectedStyle.hasCustomStyling << "hasForegroundColor:" << selectedStyle.hasForegroundColor
+                     << "foregroundColor:" << (selectedStyle.hasForegroundColor ? selectedStyle.foregroundColor.name() : "none") << "hasBackgroundColor:" << selectedStyle.hasBackgroundColor
+                     << "backgroundColor:" << (selectedStyle.hasBackgroundColor ? selectedStyle.backgroundColor.name() : "none") << "isBold:" << selectedStyle.isBold;
+#endif
+        } else {
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] Selected style has no custom styling - hasCustomStyling:" << selectedStyle.hasCustomStyling;
+#endif
+        }
+        break;
+    case StateVisited:
+        if (visitedStyle.hasCustomStyling)
+            stateStyle = &visitedStyle;
+        break;
+    case StateHover:
+        if (hoverStyle.hasCustomStyling)
+            stateStyle = &hoverStyle;
+        break;
+    case StateActive:
+        if (activeStyle.hasCustomStyling)
+            stateStyle = &activeStyle;
+        break;
+    case StateFocus:
+        if (focusStyle.hasCustomStyling)
+            stateStyle = &focusStyle;
+        break;
+    case StateFocusVisible:
+        if (focusVisibleStyle.hasCustomStyling)
+            stateStyle = &focusVisibleStyle;
+        break;
+    case StateDefault:
+    default:
+        if (linkStyle.hasCustomStyling)
+            stateStyle = &linkStyle;
+        break;
+    }
+
+    // Apply the selected state style
+    if (stateStyle) {
+        if (stateStyle->hasForegroundColor) {
+            effective.foregroundColor = stateStyle->foregroundColor;
+            effective.hasForegroundColor = true;
+        }
+        if (stateStyle->hasBackgroundColor) {
+            effective.backgroundColor = stateStyle->backgroundColor;
+            effective.hasBackgroundColor = true;
+        }
+        if (stateStyle->hasUnderlineColor) {
+            effective.underlineColor = stateStyle->underlineColor;
+            effective.hasUnderlineColor = true;
+        }
+        if (stateStyle->hasOverlineColor) {
+            effective.overlineColor = stateStyle->overlineColor;
+            effective.hasOverlineColor = true;
+        }
+        if (stateStyle->hasStrikeoutColor) {
+            effective.strikeoutColor = stateStyle->strikeoutColor;
+            effective.hasStrikeoutColor = true;
+        }
+        effective.isBold = stateStyle->isBold;
+        effective.isItalic = stateStyle->isItalic;
+        effective.isUnderlined = stateStyle->isUnderlined;
+        effective.isStrikeOut = stateStyle->isStrikeOut;
+        effective.isOverlined = stateStyle->isOverlined;
+        effective.underlineStyle = stateStyle->underlineStyle;
+        effective.hasCustomStyling = true;
+    }
+
+    // Even if the current state doesn't have custom styling, we need to mark that
+    // the link has SOME pseudo-class styling so updateLinkCharacters() processes it.
+    // This ensures ANSI base links with only :hover (but no :link) styling get updated.
+    if (!effective.hasCustomStyling) {
+        // Check if ANY pseudo-class state has custom styling
+        if (linkStyle.hasCustomStyling || visitedStyle.hasCustomStyling || hoverStyle.hasCustomStyling || activeStyle.hasCustomStyling || focusStyle.hasCustomStyling
+            || focusVisibleStyle.hasCustomStyling || anyLinkStyle.hasCustomStyling || selectedStyle.hasCustomStyling || disabledStyle.hasCustomStyling) {
+            effective.hasCustomStyling = true;
+        }
+    }
+
+    return effective;
+}
+
+void TBuffer::applyAccessibilityEnhancements(Mudlet::HyperlinkStyling& styling)
+{
+    // Ensure focus states are appropriately visible
+    if (!styling.focusStyle.hasCustomStyling && !styling.focusVisibleStyle.hasCustomStyling) {
+        // Provide default focus styling for accessibility
+        styling.focusStyle.hasCustomStyling = true;
+        styling.focusStyle.isUnderlined = true;
+        styling.focusStyle.underlineStyle = Mudlet::HyperlinkStyling::UnderlineSolid;
+        styling.focusStyle.hasUnderlineColor = true;
+        styling.focusStyle.underlineColor = QColor(0, 120, 215); // Windows accent blue
+
+        styling.focusVisibleStyle = styling.focusStyle; // Copy focus style to focus-visible
+    }
+}
+
+// Link state management methods for interactive pseudo-classes
+void TBuffer::setLinkState(int linkIndex, Mudlet::HyperlinkStyling::LinkState state)
+{
+    if (linkIndex <= 0) {
+        return; // Invalid link index
+    }
+
+    mLinkStates[linkIndex] = state;
+
+#if defined(DEBUG_OSC_PROCESSING)
+    QString stateName;
+    switch (state) {
+    case Mudlet::HyperlinkStyling::StateDefault:
+        stateName = "Default";
+        break;
+    case Mudlet::HyperlinkStyling::StateVisited:
+        stateName = "Visited";
+        break;
+    case Mudlet::HyperlinkStyling::StateHover:
+        stateName = "Hover";
+        break;
+    case Mudlet::HyperlinkStyling::StateActive:
+        stateName = "Active";
+        break;
+    case Mudlet::HyperlinkStyling::StateFocus:
+        stateName = "Focus";
+        break;
+    case Mudlet::HyperlinkStyling::StateFocusVisible:
+        stateName = "FocusVisible";
+        break;
+    case Mudlet::HyperlinkStyling::StateSelected:
+        stateName = "Selected";
+        break;
+    case Mudlet::HyperlinkStyling::StateDisabled:
+        stateName = "Disabled";
+        break;
+    }
+    qDebug() << "[OSC] Link" << linkIndex << "state changed to:" << stateName;
+#endif
+}
+
+Mudlet::HyperlinkStyling::LinkState TBuffer::getLinkState(int linkIndex) const
+{
+    if (linkIndex <= 0) {
+        return Mudlet::HyperlinkStyling::StateDefault;
+    }
+    return mLinkStates.value(linkIndex, Mudlet::HyperlinkStyling::StateDefault);
+}
+
+Mudlet::HyperlinkStyling TBuffer::getEffectiveHyperlinkStyling(int linkIndex) const
+{
+    if (linkIndex <= 0) {
+        return Mudlet::HyperlinkStyling(); // Return default styling
+    }
+    // Get the stored styling for this link from mLinkStore
+    Mudlet::HyperlinkStyling styling = mLinkStore.getStyling(linkIndex);
+
+    // Update the current state based on tracked state
+    styling.currentState = getLinkState(linkIndex);
+
+    // The HyperlinkStyling::getEffectiveStyle() method will compute the
+    // effective styling based on currentState, cascading from base -> :any-link -> state-specific
+    // However, for rendering we need to apply it to the base styling properties
+    // so the rendering code can use it directly
+
+    auto effective = styling.getEffectiveStyle();
+
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] getEffectiveHyperlinkStyling for link" << linkIndex << "state:" << styling.currentState << "isSpoiler:" << styling.isSpoiler
+             << "base hasBackgroundColor:" << styling.hasBackgroundColor << "base backgroundColor:" << (styling.hasBackgroundColor ? styling.backgroundColor.name() : "none")
+             << "effective hasForegroundColor:" << effective.hasForegroundColor << "effective foregroundColor:" << (effective.hasForegroundColor ? effective.foregroundColor.name() : "none")
+             << "effective hasBackgroundColor:" << effective.hasBackgroundColor << "effective backgroundColor:" << (effective.hasBackgroundColor ? effective.backgroundColor.name() : "none")
+             << "effective isBold:" << effective.isBold;
+#endif
+
+    // Copy effective state back to base properties for rendering
+    styling.foregroundColor = effective.foregroundColor;
+    styling.backgroundColor = effective.backgroundColor;
+    styling.underlineColor = effective.underlineColor;
+    styling.overlineColor = effective.overlineColor;
+    styling.strikeoutColor = effective.strikeoutColor;
+    styling.hasForegroundColor = effective.hasForegroundColor;
+    styling.hasBackgroundColor = effective.hasBackgroundColor;
+    styling.hasUnderlineColor = effective.hasUnderlineColor;
+    styling.hasOverlineColor = effective.hasOverlineColor;
+    styling.hasStrikeoutColor = effective.hasStrikeoutColor;
+    styling.isBold = effective.isBold;
+    styling.isItalic = effective.isItalic;
+    styling.isUnderlined = effective.isUnderlined;
+    styling.isStrikeOut = effective.isStrikeOut;
+    styling.isOverlined = effective.isOverlined;
+    styling.underlineStyle = effective.underlineStyle;
+    styling.hasCustomStyling = effective.hasCustomStyling; // CRITICAL: Copy hasCustomStyling flag
+
+    // SPOILER FIX: Ensure spoiler backgrounds are always applied regardless of pseudo-class cascade
+    // This fixes the issue where spoilers show background on hover but not on initial display
+    if (styling.isSpoiler) {
+        // Get the base styling directly from link store to ensure spoiler background is preserved
+        Mudlet::HyperlinkStyling baseStyling = mLinkStore.getStyling(linkIndex);
+        if (baseStyling.hasBackgroundColor) {
+            // For spoilers, ALWAYS use the base background that was auto-generated
+            // Ignore whatever the pseudo-class cascade decided
+            styling.backgroundColor = baseStyling.backgroundColor;
+            styling.hasBackgroundColor = true;
+            styling.hasCustomStyling = true;
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] SPOILER FIX: Forced spoiler background" << baseStyling.backgroundColor.name() << "over effective background"
+                     << (effective.hasBackgroundColor ? effective.backgroundColor.name() : "none") << "for link" << linkIndex;
+#endif
+        }
+    }
+
+    return styling;
+}
+
+void TBuffer::setHoveredLink(int linkIndex)
+{
+    int previousHoveredLink = mCurrentHoveredLinkIndex;
+    mCurrentHoveredLinkIndex = linkIndex;
+
+    // Reset previous hovered link to its base state (default, visited, or selected)
+    if (previousHoveredLink > 0 && previousHoveredLink != linkIndex) {
+        auto currentState = getLinkState(previousHoveredLink);
+
+        if (currentState == Mudlet::HyperlinkStyling::StateHover) {
+            // Return to the appropriate base state:
+            // Priority: disabled > selected > visited > default
+            // Disabled links should stay disabled
+            Mudlet::HyperlinkStyling linkStyling = getEffectiveHyperlinkStyling(previousHoveredLink);
+            if (linkStyling.selection.hasSelectionSettings && linkStyling.selection.disabled) {
+                setLinkState(previousHoveredLink, Mudlet::HyperlinkStyling::StateDisabled);
+            } else if (isLinkSelected(previousHoveredLink)) {
+                setLinkState(previousHoveredLink, Mudlet::HyperlinkStyling::StateSelected);
+            } else if (isLinkVisited(previousHoveredLink)) {
+                setLinkState(previousHoveredLink, Mudlet::HyperlinkStyling::StateVisited);
+            } else {
+                setLinkState(previousHoveredLink, Mudlet::HyperlinkStyling::StateDefault);
+            }
+
+            updateLinkCharacters(previousHoveredLink); // Update displayed characters
+        }
+    }
+
+    // Set new link to hover state
+    if (linkIndex > 0) {
+        auto currentState = getLinkState(linkIndex);
+        // Don't override active or disabled states with hover
+        // Disabled links should stay disabled and show their disabled styling
+        if (currentState != Mudlet::HyperlinkStyling::StateActive && currentState != Mudlet::HyperlinkStyling::StateDisabled) {
+            setLinkState(linkIndex, Mudlet::HyperlinkStyling::StateHover);
+            updateLinkCharacters(linkIndex); // Update displayed characters
+        }
+    }
+}
+
+void TBuffer::setActiveLink(int linkIndex)
+{
+    int previousActiveLink = mCurrentActiveLinkIndex;
+    mCurrentActiveLinkIndex = linkIndex;
+
+    // Reset previous active link
+    if (previousActiveLink > 0 && previousActiveLink != linkIndex) {
+        // Return to appropriate state based on priority: disabled > hover > selected > visited > default
+        Mudlet::HyperlinkStyling linkStyling = getEffectiveHyperlinkStyling(previousActiveLink);
+        if (linkStyling.selection.hasSelectionSettings && linkStyling.selection.disabled) {
+            setLinkState(previousActiveLink, Mudlet::HyperlinkStyling::StateDisabled);
+        } else if (previousActiveLink == mCurrentHoveredLinkIndex) {
+            setLinkState(previousActiveLink, Mudlet::HyperlinkStyling::StateHover);
+        } else if (isLinkSelected(previousActiveLink)) {
+            setLinkState(previousActiveLink, Mudlet::HyperlinkStyling::StateSelected);
+        } else if (isLinkVisited(previousActiveLink)) {
+            setLinkState(previousActiveLink, Mudlet::HyperlinkStyling::StateVisited);
+        } else {
+            setLinkState(previousActiveLink, Mudlet::HyperlinkStyling::StateDefault);
+        }
+
+        updateLinkCharacters(previousActiveLink); // Update displayed characters
+    }
+
+    // Set new link to active state
+    if (linkIndex > 0) {
+        setLinkState(linkIndex, Mudlet::HyperlinkStyling::StateActive);
+        updateLinkCharacters(linkIndex); // Update displayed characters
+    }
+}
+
+void TBuffer::setFocusedLink(int linkIndex)
+{
+    int previousFocusedLink = mCurrentFocusedLinkIndex;
+    mCurrentFocusedLinkIndex = linkIndex;
+
+    // Reset previous focused link to appropriate base state
+    if (previousFocusedLink > 0 && previousFocusedLink != linkIndex) {
+        // Preserve disabled state, otherwise return to base state
+        Mudlet::HyperlinkStyling linkStyling = getEffectiveHyperlinkStyling(previousFocusedLink);
+        if (linkStyling.selection.hasSelectionSettings && linkStyling.selection.disabled) {
+            setLinkState(previousFocusedLink, Mudlet::HyperlinkStyling::StateDisabled);
+        } else if (isLinkSelected(previousFocusedLink)) {
+            setLinkState(previousFocusedLink, Mudlet::HyperlinkStyling::StateSelected);
+        } else if (isLinkVisited(previousFocusedLink)) {
+            setLinkState(previousFocusedLink, Mudlet::HyperlinkStyling::StateVisited);
+        } else {
+            setLinkState(previousFocusedLink, Mudlet::HyperlinkStyling::StateDefault);
+        }
+    }
+
+    // Set new link to focus state
+    if (linkIndex > 0) {
+        // Determine if focus came from keyboard (would use StateFocusVisible)
+        // For now, we use StateFocus
+        setLinkState(linkIndex, Mudlet::HyperlinkStyling::StateFocus);
+    }
+}
+
+void TBuffer::markLinkAsVisited(int linkIndex)
+{
+    if (linkIndex > 0) {
+        mVisitedLinks[linkIndex] = true;
+
+        // If the link is not in an interactive state (hover/active/focus),
+        // update it to visited state immediately
+        auto currentState = getLinkState(linkIndex);
+
+        if (currentState == Mudlet::HyperlinkStyling::StateDefault) {
+            setLinkState(linkIndex, Mudlet::HyperlinkStyling::StateVisited);
+            updateLinkCharacters(linkIndex);
+        }
+
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] Link" << linkIndex << "marked as visited";
+#endif
+    }
+}
+
+bool TBuffer::isLinkVisited(int linkIndex) const
+{
+    return mVisitedLinks.value(linkIndex, false);
+}
+
+void TBuffer::setLinkSelected(int linkIndex, bool selected)
+{
+    mLinkSelectionState[linkIndex] = selected;
+}
+
+bool TBuffer::isLinkSelected(int linkIndex) const
+{
+    return mLinkSelectionState.value(linkIndex, false);
+}
+
+void TBuffer::revealSpoilerLink(int linkIndex)
+{
+    if (!mLinkOriginalText.contains(linkIndex)) {
+        return;
+    }
+
+    QString originalText = mLinkOriginalText[linkIndex];
+
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] Revealing spoiler link" << linkIndex << "with text:" << originalText;
+#endif
+
+    if (!mLinkStore.hasStyling(linkIndex)) {
+        return;
+    }
+
+    Mudlet::HyperlinkStyling styling = mLinkStore.getStyling(linkIndex);
+
+    if (styling.isSpoiler) {
+        QStringList hints = mLinkStore.getHintsConst(linkIndex);
+        if (!hints.isEmpty() && hints.first() == QObject::tr("Click to reveal")) {
+            mLinkStore.getHints(linkIndex).clear();
+
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] Cleared auto-generated 'Click to reveal' tooltip for spoiler link" << linkIndex;
+#endif
+        }
+
+        if (styling.hasBackgroundColor && mLinkOriginalBackgrounds.contains(linkIndex)) {
+            QColor originalBackground = mLinkOriginalBackgrounds[linkIndex];
+            styling.backgroundColor = originalBackground;
+
+            mLinkStore.setStyling(linkIndex, styling);
+
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] Restored original background color for spoiler link" << linkIndex;
+#endif
+        }
+    }
+
+    // Find all characters with this link index and restore their original text
+    int charIndex = 0;
+    for (size_t lineNum = 0; lineNum < buffer.size(); ++lineNum) {
+        materialisePreTriggerPassLine(static_cast<int>(lineNum));
+        auto& line = buffer[lineNum];
+        QString lineText = lineBuffer.at(static_cast<int>(lineNum));
+        bool lineModified = false;
+
+        for (size_t charPos = 0; charPos < line.size(); ++charPos) {
+            if (line[charPos].linkIndex() == linkIndex && charIndex < originalText.length()) {
+                // Replace the space character with the original character
+                QChar originalChar = originalText[charIndex];
+                if (charPos < static_cast<size_t>(lineText.length())) {
+                    lineText[static_cast<int>(charPos)] = originalChar;
+                    lineModified = true;
+                }
+                charIndex++;
+            }
+        }
+
+        if (lineModified) {
+            lineBuffer[static_cast<int>(lineNum)] = lineText;
+        }
+    }
+
+    updateLinkCharacters(linkIndex);
+
+    mLinkOriginalText.remove(linkIndex);
+
+    if (mpModel) {
+        emit mpModel->mNotifier.spoilerRevealed();
+    }
+}
+
+void TBuffer::clearGroupSelection(const QString& group, const QString& exceptValue)
+{
+    int maxLinkId = mLinkStore.getCurrentLinkID();
+    int clearedCount = 0;
+
+    for (int linkIndex = 1; linkIndex <= maxLinkId; ++linkIndex) {
+        if (!mLinkStore.hasStyling(linkIndex)) {
+            continue;
+        }
+
+        auto styling = mLinkStore.getStyling(linkIndex);
+        if (styling.selection.hasSelectionSettings && styling.selection.group == group && styling.selection.value != exceptValue) {
+            if (mpModel) {
+                mpModel->mHyperlinkSelectionManager.setSelected(styling.selection.group, styling.selection.value, false);
+            }
+
+            setLinkSelected(linkIndex, false);
+            if (styling.selection.disabled) {
+                setLinkState(linkIndex, Mudlet::HyperlinkStyling::StateDisabled);
+            } else {
+                setLinkState(linkIndex, Mudlet::HyperlinkStyling::StateDefault);
+            }
+
+            updateLinkCharacters(linkIndex);
+            clearedCount++;
+
+#if defined(DEBUG_OSC_PROCESSING)
+            qDebug() << "[OSC] clearGroupSelection: Deselected link" << linkIndex << "group:" << group << "value:" << styling.selection.value;
+#endif
+        }
+    }
+
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] clearGroupSelection: Cleared" << clearedCount << "links in group" << group;
+#endif
+}
+
+void TBuffer::applyPendingSelectionStyling()
+{
+    if (!mPendingSelectionStyling.isEmpty()) {
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] Processing pending selection styling for" << mPendingSelectionStyling.size() << "links";
+#endif
+        for (const int linkId : std::as_const(mPendingSelectionStyling)) {
+            updateLinkCharacters(linkId);
+        }
+        mPendingSelectionStyling.clear();
+    }
+}
+
+int TBuffer::getLinkIndexAt(int line, int column) const
+{
+    // Validate line bounds
+    if (line < 0 || line >= lineBuffer.size()) {
+        return 0;
+    }
+
+    const auto& bufferLine = buffer.at(line);
+
+    // Validate column bounds
+    if (column < 0 || column >= static_cast<int>(bufferLine.size())) {
+        return 0;
+    }
+
+    return bufferLine.at(column).linkIndex();
+}
+
+bool TBuffer::findNextLink(int fromLine, int fromColumn, int& outLine, int& outColumn, bool* wrapped) const
+{
+    if (buffer.empty()) {
+        return false;
+    }
+
+    const int lineCount = static_cast<int>(buffer.size());
+    if (fromLine < 0 || fromLine >= lineCount) {
+        return false;
+    }
+    fromColumn = qBound(-1, fromColumn, static_cast<int>(buffer.at(fromLine).size()) - 1);
+
+    if (wrapped) {
+        *wrapped = false;
+    }
+
+    int currentLinkAtStart = getLinkIndexAt(fromLine, fromColumn);
+
+    for (int line = fromLine; line < lineCount; ++line) {
+        const auto& bufferLine = buffer.at(line);
+        int startCol = (line == fromLine) ? fromColumn + 1 : 0;
+
+        for (int col = startCol; col < static_cast<int>(bufferLine.size()); ++col) {
+            int linkIdx = bufferLine.at(col).linkIndex();
+            if (linkIdx > 0 && linkIdx != currentLinkAtStart) {
+                outLine = line;
+                outColumn = col;
+                return true;
+            }
+        }
+    }
+
+    // Wrap around: search from the beginning up to the starting position
+    for (int line = 0; line <= fromLine; ++line) {
+        const auto& bufferLine = buffer.at(line);
+        int endCol = (line == fromLine) ? qMin(fromColumn + 1, static_cast<int>(bufferLine.size())) : static_cast<int>(bufferLine.size());
+
+        for (int col = 0; col < endCol; ++col) {
+            int linkIdx = bufferLine.at(col).linkIndex();
+            if (linkIdx > 0 && linkIdx != currentLinkAtStart) {
+                outLine = line;
+                outColumn = col;
+                if (wrapped) {
+                    *wrapped = true;
+                }
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool TBuffer::findPreviousLink(int fromLine, int fromColumn, int& outLine, int& outColumn, bool* wrapped) const
+{
+    if (buffer.empty()) {
+        return false;
+    }
+
+    const int lineCount = static_cast<int>(buffer.size());
+    if (fromLine < 0 || fromLine >= lineCount) {
+        return false;
+    }
+    if (buffer.at(fromLine).empty()) {
+        fromColumn = -1;
+    } else {
+        fromColumn = qBound(0, fromColumn, static_cast<int>(buffer.at(fromLine).size()) - 1);
+    }
+
+    if (wrapped) {
+        *wrapped = false;
+    }
+
+    int currentLinkAtStart = getLinkIndexAt(fromLine, fromColumn);
+
+    for (int line = fromLine; line >= 0; --line) {
+        const auto& bufferLine = buffer.at(line);
+        int startCol = (line == fromLine) ? fromColumn - 1 : static_cast<int>(bufferLine.size()) - 1;
+
+        for (int col = startCol; col >= 0; --col) {
+            int linkIdx = bufferLine.at(col).linkIndex();
+            if (linkIdx > 0 && linkIdx != currentLinkAtStart) {
+                // Found a different link — now find its start (first column with this linkIdx on this line)
+                int linkStart = col;
+                while (linkStart > 0 && bufferLine.at(linkStart - 1).linkIndex() == linkIdx) {
+                    --linkStart;
+                }
+                outLine = line;
+                outColumn = linkStart;
+                return true;
+            }
+        }
+    }
+
+    // Wrap around: search from the end back to the starting position
+    for (int line = lineCount - 1; line >= fromLine; --line) {
+        const auto& bufferLine = buffer.at(line);
+        int startCol = (line == fromLine) ? qMin(fromColumn, static_cast<int>(bufferLine.size()) - 1) : static_cast<int>(bufferLine.size()) - 1;
+
+        for (int col = startCol; col >= 0; --col) {
+            int linkIdx = bufferLine.at(col).linkIndex();
+            if (linkIdx > 0 && linkIdx != currentLinkAtStart) {
+                int linkStart = col;
+                while (linkStart > 0 && bufferLine.at(linkStart - 1).linkIndex() == linkIdx) {
+                    --linkStart;
+                }
+                outLine = line;
+                outColumn = linkStart;
+                if (wrapped) {
+                    *wrapped = true;
+                }
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+QString TBuffer::getLinkTooltip(int linkIndex) const
+{
+    if (linkIndex <= 0) {
+        return QString();
+    }
+
+    // When hints outnumber commands by one, the extra leading hint is the tooltip/title (not a menu item)
+    const QStringList hints = mLinkStore.getHintsConst(linkIndex);
+    const QStringList commands = mLinkStore.getLinksConst(linkIndex);
+    if (hints.size() > commands.size() && !hints.isEmpty()) {
+        return hints.first();
+    }
+
+    // If there's exactly one hint, use it
+    if (hints.size() == 1 && !hints.first().isEmpty()) {
+        return hints.first();
+    }
+
+    return QString();
+}
+
+// Update all TChar objects in the buffer that have the specified linkIndex
+// with the effective styling for the current state
+void TBuffer::updateLinkCharacters(int linkIndex)
+{
+    if (linkIndex <= 0) {
+        return;
+    }
+
+    // Get the effective styling for this link's current state
+    Mudlet::HyperlinkStyling effectiveStyling = getEffectiveHyperlinkStyling(linkIndex);
+
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] Link" << linkIndex << "effective styling:" << "hasFg:" << effectiveStyling.hasForegroundColor
+             << "fg:" << (effectiveStyling.hasForegroundColor ? effectiveStyling.foregroundColor.name() : "none") << "hasBg:" << effectiveStyling.hasBackgroundColor
+             << "bold:" << effectiveStyling.isBold << "underline:" << effectiveStyling.isUnderlined << "hasCustom:" << effectiveStyling.hasCustomStyling;
+#endif
+
+    // IMPORTANT: If this link has no custom styling at all (neither base nor pseudo-class),
+    // don't modify the characters. This preserves ANSI formatting for links without styling.
+    if (!effectiveStyling.hasCustomStyling) {
+#if defined(DEBUG_OSC_PROCESSING)
+        qDebug() << "[OSC] Link" << linkIndex << "has no custom styling - preserving ANSI formatting";
+#endif
+        return; // Don't modify characters - preserve original ANSI formatting
+    }
+
+    // Never restore ANSI base when effective styling has custom properties.
+    // This includes both base-level styling AND pseudo-class styling.
+    // If the cascade resolved custom colors/formatting from :link, :hover, etc.,
+    // use those instead of reverting to ANSI.
+    bool useAnsiBase = false;
+
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] Updating link" << linkIndex << "- hasBaseCustomStyling:" << effectiveStyling.hasBaseCustomStyling << "currentState:" << effectiveStyling.currentState
+             << "useAnsiBase:" << useAnsiBase;
+#endif
+
+    // Debug: Count how many characters we're checking and how many match
+#if defined(DEBUG_OSC_PROCESSING)
+    int totalCharacters = 0;
+    int matchingCharacters = 0;
+#endif
+
+    // Iterate through all lines in the buffer
+    for (size_t lineNumber = 0; lineNumber < buffer.size(); ++lineNumber) {
+        auto& line = buffer[lineNumber];
+        // Iterate through all characters in the line
+        for (auto& tchar : line) {
+#if defined(DEBUG_OSC_PROCESSING)
+            totalCharacters++;
+#endif
+            // Check if this character belongs to the link we're updating
+            if (tchar.linkIndex() == linkIndex) {
+                materialisePreTriggerPassLine(static_cast<int>(lineNumber));
+#if defined(DEBUG_OSC_PROCESSING)
+                matchingCharacters++;
+                static int charUpdateCount = 0;
+                if (charUpdateCount++ < 2) { // Only log first 2 characters to avoid spam
+                    qDebug() << "[OSC] Before update - char with linkIndex" << linkIndex << "- FgColor:" << tchar.foreground().name() << "hasFg:" << effectiveStyling.hasForegroundColor
+                             << "new fg:" << (effectiveStyling.hasForegroundColor ? effectiveStyling.foregroundColor.name() : "none");
+                }
+#endif
+                // Apply the effective styling to this character
+
+                // If we should use ANSI base (no base styling but in default/visited state),
+                // restore the original ANSI colors and formatting as a BASE,
+                // then let pseudo-class styling override it
+                if (useAnsiBase && mLinkOriginalCharacters.contains(linkIndex)) {
+                    TChar originalChar = mLinkOriginalCharacters.value(linkIndex);
+#if defined(DEBUG_OSC_PROCESSING)
+                    qDebug() << "[OSC] Restoring ANSI base for link" << linkIndex << "- Original FgColor:" << originalChar.foreground().name()
+                             << "Original BgColor:" << originalChar.background().name() << "Original Bold:" << bool(originalChar.mFlags & TChar::Bold)
+                             << "Current FgColor:" << tchar.foreground().name() << "Current Bold:" << bool(tchar.mFlags & TChar::Bold);
+#endif
+                    // Restore ANSI base - these will be overridden below if styling specifies them
+                    tchar.mFgColor = originalChar.mFgColor;
+                    tchar.mBgColor = originalChar.mBgColor;
+                    // Restore ALL ANSI formatting flags including decorations,
+                    // keeping the character selected if it is now
+                    tchar.mFlags = (tchar.mFlags & TChar::Selected) | (originalChar.mFlags & ~TChar::Selected);
+
+                    // DON'T continue here - let the pseudo-class styling below override the ANSI base
+                    // This allows e.g. :visited{color:#bb66dd} to work with ANSI base formatting
+                }
+
+                // Apply styling
+
+                // Update foreground color
+                if (effectiveStyling.hasForegroundColor) {
+                    tchar.setForeground(effectiveStyling.foregroundColor);
+#if defined(DEBUG_OSC_PROCESSING)
+                    static int fgUpdateCount = 0;
+                    if (fgUpdateCount++ < 2) {
+                        qDebug() << "[OSC] Applied FG color to link" << linkIndex << "- New FgColor:" << tchar.foreground().name();
+                    }
+#endif
+                }
+
+                // Update background color - restore original if not specified in styling
+                if (effectiveStyling.hasBackgroundColor) {
+                    tchar.setBackground(effectiveStyling.backgroundColor);
+                } else {
+                    // Restore the original background color from when the link was created
+                    tchar.setBackground(mLinkOriginalBackgrounds.value(linkIndex, mBackGroundColor));
+                }
+
+                // Update text decorations (only for CSS styling, not ANSI-base)
+                if (effectiveStyling.isUnderlined) {
+                    tchar.mFlags |= TChar::Underline;
+
+                    // Apply underline style
+                    // First clear any existing underline style flags
+                    tchar.mFlags &= ~(TChar::UnderlineWavy | TChar::UnderlineDotted | TChar::UnderlineDashed);
+
+                    switch (effectiveStyling.underlineStyle) {
+                    case Mudlet::HyperlinkStyling::UnderlineWavy:
+                        tchar.mFlags |= TChar::UnderlineWavy;
+                        break;
+                    case Mudlet::HyperlinkStyling::UnderlineDotted:
+                        tchar.mFlags |= TChar::UnderlineDotted;
+                        break;
+                    case Mudlet::HyperlinkStyling::UnderlineDashed:
+                        tchar.mFlags |= TChar::UnderlineDashed;
+                        break;
+                    default:
+                        break;
+                    }
+                } else {
+                    tchar.mFlags &= ~TChar::Underline;
+                    tchar.mFlags &= ~(TChar::UnderlineWavy | TChar::UnderlineDotted | TChar::UnderlineDashed);
+                }
+
+                if (effectiveStyling.isOverlined) {
+                    tchar.mFlags |= TChar::Overline;
+                } else {
+                    tchar.mFlags &= ~TChar::Overline;
+                }
+
+                if (effectiveStyling.isStrikeOut) {
+                    tchar.mFlags |= TChar::StrikeOut;
+                } else {
+                    tchar.mFlags &= ~TChar::StrikeOut;
+                }
+
+                // Update bold and italic
+                if (effectiveStyling.isBold) {
+                    tchar.mFlags |= TChar::Bold;
+                } else {
+                    tchar.mFlags &= ~TChar::Bold;
+                }
+
+                if (effectiveStyling.isItalic) {
+                    tchar.mFlags |= TChar::Italic;
+                } else {
+                    tchar.mFlags &= ~TChar::Italic;
+                }
+            }
+        }
+    }
+
+    // Debug: Report search results
+#if defined(DEBUG_OSC_PROCESSING)
+    qDebug() << "[OSC] Character search completed for link" << linkIndex << "- Total characters searched:" << totalCharacters << "- Matching characters found:" << matchingCharacters;
+#endif
+
+    if (mpModel) {
+        emit mpModel->mNotifier.linkCharactersChanged();
     }
 }

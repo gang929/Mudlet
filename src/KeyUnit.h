@@ -24,38 +24,40 @@
  ***************************************************************************/
 
 
-#include "pre_guard.h"
+#include "utils.h"
+
+#include <QList>
 #include <QMap>
+#include <QMultiMap>
 #include <QObject>
 #include <QPointer>
+#include <QSet>
 #include <QString>
-#include "post_guard.h"
 
 #include <list>
+#include <tuple>
+#include <vector>
 
 class Host;
 class TKey;
-
 
 class KeyUnit : public QObject
 {
     Q_OBJECT // Needed for a couple of translations
 
-    friend class XMLexport;
+            friend class XMLexport;
     friend class XMLimport;
 
 public:
     explicit KeyUnit(Host* pHost);
+    ~KeyUnit();
 
-    std::list<TKey*> getKeyRootNodeList()
-    {
-        return mKeyRootNodeList;
-    }
+    std::list<TKey*> getKeyRootNodeList() { return mKeyRootNodeList; }
 
     TKey* getKey(int id);
     void removeAllTempKeys();
     void compileAll();
-    TKey* findFirstKey(QString & name);
+    TKey* findFirstKey(QString& name);
     std::vector<int> findItems(const QString& name, const bool exactMatch, const bool caseSensitive);
     bool enableKey(const QString& name);
     bool disableKey(const QString& name);
@@ -63,6 +65,7 @@ public:
     bool registerKey(TKey* pT);
     void unregisterKey(TKey* pT);
     void reParentKey(int childID, int oldParentID, int newParentID, int parentPosition = -1, int childPosition = -1);
+    void reParentKey(int childID, int oldParentID, int newParentID, TreeItemInsertMode mode, int position = 0);
     std::tuple<QString, int, int, int> assembleReport();
     int getNewID();
     QString getKeyName(const Qt::Key, const Qt::KeyboardModifiers) const;
@@ -70,15 +73,21 @@ public:
     void uninstall(const QString&);
     void _uninstall(TKey* pChild, const QString& packageName);
     bool processDataStream(const Qt::Key, const Qt::KeyboardModifiers);
-    void markCleanup( TKey * pT );
+    // Query-only counterpart to processDataStream(), which executes what it matches
+    bool wouldMatch(const Qt::Key, const Qt::KeyboardModifiers) const;
+    // The binding wouldMatch() found, for naming it in a clash report
+    const TKey* firstMatch(const Qt::Key, const Qt::KeyboardModifiers) const;
+    void markCleanup(TKey* pT);
     void doCleanup();
+    int processingDepth() const { return mProcessingDepth; }
     void stopAllTriggers();
     void reenableAllTriggers();
 
 
     QMultiMap<QString, TKey*> mLookupTable;
-    std::list<TKey*> mCleanupList;
+    QSet<TKey*> mCleanupSet;
     QList<TKey*> uninstallList;
+    bool hasPendingDeletes() const { return !mCleanupSet.isEmpty() || !uninstallList.isEmpty(); }
     // Past behaviour is to only process the first key binding that matches,
     // ignoring any duplicates - but changing that behaviour unconditionally
     // could break things - so only do it if this flag is set:
@@ -106,6 +115,8 @@ private:
     int statsItemsTotal = 0;
     int statsTempItems = 0;
     int statsActiveItems = 0;
+    // Counter for nested processing; cleanup deferred until 0
+    int mProcessingDepth = 0;
 };
 
 #endif // MUDLET_KEYUNIT_H

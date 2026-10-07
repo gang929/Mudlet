@@ -2,200 +2,10 @@
 --- Mudlet DB
 ----------------------------------------------------------------------------------
 
-
--- TODO will be already loaded in LuaGlobal
------------------------------------------------------------------------------
--- General-purpose useful tools that were needed during development:
------------------------------------------------------------------------------
-if package.loaded["rex_pcre"] then
-  rex = require "rex_pcre"
-end
-
-if not display then
-  require "DebugTools"
-end
-if not table.contains then
-  require "TableUtils"
-end
-if not string.trim then
-  require "StringUtils"
-end
-
--- TODO those functions are already definde elsewhere
-function string.starts(String, Start)
-  return string.sub(String, 1, string.len(Start)) == Start
-end
-
-function string.ends(String, End)
-  return End == '' or string.sub(String, -string.len(End)) == End
-end
-
-
-
-
--- TODO move to StringUtils?
------------------------------------------------------------------------------
--- Some Date / Time parsing functions.
------------------------------------------------------------------------------
-datetime = {
-  _directives = {
-    ["%b"] = "(?P<abbrev_month_name>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)",
-    ["%B"] = "(?P<month_name>january|february|march|april|may|june|july|august|september|october|november|december)",
-    ["%d"] = "(?P<day_of_month>\\d{2})",
-    ["%H"] = "(?P<hour_24>\\d{2})",
-    ["%I"] = "(?P<hour_12>\\d{2})",
-    ["%m"] = "(?P<month>\\d{2})",
-    ["%M"] = "(?P<minute>\\d{2})",
-    ["%p"] = "(?P<ampm>am|pm)",
-    ["%S"] = "(?P<second>\\d{2})",
-    ["%y"] = "(?P<year_half>\\d{2})",
-    ["%Y"] = "(?P<year_full>\\d{4})"
-  },
-  _pattern_cache = {},
-  _month_names = {
-    ["january"] = 1,
-    ["february"] = 2,
-    ["march"] = 3,
-    ["april"] = 4,
-    ["may"] = 5,
-    ["june"] = 6,
-    ["july"] = 7,
-    ["august"] = 8,
-    ["september"] = 9,
-    ["october"] = 10,
-    ["november"] = 11,
-    ["december"] = 12
-  },
-  _abbrev_month_names = {
-    ["jan"] = 1,
-    ["feb"] = 2,
-    ["mar"] = 3,
-    ["apr"] = 4,
-    ["may"] = 5,
-    ["jun"] = 6,
-    ["jul"] = 7,
-    ["aug"] = 8,
-    ["sep"] = 9,
-    ["oct"] = 10,
-    ["nov"] = 11,
-    ["dec"] = 12
-  }
-}
-
--- the timestamp is stored in UTC time, so work out the difference in seconds
--- from local to UTC time. Credit: https://github.com/stevedonovan/Penlight/blob/master/lua/pl/Date.lua#L85
-function datetime:calculate_UTCdiff(ts)
-  local date, time = os.date, os.time
-  local utc = date('!*t', ts)
-  local lcl = date('*t', ts)
-  lcl.isdst = os.date("*t")["isdst"]
-  return os.difftime(time(lcl), time(utc))
-end
-
--- NOT LUADOC
--- The rex.match function does not return named patterns even if you use named capture
--- groups, but the r:tfind does -- but this only operates on compiled patterns. So,
--- we are caching the conversion of 'simple format' date patterns into a regex, and
--- then compiling them.
-function datetime:_get_pattern(format)
-  if not datetime._pattern_cache[format] then
-    local fmt = rex.gsub(format, "(%[A-Za-z])",
-    function(m)
-      return datetime._directives[m] or m
-    end
-    )
-
-    datetime._pattern_cache[format] = rex.new(fmt, rex.flags().CASELESS)
-  end
-
-  return datetime._pattern_cache[format]
-end
-
-
-
---- Parses the specified source string, according to the format if given, to return a representation of
---- the date/time. The default format if not specified is: "^%Y-%m-%d %H:%M:%S$" <br/><br/>
----
---- If as_epoch is provided and true, the return value will be a Unix epoch -- the number
---- of seconds since 1970. This is a useful format for exchanging date/times with other systems. If as_epoch
---- is false, then a Lua time table will be returned. Details of the time tables are provided
---- in the http://www.lua.org/pil/22.1.html. <br/><br/>
----
---- Supported Format Codes
----   </pre>
----   %b   Abbreviated Month Name
----   %B   Full Month Name
----   %d   Day of Month
----   %H   Hour (24-hour format)
----   %I   Hour (12-hour format, requires %p as well)
----   %p   AM or PM
----   %m   2-digit month (01-12)
----   %M   2-digit minutes (00-59)
----   %S   2-digit seconds (00-59)
----   %y   2-digit year (00-99), will automatically prepend 20 so 10 becomes 2010 and not 1910.
----   %Y   4-digit year.
----   </pre>
-function datetime:parse(source, format, as_epoch)
-  if not format then
-    format = "^%Y-%m-%d %H:%M:%S$"
-  end
-
-  local fmt = datetime:_get_pattern(format)
-  local m = { fmt:tfind(source) }
-
-  if m and m[3] then
-    m = m[3]
-    dt = {}
-
-    if m.year_half then
-      dt.year = tonumber("20" .. m.year_half)
-    elseif m.year_full then
-      dt.year = tonumber(m.year_full)
-    end
-
-    if m.month then
-      dt.month = tonumber(m.month)
-    elseif m.month_name then
-      dt.month = datetime._month_names[m.month_name:lower()]
-    elseif m.abbrev_month_name then
-      dt.month = datetime._abbrev_month_names[m.abbrev_month_name:lower()]
-    end
-
-    dt.day = m.day_of_month
-
-    if m.hour_12 then
-      assert(m.ampm, "You must use %p (AM|PM) with %I (12-hour time)")
-      if m.ampm == "PM" then
-        dt.hour = 12 + tonumber(m.hour_12)
-      else
-        dt.hour = tonumber(m.hour_12)
-      end
-    else
-      dt.hour = tonumber(m.hour_24)
-    end
-
-    dt.min = tonumber(m.minute)
-    dt.sec = tonumber(m.second)
-    dt.isdst = os.date("*t")["isdst"]
-
-    if as_epoch then
-      return os.time(dt)
-    else
-      return dt
-    end
-  else
-    return nil
-  end
-end
-
-
-
------------------------------------------------------------------------------
--- The database wrapper library
------------------------------------------------------------------------------
 if package.loaded["luasql.sqlite3"] then
   luasql = require "luasql.sqlite3"
 end
+
 
 db = {}
 db.__autocommit = {}
@@ -301,14 +111,17 @@ end
 -- The column_spec is either a string or an indexed table. This function returns either "column" or
 -- "column1", "column2" for use in the column specification of INSERT.
 function db:_sql_columns(value)
+  local col_chunks = {}
   local colstr = ''
   local t = type(value)
 
   if t == "table" then
-    col_chunks = {}
     for _, v in ipairs(value) do
-      -- see https://www.sqlite.org/syntaxdiagrams.html#ordering-term
-      if v:lower() == "desc" or v:lower() == "asc" then
+      assert(type(v) == "string", "Column names must be strings, not " .. type(v) .. ".")
+      -- see https://www.sqlite.org/syntaxdiagrams.html#ordering-term: a sort
+      -- direction belongs to the column in front of it, so one that leads the
+      -- list can only be a column of that name
+      if col_chunks[1] and (v:lower() == "desc" or v:lower() == "asc") then
         col_chunks[#col_chunks] = col_chunks[#col_chunks] .. " " .. v
       else
         col_chunks[#col_chunks + 1] = '"' .. v:lower() .. '"'
@@ -359,6 +172,8 @@ function db:_sql_values(values)
     elseif t == "table" and v._timestamp ~= nil then
       if not v._timestamp then
         s = "NULL"
+      elseif v._timestamp == "CURRENT_TIMESTAMP" then
+        s = "datetime('now')"
       else
         s = "datetime('" .. v._timestamp .. "', 'unixepoch')"
       end
@@ -381,11 +196,184 @@ end
 --   "mydatabase", and "../../../../etc/passwd" becomes "etcpasswd". This prevents any possible
 --   security issues with database names.
 function db:safe_name(name)
-  name = name:gsub("[^%a%d]", "")
+  name = name:gsub("[^%ad]", "")
   name = name:lower()
   return name
 end
 
+
+function db:_isActiveDBName(db_name)
+  db_name = db:safe_name(db_name)
+
+  return (
+    db.__conn[db_name]
+    and db.__conn[db_name] ~= 'SQLite3 connection (closed)'
+    and io.exists(getMudletHomeDir() .. "/Database_" .. db_name .. ".db")
+  )
+end
+
+
+-- NOT LUADOC
+-- db:close takes the connection away but leaves db.__schema behind, so every sheet,
+-- field and database handle a script is still holding keeps working right up to the
+-- moment it needs the connection, and then indexes a nil. Nothing routes through a
+-- single choke point, so each site that reaches into db.__conn has to notice for
+-- itself; the callers of this function are the authoritative list of them.
+--
+-- Every one of those sites raised before these guards existed, and all but one still
+-- does. THE RULE IS THAT NAMING THE CAUSE MUST NOT MAKE A LOUD FAILURE QUIET, not
+-- that every site should answer the same way:
+--
+--   * db:add is the one that returns, because it alone already answers nil plus a
+--     printed message when its INSERT fails, and packages do check that result.
+--   * db:fetch_sql looks like it should match db:add, and must not. Its SQL-failure
+--     path returns a BARE nil - no message, no print - and a query that matched
+--     nothing returns an empty table, not nil. Handing back nil for a closed
+--     database would make the fetch-then-add upsert that db:merge_unique itself
+--     writes silently take the insert branch and loop forever.
+--   * db.Database:_commit and _rollback answer false plus a message, the contract
+--     #10068 gave them to match db:close. They are not a third opinion, just an
+--     older one.
+--   * everything else raises, which is what it did before.
+--
+-- error() rather than assert() throughout: assert would build the message on every
+-- healthy call, and these sit on trigger-driven write paths.
+--
+-- expected is a parameter because the sites do not agree on what they take: a sheet at
+-- most of them, a field at db:set and db:aggregate, a database name at db:_migrate, the
+-- handle itself at the db.Database methods. No one phrase is true at all of them, and a
+-- phrase that named several would have to deny a field reference is a field reference.
+local A_SHEET = "a sheet, as in mydb.sheetname"
+local A_FIELD = "a field, as in mydb.sheetname.fieldname"
+local A_DATABASE = "a database handle, as in what db:create returned"
+
+local function db_no_connection_message(action, db_name, expected)
+  -- something that is not what this site takes carries no name to look up, so it lands
+  -- on the same missing connection by a different route: saying "closed" there would
+  -- name a cause that is not the one the caller has to fix
+  if not db_name then
+    return "can not "..action.." the database: expected "..expected.."."
+  end
+
+  -- likewise a name that was never created at all, where hunting for a db:close call
+  -- that does not exist is the wrong place to send someone
+  if not db.__schema[db_name] then
+    return "can not "..action.." "..db_name..": no database by that name has been created."
+  end
+
+  return "can not "..action.." "..db_name.." because the database is closed."
+end
+
+
+local VALIDATION_OPTIONS = {
+  "ABORT",
+  "FAIL",
+  "IGNORE",
+  "REPLACE",
+  "ROLLBACK"
+}
+
+---@param validations string
+---@return boolean is_valid
+---@return string msg
+function db:_validate_validations(validations)
+  if type(validations) ~= "string" then
+    return false, "_validations must be a string. Received "..type(validations)
+  elseif table.contains(VALIDATION_OPTIONS, validations) then
+    return true, ""
+  end
+
+  return false, '_validations must be one of: {"ABORT", "FAIL", "IGNORE", "REPLACE", "ROLLBACK"}.  Received: '..validations
+end
+
+
+---@param unique_constraints string|table
+---@return boolean is_valid
+---@return string msg
+function db:_validate_unique_contraints(unique_constraints)
+  local is_valid, msg = true, ""
+
+  local type_of = type(unique_constraints)
+  local is_string = type_of == "string"
+  local is_table = type_of == "table"
+
+  if is_string then
+    -- pass
+  elseif is_table then
+    local msgs = {}
+    for _, unique_constraint in ipairs(unique_constraints) do
+      type_of = type(unique_constraint)
+      is_string = type_of == "string"
+      is_table = type_of == "table"
+      if is_string then
+        -- pass
+      elseif is_table then
+        for _, value in ipairs(unique_constraint) do
+          type_of = type(value)
+          if type_of ~= "string" then
+            is_valid = false
+            table.insert(msgs, "Multi-column definitions for _unique must be a list of strings, for example: _unique = { {'foo', 'bar'} }.  Received "..type_of..".")
+          end
+        end
+      else
+        is_valid = false
+        table.insert(msgs, "Members of _unique must be a string or table. Received ".. type_of..".")
+      end
+    end
+
+    msg = table.concat(msgs, "\n")
+  else
+    is_valid = false
+    msg = "_unique must be a string or a table.  Received "..type_of.."."
+  end
+
+  return is_valid, msg
+end
+
+
+--- Checks an _index sheet option, which takes the same shapes _unique does: a
+--- single column name, a list of column names, or a list holding a list of
+--- column names for a compound index.
+---@param index string|table
+---@return boolean is_valid
+---@return string msg
+function db:_validate_index(index)
+  local type_of = type(index)
+
+  if type_of == "string" then
+    return true, ""
+  elseif type_of ~= "table" then
+    return false, "_index must be a string or a table.  Received "..type_of.."."
+  end
+
+  local msgs = {}
+  for _, index_entry in ipairs(index) do
+    type_of = type(index_entry)
+    if type_of == "table" then
+      for _, column_name in ipairs(index_entry) do
+        if type(column_name) ~= "string" then
+          table.insert(msgs, "Multi-column definitions for _index must be a list of strings, for example: _index = { {'foo', 'bar'} }.  Received "..type(column_name)..".")
+        end
+      end
+    elseif type_of ~= "string" then
+      table.insert(msgs, "Members of _index must be a string or table. Received "..type_of..".")
+    end
+  end
+
+  return msgs[1] == nil, table.concat(msgs, "\n")
+end
+
+
+-- NOT LUADOC
+-- Lua's reserved words, so db:create can tell a column name that may be written
+-- as a bare key in the {name = ""} sheet form from one that has to be bracketed
+local lua_reserved_words = {
+  ["and"] = true, ["break"] = true, ["do"] = true, ["else"] = true, ["elseif"] = true,
+  ["end"] = true, ["false"] = true, ["for"] = true, ["function"] = true, ["if"] = true,
+  ["in"] = true, ["local"] = true, ["nil"] = true, ["not"] = true, ["or"] = true,
+  ["repeat"] = true, ["return"] = true, ["then"] = true, ["true"] = true,
+  ["until"] = true, ["while"] = true,
+}
 
 
 --- Creates and/or modifies an existing database. This function is safe to define at a top-level of a Mudlet
@@ -393,6 +381,21 @@ end
 --- If the named database does not exist it will create it. If the database does exist then it will add
 --- any columns or indexes which didn't exist before to that database. If the database already has all the
 --- specified columns and indexes, it will do nothing. <br/><br/>
+---
+--- Because it is meant to run unguarded, a fault in the schema is only fatal when it has to be,
+--- and where that line falls depends on what the faulty part holds. Something derived can be left
+--- out and reported: an _index naming a column the sheet does not declare is skipped rather than
+--- refused, because every row stays reachable without the index. A column is not derived. A sheet
+--- built without one takes writes to it silently, since db:add reports the rejected INSERT the
+--- same way and returns nil, which callers do not check, so a script can record nothing for weeks
+--- with no sign of it. A fault that would cost the sheet a column therefore stays fatal, and its
+--- message names the key so the fix is obvious. A value whose shape no sheet can be built from is
+--- refused as well, whatever it holds: a malformed _index, _unique or _violations leaves nothing to
+--- skip and nothing to build from. <br/><br/>
+---
+--- Note when weighing that up that printError is a quiet channel: it reaches the editor's Errors
+--- tab, which is hidden until the user opens it, and the main console only when they have turned
+--- on echoing Lua errors. <br/><br/>
 ---
 --- The database will be called Database_<sanitized database name>.db and will be stored in the
 --- Mudlet configuration directory. <br/><br/>
@@ -436,57 +439,539 @@ end
 ---   )
 ---   </pre>
 ---   Note that you have to use double {{ }} if you have composite index/unique constrain.
+---   A single column may be given on its own instead of in a list, so _index = "city"
+---   and _unique = "name" mean the same as the two lines above.
+---   A sheet may also be given as a plain list of its column names, which then all
+---   hold text and default to "". The sheet options are keys rather than list members,
+---   so they work there too: enemies = {"name", "city", _index = "city"}
+---   An _index entry naming a column the sheet does not have cannot be created, so
+---   that entry is skipped and a warning is printed, while everything else the
+---   sheet asks for is made as usual. The indexes the sheet already has are left
+---   alone in that case, since what is left of _index is no longer the whole set
+---   it asked for.
+---   A _unique entry naming a column the sheet does not have is skipped and warned
+---   about the same way, but that one costs more than an index would: a sheet made
+---   from scratch is built without the uniqueness it asked for, so db:add takes rows
+---   the constraint would have refused. A sheet that already enforces that uniqueness
+---   keeps it and is warned about again, since taking a rule off a typo is not
+---   something a later, correct db:create can undo: its constraints are then left
+---   exactly as they are, a constraint it has newly asked for and a change to
+---   _violations among them, until the entry is spelled right. A db:create that
+---   loses the sheet nothing is applied as usual, and one that also drops a column
+---   does lose the rule, since removing a column is a rebuild in its own right.
+---   Naming _row_id in a _unique entry written as a list is warned about but kept,
+---   since a sheet's _row_id is unique on its own and the constraint is therefore
+---   one that can never refuse a row.
 function db:create(db_name, sheets, force)
   if not db.__env or db.__env == 'SQLite3 environment (closed)' then
     db.__env = luasql.sqlite3()
   end
 
-  assert(db_name == db:safe_name(db_name), "Database name contains illegal characters.  Only alphanumeric characters are valid.  Database not created or loaded.")
-
+  local is_valid, msgs, warnings = true, {}, {}
+  local schema = {}
   db_name = db:safe_name(db_name)
 
-  if not db.__conn[db_name] or db.__conn[db_name] == 'SQLite3 connection (closed)' or (not io.exists(getMudletHomeDir() .. "/Database_" .. db_name .. ".db")) then
-    db.__conn[db_name] = db.__env:connect(getMudletHomeDir() .. "/Database_" .. db_name .. ".db")
-    db.__conn[db_name]:setautocommit(false)
-    db.__autocommit[db_name] = true
-  end
-
-  db.__schema[db_name] = {}
 
   -- We need to separate the actual column configuration from the meta-configuration of the desired
   -- sheet. {sheet={"column"}} verses {sheet={"column"}, _index={"column"}}. In the former we are
   -- creating a database with a single field; in the latter we are also adding an index on that
   -- field. The db package reserves any key that begins with an underscore to be special and syntax
   -- for its own use.
-  for s_name, sht in pairs(sheets) do
+  for sheet_name, sheet in pairs(sheets) do
+    local columns = {}
     local options = {}
+    local has_skipped_index = false
+    local has_skipped_unique = false
 
-    if sht[1] ~= nil then
-      -- in case the sheet was provided in the sheet = {"column1", "column2"} format:
-      local t = {}               --   assume field types are text, and should default to ""
-      for k, v in pairs(sht) do
-        t[v] = ""
+    -- the sheet was provided in {"column1", "column2"} format
+    if sheet[1] ~= nil then
+      -- The list holds the column names, which are text defaulting to "". A key
+      -- is a sheet option when it starts with an underscore and an error
+      -- otherwise: sweeping keys in with the column names would make a column
+      -- out of an index definition. Numeric keys are checked against #sheet so
+      -- that a stray [7] in a two-item list is not taken for a column name.
+      -- These stay hard errors rather than being skipped the way an unusable
+      -- _index entry is: a sheet built without one of its columns takes every
+      -- write to that column silently, since db:add reports the rejected INSERT
+      -- to the same place and returns nil, which callers do not check.
+      local column_count = #sheet
+
+      -- both working forms, spelled with the names this sheet did give plus the
+      -- one being complained about, so the fix can be read straight off the
+      -- message. Leaving that name out would advise a sheet without the column
+      -- the user was declaring, which is the state this refusal exists to stop.
+      local function keyed_entry(name)
+        if name:match("^[%a_][%w_]*$") and not lua_reserved_words[name] then
+          return name..' = ""'
+        end
+        -- anything else is not a bare key, so the form the message tells the
+        -- user to write would not parse
+        return "["..string.format("%q", name)..'] = ""'
       end
-      sht = t
-    else -- sheet provided in the sheet = {"column1" = default} format
-      for k, v in pairs(sht) do
-        if string.starts(k, "_") then
-          options[k] = v
-          sht[k] = nil
+
+      local function both_forms(extra_name)
+        local listed, keyed = {}, {}
+        for i = 1, column_count do
+          if type(sheet[i]) == "string" then
+            listed[#listed + 1] = string.format("%q", sheet[i])
+            keyed[#keyed + 1] = keyed_entry(sheet[i])
+          end
+        end
+        if extra_name then
+          listed[#listed + 1] = string.format("%q", extra_name)
+          keyed[#keyed + 1] = keyed_entry(extra_name)
+        end
+        if listed[1] == nil then
+          return '{"name", "city"}', '{name = "", city = ""}'
+        end
+        return "{"..table.concat(listed, ", ").."}", "{"..table.concat(keyed, ", ").."}"
+      end
+
+      for key, value in pairs(sheet) do
+        if type(key) == "number" and key % 1 == 0 and key >= 1 and key <= column_count then
+          if type(value) == "string" then
+            columns[value] = ""
+          else
+            -- no example here: the two forms would have to be spelled without
+            -- the name this entry was meant to give, which reads as advice to
+            -- drop the column rather than to name it
+            is_valid = false
+            table.insert(msgs, "db:create - "..sheet_name.." - column name #"..key..
+              " is a "..type(value)..", but a sheet's column names have to be strings.")
+          end
+        elseif type(key) == "string" and string.starts(key, "_") then
+          options[key] = value
+        elseif type(key) == "number" then
+          -- past the end, at or below zero, or fractional: none of them is a
+          -- position in the list, so none of them names a column
+          is_valid = false
+          table.insert(msgs, "db:create - "..sheet_name.." - ["..tostring(key)..
+            "] is not a position in this "..column_count.." item list, so it names no column. "..
+            "A sheet given as a list runs from 1 with no gaps.")
+        else
+          -- only a string key names a column the example can offer to declare
+          local list_form, keyed_form = both_forms(type(key) == "string" and key or nil)
+          is_valid = false
+          table.insert(msgs, "db:create - "..sheet_name.." - "..string.format("%q", tostring(key))..
+            " is a key, but a sheet given as a list takes its column names as list members. Write "..
+            list_form..", or use the "..keyed_form.." form to give a column a default.")
+        end
+      end
+
+    -- sheet provided in {"column1" = default} format
+    else
+      for key, value in pairs(sheet) do
+
+        if string.starts(key, "_") then
+          options[key] = value
+        else
+          columns[key] = value
         end
       end
     end
 
-    if not options._violations then
+    if options._violations then
+      local is_validations_valid, msg = db:_validate_validations(options._violations)
+      if is_validations_valid == false then
+        is_valid = false
+        table.insert(msgs, "db:create - "..sheet_name.." - "..msg)
+      end
+    else
       options._violations = "FAIL"
     end
 
-    db.__schema[db_name][s_name] = { columns = sht, options = options }
-    db:_migrate(db_name, s_name, force)
+    if options._unique then
+      local is_unique_valid, msg = db:_validate_unique_contraints(options._unique)
+      if is_unique_valid == false then
+        is_valid = false
+        table.insert(msgs, "db:create - "..sheet_name.." - "..msg)
+      end
+
+      -- the readers of _unique want the list: the loop below walks it with ipairs,
+      -- and db:merge_unique measures it with #, which on a string gives the length
+      -- of the column name rather than one constraint and raises. db.__schema is
+      -- only written here, so normalising once covers both
+      if type(options._unique) == "string" then
+        options._unique = { options._unique }
+      end
+
+      if type(options._unique) == "table" then
+        -- the two forms reach the database by different routes, so what counts as a
+        -- column the sheet has differs too: a compound entry is written into the
+        -- CREATE TABLE for sqlite to resolve, which matches names case-insensitively
+        -- and knows the _row_id every sheet is given, while a single column name is
+        -- attached by an exact-match lookup in db:_build_create_table_sql
+        local resolvable = { _row_id = true }
+        for column_name in pairs(columns) do
+          -- column keys may be numbers, and sqlite resolves UNIQUE("2") against a column called 2
+          resolvable[tostring(column_name):lower()] = true
+        end
+
+        local wanted = {}
+
+        for _, unique_entry in ipairs(options._unique) do
+          local compound = type(unique_entry) == "table"
+          local unique_columns = compound and unique_entry or {unique_entry}
+          local unknown_column
+          local names_row_id
+
+          for _, column_name in ipairs(unique_columns) do
+            if type(column_name) == "string" then
+              local known
+              if compound then
+                known = resolvable[column_name:lower()] ~= nil
+                names_row_id = names_row_id or column_name:lower() == "_row_id"
+              else
+                known = columns[column_name] ~= nil
+              end
+
+              if not known and not unknown_column then
+                unknown_column = column_name
+              end
+            end
+          end
+
+          -- a UNIQUE naming a column sqlite cannot resolve is refused, and takes the
+          -- whole CREATE TABLE with it, leaving no sheet at all. Dropping the
+          -- constraint keeps the sheet, at the price of db:add then taking the
+          -- duplicates it was meant to refuse. On an existing sheet either form can
+          -- cost a rule the table enforces, so has_skipped_unique tells db:_migrate
+          if compound and #unique_entry == 0 then
+            has_skipped_unique = true
+            table.insert(warnings, "db:create - "..sheet_name.." - _unique has an entry with no "..
+              "column names in it: that constraint is skipped.")
+          elseif not unknown_column then
+            -- a list naming _row_id can never refuse a row but is kept: dropping it changes the SQL
+            -- for no gain, and has_skipped_unique would stop the constraints ever being reconciled
+            if names_row_id then
+              table.insert(warnings, "db:create - "..sheet_name.." - _unique names \"_row_id\" in an "..
+                "entry written as a list, and a sheet's _row_id is unique already, so that constraint "..
+                "can never refuse a row: drop it, or name the columns you meant.")
+            end
+
+            wanted[#wanted + 1] = unique_entry
+          elseif unknown_column == "_row_id" then
+            has_skipped_unique = true
+            table.insert(warnings, "db:create - "..sheet_name.." - _unique names \"_row_id\", the key "..
+              "every sheet is given, which is unique already: that constraint is skipped. Naming it "..
+              "in a compound entry makes one that can never refuse a row either.")
+          else
+            has_skipped_unique = true
+            table.insert(warnings, "db:create - "..sheet_name.." - _unique names \""..unknown_column..
+              "\", which is not one of the sheet's columns: that constraint is skipped.")
+          end
+        end
+
+        -- nil rather than an empty list, so db:merge_unique can still tell a sheet
+        -- with no unique index from one with several by which of its asserts fires
+        options._unique = #wanted > 0 and wanted or nil
+      end
+    end
+
+    -- A falsy _index means the sheet wants no indexes, the same as _unique and
+    -- _violations above treat theirs
+    if options._index then
+      local is_index_valid, msg = db:_validate_index(options._index)
+      if is_index_valid == false then
+        is_valid = false
+        table.insert(msgs, "db:create - "..sheet_name.." - "..msg)
+      end
+
+      -- A single column name is as good an _index as a list of them, but the
+      -- readers of _index only handle the list: db:_drop_orphaned_indexes walks
+      -- it with ipairs and db:_migrate_indexes ignores anything that is not a
+      -- table. db.__schema is only written here, so normalising once covers
+      -- both of them.
+      if type(options._index) == "string" then
+        options._index = { options._index }
+      end
+
+      -- An index on a column this sheet does not declare is dropped from the
+      -- wanted set and reported rather than carried: db:_migrate_indexes cannot
+      -- make the index a typo asks for, and leaving the entry in place has
+      -- db:_drop_orphaned_indexes take the typo for part of the wanted set. It
+      -- is a warning rather than an error because the rest of the sheet is
+      -- sound and its data is reachable without the index, so a script that has
+      -- lived with the stray name goes on working. What is left of _index is no
+      -- longer everything the sheet asked for, though, so the sheet is marked
+      -- for db:_drop_orphaned_indexes to leave the indexes it has alone. The
+      -- shapes _validate_index refused above are left to it to report.
+      if type(options._index) == "table" then
+        local wanted = {}
+
+        for _, index_entry in ipairs(options._index) do
+          local index_columns = type(index_entry) == "table" and index_entry or {index_entry}
+          local unknown_column
+
+          for _, column_name in ipairs(index_columns) do
+            if not unknown_column and type(column_name) == "string" and columns[column_name] == nil then
+              unknown_column = column_name
+            end
+          end
+
+          -- one unknown column costs the whole entry: a compound index on the
+          -- rest of its columns is not the one that was asked for
+          if not unknown_column then
+            wanted[#wanted + 1] = index_entry
+          else
+            has_skipped_index = true
+
+            if unknown_column == "_row_id" then
+              table.insert(warnings, "db:create - "..sheet_name.." - _index names \"_row_id\", which is the "..
+                "key every sheet is given rather than one of its own columns: that index is skipped.")
+            elseif unknown_column:lower() == "asc" or unknown_column:lower() == "desc" then
+              -- db:_sql_columns would build the ordering term, but
+              -- db:_index_valid refuses it, so the index was never made
+              table.insert(warnings, "db:create - "..sheet_name.." - _index names \""..unknown_column..
+                "\", and an index takes column names only, not a sort direction: that index is skipped.")
+            else
+              table.insert(warnings, "db:create - "..sheet_name.." - _index names \""..unknown_column..
+                "\", which is not one of the sheet's columns: that index is skipped.")
+            end
+          end
+        end
+
+        options._index = wanted
+      end
+    end
+
+    schema[sheet_name] = {
+      columns = columns,
+      options = options,
+      has_skipped_index = has_skipped_index,
+      has_skipped_unique = has_skipped_unique,
+    }
+  end
+
+  assert(is_valid, table.concat(msgs, "\n"))
+
+  -- after the assert: what is wrong with the schema comes before what was left
+  -- out of it, and a sheet that never got made has nothing to warn about
+  for _, warning in ipairs(warnings) do
+    printError(warning, true, false)
+  end
+
+  if not db:_isActiveDBName(db_name) then
+    -- the driver answers nil plus a reason for a file it can not open, which a
+    -- read-only profile directory or a full disk both produce: without this the
+    -- setautocommit below is the nil index instead
+    local conn, err = db.__env:connect(getMudletHomeDir() .. "/Database_" .. db_name .. ".db")
+    if not conn then
+      error("db:create could not open the database file for "..db_name..": "..tostring(err), 2)
+    end
+
+    db.__conn[db_name] = conn
+    conn:setautocommit(false)
+    db.__autocommit[db_name] = true
+  end
+
+  db.__schema[db_name] = schema
+
+  for sheet_name, _ in pairs(sheets) do
+    db:_migrate(db_name, sheet_name, force)
   end
   return db:get_database(db_name)
 end
 
+
+local function normalize_sql(sql)
+  return (
+    sql:lower()
+    :gsub("\n", " ")
+    :gsub("\r", " ")
+    :gsub("%s+", " ")
+    :gsub("^%s*(.-)%s*$", "%1")
+  )
+end
+
+
+-- NOT LUADOC
+-- Extracts UNIQUE constraints from a CREATE TABLE statement.
+-- This includes both column-level constraints (e.g., "col1" TEXT UNIQUE ON CONFLICT REPLACE)
+-- and table-level constraints (e.g., UNIQUE("col1", "col2") ON CONFLICT FAIL), each of
+-- which may come without its ON CONFLICT clause (e.g., "col1" TEXT UNIQUE).
+-- This allows us to detect when constraint definitions have changed without being affected by
+-- column additions/removals.
+function db:_extract_table_constraints(sql)
+  if not sql or sql == "" then
+    return ""
+  end
+
+  -- Normalize whitespace and case for consistent comparison
+  local normalized = normalize_sql(sql)
+
+  -- Extract the part between the parentheses of CREATE TABLE
+  local content = normalized:match("create%s+table%s+[%w_\"]+%s*%((.+)%)")
+  if not content then
+    return ""
+  end
+
+  local constraints = {}
+
+  -- A column name and a default value are both quoted, and either can hold the
+  -- word, so the search runs over a copy with the quoted parts blanked out.
+  -- Same-length blanks keep every offset lined up with the content itself.
+  local function blank(quoted)
+    return (" "):rep(#quoted)
+  end
+  local searchable = content:gsub('"[^"]*"', blank)
+  searchable = searchable:gsub("'[^']*'", blank)
+
+  -- Each UNIQUE is picked up with the column list it may carry, then with the
+  -- ON CONFLICT clause it may carry. Both parts are optional: SQLite defaults
+  -- the conflict resolution to ABORT, so a sheet whose table was not written by
+  -- this module can hold a bare UNIQUE, and a bare one has to be seen or a
+  -- change in uniqueness compares equal to no uniqueness at all.
+  local position = 1
+  while true do
+    local start, stop = searchable:find("unique", position, true)
+    if not start then
+      break
+    end
+    position = stop + 1
+
+    -- and a column called unique_id is not one either
+    local before = start > 1 and searchable:sub(start - 1, start - 1) or " "
+    local after = searchable:sub(stop + 1, stop + 1)
+    if not before:match("[%w_]") and not after:match("[%w_]") then
+      local constraint = "unique"
+
+      local columns_start, columns_stop = content:find("^%s*%([^)]+%)", position)
+      if columns_start then
+        constraint = constraint .. content:sub(columns_start, columns_stop)
+        position = columns_stop + 1
+      end
+
+      local conflict_start, conflict_stop = content:find("^%s+on%s+conflict%s+%w+", position)
+      if conflict_start then
+        constraint = constraint .. content:sub(conflict_start, conflict_stop)
+        position = conflict_stop + 1
+      end
+
+      table.insert(constraints, constraint)
+    end
+  end
+
+  -- Sort for consistent comparison
+  table.sort(constraints)
+
+  return table.concat(constraints, "|")
+end
+
+
+
+-- Splits on commas outside brackets. `searchable` is `text` with quoted parts blanked, so quoted
+-- commas don't count; each piece carries both, as callers read names off one and search the other.
+local function split_on_commas(text, searchable)
+  local pieces = {}
+  local depth, piece_start = 0, 1
+
+  local function add(stop_at)
+    pieces[#pieces + 1] = { text = text:sub(piece_start, stop_at), scan = searchable:sub(piece_start, stop_at) }
+  end
+
+  for position = 1, #searchable do
+    local char = searchable:sub(position, position)
+    if char == "(" then
+      depth = depth + 1
+    elseif char == ")" then
+      depth = depth - 1
+    elseif char == "," and depth == 0 then
+      add(position - 1)
+      piece_start = position + 1
+    end
+  end
+  add(#text)
+
+  return pieces
+end
+
+
+-- Bare names are read too: a table this module didn't write may not quote them, and reading them
+-- as empty would make all its UNIQUEs look alike. Other forms ([name]) do come back empty, which no
+-- expected CREATE TABLE holds, so that sheet is left alone rather than losing a rule.
+local function leading_column_name(text)
+  local trimmed = text:match("^%s*(.-)%s*$")
+
+  return trimmed:match('^"([^"]*)"') or trimmed:match("^([%w_$]+)") or ""
+end
+
+
+-- Counts each UNIQUE's column set, sorted as order doesn't matter to sqlite, and ignoring ON CONFLICT
+-- (a _violations change costs no uniqueness). Not db:_extract_table_constraints: it drops a
+-- column-level UNIQUE's column name, so a rule moving between columns would look unchanged.
+local function unique_targets(sql)
+  local counts = {}
+  local content = normalize_sql(sql or ""):match("^create table [^(]+%((.+)%)$")
+  if not content then
+    return counts
+  end
+
+  -- quoted names and defaults may hold a comma, a bracket or "unique", so scan a copy with them
+  -- blanked; same-length blanks keep offsets lined up
+  local function blank(quoted)
+    return (" "):rep(#quoted)
+  end
+  local searchable = content:gsub('"[^"]*"', blank):gsub("'[^']*'", blank)
+
+  for _, part in ipairs(split_on_commas(content, searchable)) do
+    local text, scan = part.text, part.scan
+
+    local start, stop = scan:find("unique", 1, true)
+    while start and (scan:sub(start - 1, start - 1):match("[%w_]") or scan:sub(stop + 1, stop + 1):match("[%w_]")) do
+      -- a column called unique_id is not one
+      start, stop = scan:find("unique", stop + 1, true)
+    end
+
+    if start then
+      -- table-level: the bracketed list that follows; column-level: the column the part opens with
+      local columns = {}
+      local list_start, list_stop = scan:find("^%s*%b()", stop + 1)
+
+      if list_start then
+        local list_text = text:sub(list_start, list_stop):match("^%s*%((.*)%)$")
+        local list_scan = scan:sub(list_start, list_stop):match("^%s*%((.*)%)$")
+        for _, entry in ipairs(split_on_commas(list_text, list_scan)) do
+          columns[#columns + 1] = leading_column_name(entry.text)
+        end
+      else
+        columns[1] = leading_column_name(text)
+      end
+
+      table.sort(columns)
+      -- not a comma, or a column called a,b would equal a UNIQUE over a and b
+      local target = table.concat(columns, "\0")
+      counts[target] = (counts[target] or 0) + 1
+    end
+  end
+
+  return counts
+end
+
+
+local function drops_a_unique(expected_sql, actual_sql)
+  local expected = unique_targets(expected_sql)
+  for target, count in pairs(unique_targets(actual_sql)) do
+    if (expected[target] or 0) < count then
+      return true
+    end
+  end
+
+  return false
+end
+
+
+local function count_rows(conn, s_name)
+  local count_cursor, count_err = conn:execute("SELECT COUNT(*) as cnt FROM " .. s_name);
+  if count_cursor == nil then
+    return nil, count_err
+  end
+
+  local count = count_cursor:fetch({}, "a").cnt;
+  count_cursor:close();
+
+  return count, nil;
+end
 
 
 -- NOT LUADOC
@@ -496,6 +981,11 @@ end
 -- it is not capable of removing indexes, columns, or sheets after they have been defined.
 function db:_migrate(db_name, s_name, force)
   local conn = db.__conn[db_name]
+  -- db:create is the only caller outside the specs and it has a live connection by
+  -- the time it gets here, so this only fires for a script calling db:_migrate
+  -- directly. Note the first argument is a database name, not a sheet
+  if not conn then error(db_no_connection_message("migrate", db_name, "a database name"), 2) end
+
   local schema = db.__schema[db_name][s_name]
 
   local current_columns = {}
@@ -503,6 +993,7 @@ function db:_migrate(db_name, s_name, force)
   -- The PRAGMA table_info command is a query which returns all of the columns currently
   -- defined in the specified table. The purpose of this section is to see if any new columns
   -- have been added.
+  db:echo_sql("PRAGMA table_info('" .. s_name .. "')")
   local cur = conn:execute("PRAGMA table_info('" .. s_name .. "')") -- currently broken - LuaSQL bug, needs to be upgraded for new sqlite API
 
   if type(cur) == "userdata" then
@@ -552,7 +1043,191 @@ function db:_migrate(db_name, s_name, force)
   else
     -- At this point we know that the sheet already exists, but we are concerned if the current
     -- definition includes columns which may be added.
-    local missing = {}
+
+    -- Check if the table-level constraints have changed (e.g., _violations option changed)
+    -- by comparing only the UNIQUE constraint definitions, not the column list
+    local expected_sql = db:_build_create_table_sql(schema, s_name)
+    local get_actual_sql = "SELECT sql FROM sqlite_master " ..
+                           "WHERE type = 'table' AND name = '" .. s_name .. "'"
+    db:echo_sql(get_actual_sql)
+    local sql_cur, sql_err = conn:execute(get_actual_sql)
+    local table_constraints_changed = false
+    local would_drop_a_unique = false
+    local unique_lost_to_column_removal = false
+
+    if sql_cur and type(sql_cur) ~= "number" then
+      local sql_row = sql_cur:fetch({}, "a")
+      sql_cur:close()
+
+      if sql_row and sql_row.sql then
+        local actual_sql = sql_row.sql
+        local expected_constraints = db:_extract_table_constraints(expected_sql)
+        local actual_constraints = db:_extract_table_constraints(actual_sql)
+
+        if expected_constraints ~= actual_constraints then
+          table_constraints_changed = true
+          -- a skipped _unique entry is likely a typo, and once fixed its rule can't be restored over
+          -- duplicates let in meanwhile, so hold back only a rebuild that would drop an enforced rule
+          if schema.has_skipped_unique and drops_a_unique(expected_sql, actual_sql) then
+            -- unless a column is removed: that rebuilds from the same pruned _unique anyway, and keeping
+            -- the column is worse, as db.Sheet's __index raises for columns not in the schema
+            local removes_a_column = false
+            for column_name in pairs(current_columns) do
+              -- == nil, not falsy: a column defaulting to false is still declared
+              if column_name ~= "_row_id" and schema.columns[column_name] == nil then
+                removes_a_column = true
+                break
+              end
+            end
+
+            would_drop_a_unique = not removes_a_column
+
+            if would_drop_a_unique then
+              printError("db:create - "..s_name.." - the uniqueness this sheet already enforces is "..
+                "kept rather than rebuilt to match what is left of _unique: spell the skipped "..
+                "entries right and it is applied then.", true, false)
+            else
+              -- reported only once past the guard that can still halt the rebuild
+              unique_lost_to_column_removal = true
+            end
+          end
+        end
+      end
+    end
+
+    if table_constraints_changed and not would_drop_a_unique then
+      -- Commit any pending transaction before table recreation
+      db:echo_sql("COMMIT")
+      conn:commit()
+
+      -- Check if we're deleting columns that contain data (unless force flag is set)
+      local redundant_columns = {}
+      for k, _ in pairs(current_columns) do
+        -- == nil, not falsy: a column defaulting to false is declared
+        if schema.columns[k] == nil and k ~= "_row_id" then
+          redundant_columns[#redundant_columns + 1] = k
+        end
+      end
+
+      if #redundant_columns > 0 and not force then
+        -- Check if any of the redundant columns contain non-null data
+        local not_blank = {}
+        for _, col in ipairs(redundant_columns) do
+          local check_sql = string.format('SELECT COUNT(*) AS cnt FROM %s WHERE "%s" IS NOT NULL', s_name, col)
+          db:echo_sql(check_sql)
+          local check_cur, check_err = conn:execute(check_sql)
+          assert(check_cur, check_err)
+
+          if type(check_cur) ~= "number" then
+            local check_row = check_cur:fetch({}, "a")
+            check_cur:close()
+
+            if check_row and check_row.cnt and tonumber(check_row.cnt) > 0 then
+              not_blank[#not_blank + 1] = col
+            end
+          end
+        end
+
+        assert(not not_blank[1] or force,
+               "db:_migrate halted due to data present in undefined columns: " .. table.concat(not_blank, ", ") ..
+               "\nuse force option to drop anyway.")
+      end
+
+      if unique_lost_to_column_removal then
+        printError("db:create - "..s_name.." - removing a column rebuilds this sheet from what is "..
+          "left of _unique, so the uniqueness it enforces today is lost whichever column that rule "..
+          "sits on: spell the skipped entries right before removing a column.", true, false)
+      end
+
+      -- Build the list of columns to preserve (only columns that exist in both current and new schema)
+      local fields = { "_row_id" }
+      for k, _ in pairs(schema.columns) do
+        if current_columns[k] then
+          fields[#fields + 1] = string.format('"%s"', k)
+        end
+      end
+      local fields_sql = table.concat(fields, ", ")
+
+      -- Get the current CREATE TABLE statement to use for the backup
+      local get_create = "SELECT sql FROM sqlite_master " ..
+                        "WHERE type = 'table' AND name = '" .. s_name .. "'"
+      db:echo_sql(get_create)
+      local create_cur, create_err = conn:execute(get_create)
+      assert(create_cur, create_err)
+
+      if type(create_cur) ~= "number" then
+        local row = create_cur:fetch({}, "a")
+        create_cur:close()
+
+        -- Ensure we got a result
+        if not row or not row.sql then
+          error("Unable to fetch CREATE TABLE statement for table: " .. s_name)
+        end
+
+        local original_count, og_count_err = count_rows(conn, s_name);
+        assert(original_count, og_count_err);
+
+        -- Create temporary backup table, recreate main table, copy data
+        local create_tmp = row.sql:gsub(s_name, s_name .. "_bak")
+        create_tmp = create_tmp:gsub("TABLE", "TEMPORARY TABLE")
+
+        local sql_chunks = {}
+        sql_chunks[#sql_chunks + 1] = create_tmp .. ";"
+        sql_chunks[#sql_chunks + 1] = "INSERT INTO " .. s_name .. "_bak SELECT * FROM " .. s_name .. ";"
+        sql_chunks[#sql_chunks + 1] = "DROP TABLE " .. s_name .. ";"
+
+        local new_create_sql = db:_build_create_table_sql(schema, s_name)
+
+        sql_chunks[#sql_chunks + 1] = new_create_sql .. ";"
+        sql_chunks[#sql_chunks + 1] = string.format("INSERT INTO %s SELECT %s FROM %s_bak;", s_name, fields_sql, s_name)
+        sql_chunks[#sql_chunks + 1] = "DROP TABLE " .. s_name .. "_bak;"
+
+        for i, sql in ipairs(sql_chunks) do
+          db:echo_sql(sql)
+          local ret, str = conn:execute(sql)
+
+          if not ret then
+            conn:rollback()
+            error("Migration failed at chunk " .. i .. ": " .. tostring(str))
+          end
+        end
+
+        local migrated_count, migrated_count_err = count_rows(conn, s_name)
+        if migrated_count_err then
+          conn:rollback()
+          error(migrated_count_err);
+        end
+
+        if (original_count ~= migrated_count and not force) then
+            conn:rollback()
+            error(
+               "db:_migrate halted for ".. s_name .." during constraint migrations due to data loss."
+               .."\n\t".. (original_count - migrated_count) .." rows would be lost with new constraints."
+               .."\nUse force option to migrate anyway."
+            )
+        end
+
+        -- Commit the migration transaction
+        db:echo_sql("COMMIT")
+        conn:commit()
+
+        -- After recreating the table with new constraints, add any new columns that didn't exist before
+        for k, v in pairs(schema.columns) do
+          if not current_columns[k] then
+            local sql_add = 'ALTER TABLE %s ADD COLUMN "%s" %s NULL DEFAULT %s'
+            local t = db:_sql_type(v)
+            local def = db:_sql_convert(v)
+            local sql = sql_add:format(s_name, k, t, def)
+            db:echo_sql(sql)
+            conn:execute(sql)
+            -- Update current_columns to reflect the newly added column
+            current_columns[k] = ""
+          end
+        end
+      end
+    else
+      -- also reached when the rebuild was held back to keep a uniqueness rule
+      local missing = {}
 
     for k, v in pairs(schema.columns) do
 
@@ -574,8 +1249,8 @@ function db:_migrate(db_name, s_name, force)
         local t = db:_sql_type(v.default)
         local def = db:_sql_convert(v.default)
         local sql = sql_add:format(s_name, v.name, t, def)
-        conn:execute(sql)
         db:echo_sql(sql)
+        conn:execute(sql)
       end
     elseif
     #missing + table.size(current_columns) > table.size(schema.columns) + 1
@@ -589,7 +1264,7 @@ function db:_migrate(db_name, s_name, force)
           table.insert(redundant_columns, k)
         end
       end
-      
+
       --check if any of the redundant columns are non-empty
       local max_redundant = {}
       for i, v in ipairs(redundant_columns) do
@@ -597,6 +1272,7 @@ function db:_migrate(db_name, s_name, force)
       end
       local sql_check_blank = [[SELECT %s from %s;]]
       local sql = sql_check_blank:format(table.concat(max_redundant, ", "), s_name)
+      db:echo_sql(sql)
       local blank_cur = conn:execute(sql)
       local blank_results = blank_cur:fetch({}, "a")
       blank_cur:close()
@@ -604,19 +1280,26 @@ function db:_migrate(db_name, s_name, force)
       for k, _ in pairs(blank_results) do
         table.insert(not_blank, k)
       end
-      
+
       -- don't drop non-empty columns unless force flag is provided
       assert(not not_blank[1] or force, "db:_migrate halted due to data present in undefined columns: "..table.concat(not_blank, ","))
-      
+
       local get_create = "SELECT sql FROM sqlite_master " ..
       "WHERE type = 'table' AND " ..
       "name = '" .. s_name .. "'"
       local ret_str
+      db:echo_sql(get_create)
       cur, ret_str = conn:execute(get_create)
       assert(cur, ret_str)
       if type(cur) ~= "number" then
         local row = cur:fetch({}, "a");
         cur:close()
+
+        -- Ensure we got a result
+        if not row or not row.sql then
+          error("Unable to fetch CREATE TABLE statement for table: " .. s_name)
+        end
+
         local create_tmp = row.sql:gsub(s_name, s_name .. "_bak")
         local sql_chunks = {}
         local fields = { "_row_id" }
@@ -647,19 +1330,20 @@ function db:_migrate(db_name, s_name, force)
         end
       end
     end
+    end -- end of else block for table_constraints_changed check
   end
 
   -- On every invocation of db:create we run the code that creates indexes, as that code will
   -- do nothing if the specific indexes already exist. This is enforced by the db:_index_name
   -- function creating a unique index.
-  --
-  -- Note that in no situation will an existing index be deleted.
 
   -- make up current_columns, as pragma_info currently does not populate it, due to luasql bug
   for key, value in pairs(schema.columns) do
     current_columns[key] = db:_sql_type(value)
   end
 
+  local res_drops, msg = db:_drop_orphaned_indexes(conn, s_name, schema)
+  assert(res_drops, msg)
   db:_migrate_indexes(conn, s_name, schema, current_columns)
   db:echo_sql("COMMIT")
   conn:commit()
@@ -667,62 +1351,221 @@ function db:_migrate(db_name, s_name, force)
 end
 
 function db:_build_create_table_sql(schema, s_name)
-
-  local sql_column = ', "%s" %s NULL'
+  local sql_column = '"%s" %s NULL'
   local sql_column_default = sql_column .. ' DEFAULT %s'
 
+  local on_conflict = "ON CONFLICT "..(schema.options._violations or "FAIL")
 
-  local sql_chunks = { "CREATE TABLE ", s_name, '("_row_id" INTEGER PRIMARY KEY AUTOINCREMENT' }
+  local sql_chunks = { '"_row_id" INTEGER PRIMARY KEY AUTOINCREMENT' }
+
+  local unique_column_constraints = {}
+  local unique_table_constraints = {}
+
+  -- Validations were already performed in db:create, so the only thing
+  -- we need to do here is filter our unique constraints to the appropirate
+  -- tables.
+  --
+  -- Into unique_column_constraints when the a column is unique on its own
+  -- and into unique_table_constraints when columns are grouped together.
+  if schema.options and schema.options._unique then
+    if type(schema.options._unique) == "string" then
+      table.insert(unique_column_constraints, schema.options._unique)
+    elseif type(schema.options._unique) == "table" then
+      for i, unique_constraint in ipairs(schema.options._unique) do
+        if type(unique_constraint) == "string" then
+          table.insert(unique_column_constraints, unique_constraint)
+        elseif type(unique_constraint) == "table" then
+          table.insert(
+            unique_table_constraints,
+            'UNIQUE("'..table.concat(unique_constraint, '", "')..'") '..on_conflict
+          )
+        end
+      end
+    end
+  end
 
   -- We iterate over every defined column, and add a line which creates it.
-  for key, value in pairs(schema.columns) do
+  for col_name, col_schema in pairs(schema.columns) do
     local sql = ""
-    if value == nil then
-      sql = sql_column:format(key, db:_sql_type(value))
+    if col_schema == nil then
+      sql = sql_column:format(col_name, db:_sql_type(col_schema))
     else
-      sql = sql_column_default:format(key, db:_sql_type(value), db:_sql_convert(value))
+      sql = sql_column_default:format(col_name, db:_sql_type(col_schema), db:_sql_convert(col_schema))
     end
-    if (type(schema.options._unique) == "table" and table.contains(schema.options._unique, key))
-    or (type(schema.options._unique) == "string" and schema.options._unique == key) then
-      sql = sql .. " UNIQUE"
+    if table.contains(unique_column_constraints, col_name) then
+      sql = sql .. " UNIQUE "..on_conflict
     end
     sql_chunks[#sql_chunks + 1] = sql
   end
 
-  sql_chunks[#sql_chunks + 1] = ")"
+  -- Add in the unique constraints
+  for _, unique_table_constraint in ipairs(unique_table_constraints) do
+    sql_chunks[#sql_chunks + 1] = unique_table_constraint
+  end
 
-  return table.concat(sql_chunks, "")
+  return "CREATE TABLE " .. s_name.. " ("..table.concat(sql_chunks, ", ")..")"
+end
+
+
+-- Conditionally drops orphaned indexes.
+function db:_drop_orphaned_indexes(conn, s_name, schema)
+  local cur, err;
+
+  -- db:create dropped an _index entry naming a column the sheet does not have,
+  -- so what is left of _index is not the whole set the sheet asked for and
+  -- pruning against it would take the indexes the typo never mentioned with it.
+  -- Nothing is dropped this time round; the create that spells the column right
+  -- prunes as usual.
+  if schema.has_skipped_index then
+    return true, nil
+  end
+
+  local sql = ([[
+    SELECT
+      name,
+      tbl_name,
+      sql
+    FROM sqlite_master a
+    WHERE
+        type = 'index'
+        AND tbl_name = '%s'
+        AND a.sql IS NOT NULL;
+  ]]):format(s_name):trim():gsub("%s+", " ")
+
+  local sql_drop_index = "DROP INDEX IF EXISTS %s;"
+
+  db:echo_sql(sql)
+  cur, err = conn:execute(sql)
+  if cur == nil then
+    return nil, err
+  end
+
+
+  local row = cur:fetch({}, "a")
+  local drops = {}
+
+  -- No indexes should exist for the sheet, should remove all indexes for the table.
+  if not schema.options._index then
+    while row do
+      table.insert(
+        drops,
+        sql_drop_index:format(row.name)
+      )
+      row = cur:fetch({}, "a")
+    end
+    cur:close()
+    for _, drop in ipairs(drops) do
+      db:echo_sql(drop)
+      cur, err = conn:execute(drop)
+      if cur == nil then
+        return nil, err;
+      end
+    end
+    return true, nil
+  end
+
+
+  local index_strs = {}
+
+  for i, index in ipairs(schema.options._index) do
+    if type(index) == "table" then
+      local t = {}
+      for j, col_name in ipairs(index) do
+        t[j] = col_name:lower()
+      end
+      table.sort(t);
+      index_strs[i] = table.concat(t, ',')
+    else
+      index_strs[i] = index:lower()
+    end
+  end
+
+  local cols         = {}
+  local index_match  = ""
+  local is_dangling  = true;
+  local cols_str     = ""
+  local unique_match = ""
+
+  while row do
+    cols = {}
+    sql = normalize_sql(row.sql)
+    index_match  = sql:match("create%s+index%s+idx[%w_]+%s+on%s+[%w_]+%s+%((.+)%)")
+    unique_match = sql:match("create%s+unique%s+index%s+idx[%w_]+%s+on%s+[%w_]+%s+%((.+)%)")
+
+    -- matched unique index.  Mudlet doesn't make these anymore, so it should be removed.
+    if unique_match then
+        table.insert(
+          drops,
+          sql_drop_index:format(row.name)
+        )
+
+    elseif index_match then
+      cols = {}
+      for col in index_match:gmatch('"(%w+)"') do
+        table.insert(cols, col)
+      end
+      table.sort(cols)
+      cols_str = table.concat(cols, ',')
+
+      is_dangling = true
+
+      for _, index_str in ipairs(index_strs) do
+        if cols_str == index_str then
+          is_dangling = false
+          break
+        end
+      end
+
+      if is_dangling then
+        table.insert(
+          drops,
+          sql_drop_index:format(row.name)
+        )
+      end
+
+    end
+
+    row = cur:fetch({}, "a")
+  end
+  cur:close()
+
+  for _, drop in ipairs(drops) do
+    db:echo_sql(drop)
+    cur, err = conn:execute(drop)
+    if cur == nil then
+      return nil, err;
+    end
+  end
+
+  return true, nil
 end
 
 
 -- NOT LUADOC
 -- Creates any indexes which do not yet exist in the given database.
 function db:_migrate_indexes(conn, s_name, schema, current_columns)
-  local sql_create_index = "CREATE %s IF NOT EXISTS %s ON %s (%s);"
-  local opt = { _unique = "UNIQUE INDEX", _index = "INDEX" } -- , _check = "CHECK"}
+  local sql_create_index = "CREATE INDEX IF NOT EXISTS %s ON %s (%s);"
+  local sql = ""
 
-  for option_type, options in pairs(schema.options) do
-    if option_type == "_unique" or option_type == "_index" then
-      for _, value in pairs(options) do
-
-        -- If an index references a column which does not presently exist within the schema
-        -- this will fail.
-
-        if db:_index_valid(current_columns, value) then
-          --assert(db:_index_valid(current_columns, value),
-          --      "In sheet "..s_name.." an index field is specified that does not exist.")
-
-          local sql = sql_create_index:format(
-          opt[option_type], db:_index_name(s_name, value), s_name, db:_sql_columns(value)
-          )
-          db:echo_sql(sql)
-          conn:execute(sql)
-        end
+  if (type(schema.options._index) == "table") then
+    for _, value in pairs(schema.options._index) do
+      -- If an index references a column which does not presently exist within the schema
+      -- this will fail.
+      if db:_index_valid(current_columns, value) then
+        --assert(db:_index_valid(current_columns, value),
+        --      "In sheet "..s_name.." an index field is specified that does not exist.")
+        sql = sql_create_index:format(
+          db:_index_name(s_name, value),
+          s_name,
+          db:_sql_columns(value)
+        )
+        db:echo_sql(sql)
+        conn:execute(sql)
       end
+
     end
   end
 end
-
 
 
 --- Adds one or more new rows to the specified sheet. If any of these rows would violate a UNIQUE index,
@@ -744,13 +1587,25 @@ end
 ---     {name="Richard Clark"}
 ---   )
 ---   </pre>
+--- @return boolean result true when the rows went in, nil when the insert failed. A
+---   multi-row call stops at the first row the database refuses, so earlier rows of
+---   that same call are left in the transaction uncommitted rather than rolled back.
+--- @return string message Why the insert failed, absent when it did not.
 function db:add(sheet, ...)
   local db_name = sheet._db_name
   local s_name = sheet._sht_name
   assert(s_name, "First argument to db:add must be a proper Sheet object.")
 
   local conn = db.__conn[db_name]
-  local sql_insert = "INSERT OR %s INTO %s %s VALUES %s"
+  if not conn then
+    -- printed as well as returned, the way the SQL failure below is: the callers
+    -- of db:add that check the result are outnumbered by the ones that do not
+    local msg = db_no_connection_message("add to", db_name, A_SHEET)
+    printError(msg, true, false)
+    return nil, msg
+  end
+
+  local sql_insert = "INSERT INTO %s %s VALUES %s"
 
   for _, t in ipairs({ ... }) do
     if t._row_id then
@@ -758,11 +1613,16 @@ function db:add(sheet, ...)
       t._row_id = nil
     end
 
-    local sql = sql_insert:format(db.__schema[db_name][s_name].options._violations, s_name, db:_sql_fields(t), db:_sql_values(t))
+    local sql = sql_insert:format(
+      s_name,
+      db:_sql_fields(t),
+      db:_sql_values(t)
+    )
     db:echo_sql(sql)
 
     local result, msg = conn:execute(sql)
-    if not result then
+    if result == nil then
+      printError(msg, true, false)
       return nil, msg
     end
   end
@@ -784,10 +1644,17 @@ end
 ---   db:fetch_sql(mydb.kills, "SELECT distinct area FROM kills")
 ---   </pre>
 ---
+--- @return table results The matching rows, an empty table when the query matched nothing,
+---   or nil when the SQL could not run. Raises when the database is closed.
 --- @see db:fetch
 function db:fetch_sql(sheet, sql)
   local db_name = sheet._db_name
   local conn = db.__conn[db_name]
+  -- raises rather than answering nil, which db:merge_unique below shows the reason for:
+  -- "local results = db:fetch(...)  if results and results[1] then update else add end"
+  -- reads a nil as "not there yet" and inserts, so a closed database would silently
+  -- take the insert branch every time round instead of stopping
+  if not conn then error(db_no_connection_message("fetch from", db_name, A_SHEET), 2) end
 
   db:echo_sql(sql)
   local cur = conn:execute(sql)
@@ -795,10 +1662,11 @@ function db:fetch_sql(sheet, sql)
   -- if we had a syntax error in our SQL, cur will be nil
   if cur and cur ~= 0 then
     local results = {}
+    local columns = cur:getcolnames()
     local row = cur:fetch({}, "a")
 
     while row do
-      results[#results + 1] = db:_coerce_sheet(sheet, row)
+      results[#results + 1] = db:_coerce_sheet(sheet, row, columns)
       row = cur:fetch({}, "a")
     end
     cur:close()
@@ -844,17 +1712,26 @@ end
 ---   )
 ---   </pre>
 ---
+--- @return table results The matching rows, an empty table when the query matched nothing,
+---   or nil when the SQL could not run. Raises when the database is closed.
 --- @see db:fetch_sql
 function db:fetch(sheet, query, order_by, descending)
   local s_name = sheet._sht_name
+  -- a table with no sheet name is not a sheet whatever else it carries, so its
+  -- _db_name is no more to be trusted than the rest of it
+  local db_name = s_name and sheet._db_name or nil
+
+  -- db:fetch_sql's own argument guard is too late for this one: the concatenation
+  -- below reaches a nil sheet name first and dies there
+  if not s_name then error(db_no_connection_message("fetch from", db_name, A_SHEET), 2) end
 
   local sql = "SELECT * FROM " .. s_name
 
   if query then
-    if type(query) == "table" then
+    if type(query) == "table" and not query._isExp then
       sql = sql .. " WHERE " .. db:AND(unpack(query))
     else
-      sql = sql .. " WHERE " .. query
+      sql = sql .. " WHERE " .. tostring(query)
     end
   end
 
@@ -871,6 +1748,11 @@ function db:fetch(sheet, query, order_by, descending)
 
     sql = sql .. " ORDER BY " .. db:_sql_columns(o)
   end
+
+  -- the closed database is checked here rather than left to db:fetch_sql, whose own
+  -- guard would raise without naming a line: the return below is a tail call, so this
+  -- frame is already gone when its error(msg, 2) goes looking for level 2
+  if not db.__conn[db_name] then error(db_no_connection_message("fetch from", db_name, A_SHEET), 2) end
 
   return db:fetch_sql(sheet, sql)
 end
@@ -898,19 +1780,21 @@ end
 function db:aggregate(field, fn, query, distinct)
   local db_name = field.database
   local s_name = field.sheet
-  local conn = db.__conn[db_name]
-
   assert(type(field) == "table", "Field must be a field reference.")
   assert(field.name, "Field must be a real field reference.")
+
+  -- the connection check goes last: a bad field reference is the more useful complaint
+  local conn = db.__conn[db_name]
+  if not conn then error(db_no_connection_message("aggregate over", db_name, A_FIELD), 2) end
 
   local sql_chunks = { "SELECT", fn, "(", distinct and "DISTINCT" or "", field.name, ")", "AS", fn, "FROM", s_name }
 
   if query then
     sql_chunks[#sql_chunks + 1] = "WHERE"
-    if type(query) == "table" then
+    if type(query) == "table" and not query._isExp then
       sql_chunks[#sql_chunks + 1] = db:AND(unpack(query))
     else
-      sql_chunks[#sql_chunks + 1] = query
+      sql_chunks[#sql_chunks + 1] = tostring(query)
     end
   end
 
@@ -932,11 +1816,9 @@ function db:aggregate(field, fn, query, distinct)
       return count
     end
     -- Only datetime left
-    -- the value, count, is currently in a UTC timestamp
-    local localtime = datetime:parse(count, nil, true)
-    -- convert it into a UTC timestamp as datetime:parse parses it in the local time context
-    count = db:Timestamp(localtime + datetime:calculate_UTCdiff(localtime))
-    return count
+    local utc_epoch = datetime:parse(count, nil, true)
+    local locale_diff = datetime:calculate_UTCdiff(utc_epoch)
+    return db:Timestamp(utc_epoch + locale_diff)
   else
     return 0
   end
@@ -977,12 +1859,14 @@ function db:delete(sheet, query)
   local db_name = sheet._db_name
   local s_name = sheet._sht_name
 
-  local conn = db.__conn[db_name]
-
   assert(query, "must pass a query argument to db:delete()")
+
+  local conn = db.__conn[db_name]
+  if not conn then error(db_no_connection_message("delete from", db_name, A_SHEET), 2) end
+
   if type(query) == "number" then
     query = "_row_id = " .. tostring(query)
-  elseif type(query) == "table" then
+  elseif type(query) == "table" and not query._isExp then
     assert(query._row_id, "Passed a non-result table to db:delete, need a _row_id field to continue.")
     query = "_row_id = " .. tostring(query._row_id)
   end
@@ -990,7 +1874,7 @@ function db:delete(sheet, query)
   local sql = "DELETE FROM " .. s_name
 
   if query ~= true then
-    sql = sql .. " WHERE " .. query
+    sql = sql .. " WHERE " .. tostring(query)
   end
 
   db:echo_sql(sql)
@@ -1061,6 +1945,10 @@ function db:merge_unique(sheet, tables)
   local db_name = sheet._db_name
   local s_name = sheet._sht_name
 
+  -- ahead of the schema lookup below, which indexes db.__schema[nil] for a table that
+  -- is not a sheet and dies there before this can say so
+  if not db.__conn[db_name] then error(db_no_connection_message("merge into", db_name, A_SHEET), 2) end
+
   local unique_options = db.__schema[db_name][s_name].options._unique
   assert(unique_options, "db:merge_unique only works on a sheet with a unique index.")
   assert(#unique_options == 1, "db:merge_unique only works on a sheet with a single unique index.")
@@ -1123,8 +2011,9 @@ function db:update(sheet, tbl)
   local s_name = sheet._sht_name
 
   local conn = db.__conn[db_name]
+  if not conn then error(db_no_connection_message("update", db_name, A_SHEET), 2) end
 
-  local sql_chunks = { "UPDATE OR", db.__schema[db_name][s_name].options._violations, s_name, "SET" }
+  local sql_chunks = { "UPDATE", s_name, "SET" }
 
   local set_chunks = {}
   local set_block = [["%s" = %s]]
@@ -1196,13 +2085,19 @@ function db:set(field, value, query)
   local s_name = field.sheet
 
   local conn = db.__conn[db_name]
+  if not conn then error(db_no_connection_message("set a field in", db_name, A_FIELD), 2) end
 
-  local sql_update = [[UPDATE OR %s %s SET "%s" = %s]]
+  local sql_update = [[UPDATE %s SET "%s" = %s]]
   if query then
     sql_update = sql_update .. [[ WHERE %s]]
   end
 
-  local sql = sql_update:format(db.__schema[db_name][s_name].options._violations, s_name, field.name, db:_coerce(field, value), query)
+  local sql = sql_update:format(
+    s_name,
+    field.name,
+    db:_coerce(field, value),
+    tostring(query)
+  )
 
   db:echo_sql(sql)
   assert(conn:execute(sql))
@@ -1232,20 +2127,25 @@ end
 -- After a table so retrieved from the database, this function coerces values to
 -- their proper types. Specifically, numbers and datetimes become the proper
 -- types.
-function db:_coerce_sheet(sheet, tbl)
+function db:_coerce_sheet(sheet, tbl, columns)
   if tbl then
+    columns = columns or table.keys(tbl)
     tbl._row_id = tonumber(tbl._row_id)
 
-    for k, v in pairs(tbl) do
+    for _, k in pairs(columns) do
       if k ~= "_row_id" then
         local field = sheet[k]
         if field.type == "number" then
           tbl[k] = tonumber(tbl[k]) or tbl[k]
         elseif field.type == "datetime" then
-          -- the value, tbl[k], is currently in a UTC timestamp
-          local localtime = datetime:parse(tbl[k], nil, true)
-          -- convert it into a UTC timestamp as datetime:parse parses it in the local time context
-          tbl[k] = db:Timestamp(localtime + datetime:calculate_UTCdiff(localtime))
+          if (tbl[k] == nil) then
+            tbl[k] = db:Timestamp(nil)
+          else
+            -- the value, tbl[k], is a UTC timestamp
+            local utc_epoch = datetime:parse(tbl[k], nil, true)
+            local locale_diff = datetime:calculate_UTCdiff(utc_epoch)
+            tbl[k] = db:Timestamp(utc_epoch + locale_diff)
+          end
         end
       end
     end
@@ -1260,13 +2160,17 @@ end
 -- type of the specified field. Strings will be single-quoted (and single-quotes
 -- within will be properly escaped), numbers will be rendered properly, and such.
 function db:_coerce(field, value)
-  if type(value) == "table" and value._isNull then
+  if type(value) == "table" and value._isExp then
+    return value._expression
+  elseif type(value) == "table" and value._isNull then
     return "NULL"
   elseif field.type == "number" then
-    return tonumber(value) or "'" .. value .. "'"
+    return tonumber(value) or ("'" .. value .. "'")
   elseif field.type == "datetime" then
     if value._timestamp == false then
       return "NULL"
+    elseif value._timestamp == "CURRENT_TIMESTAMP" then
+      return "datetime('now')"
     else
       return "datetime('" .. value._timestamp .. "', 'unixepoch')" or "'" .. value .. "'"
     end
@@ -1470,6 +2374,20 @@ end
 
 
 
+-- NOT LUADOC
+-- The metatable for db:exp values. It renders as the raw expression text whenever
+-- concatenated or stringified, so WHERE-position use (db:fetch, db:AND, db:OR, ...)
+-- is unchanged, while db:_coerce recognises the _isExp marker and passes the raw
+-- expression through (letting db:exp be used as a db:set value, not just in WHERE).
+db.__Expression = {
+  __tostring = function(self)
+    return self._expression
+  end,
+  __concat = function(a, b)
+    return tostring(a) .. tostring(b)
+  end,
+}
+
 --- Returns the string as-is to the database. <br/><br/>
 ---
 --- Use this function with caution, but it is very useful in some circumstances. One of the most
@@ -1492,7 +2410,7 @@ end
 ---
 --- @see db:fetch
 function db:exp(text)
-  return text
+  return setmetatable({ _expression = text, _isExp = true }, db.__Expression)
 end
 
 
@@ -1522,6 +2440,10 @@ end
 ---
 --- @see db:fetch
 function db:OR(left, right)
+  -- coerce to strings so db:exp sentinels work here as well as plain expressions
+  left = tostring(left)
+  right = tostring(right)
+
   if not string.starts(left, "(") then
     left = "(" .. left .. ")"
   end
@@ -1534,15 +2456,63 @@ function db:OR(left, right)
 end
 
 
-
---- <b><u>TODO</u></b>
-function db:close()
-  for _, c in pairs(db.__conn) do
-    c:close()
+--- Closes all databases.
+--- @return boolean result Returns true if all databases closed successfully and false otherwise 
+--- @return string message
+function db:_closeAll()
+  if db.__env == nil then
+    return false, "database environment is nil, did you forget to call db:create?"
   end
+
+  local result, msgs = true, {}
+  for db_name, conn in pairs(db.__conn) do
+    if not conn:close() then
+      result = false
+      table.insert(msgs, "database object for "..db_name.." is already closed.")
+    end
+  end
+
   db.__conn = {}
   db.__env:close()
   db.__env = nil
+
+  return result, table.concat(msgs, "\n")
+end
+
+
+--- Closes the named database or all databases if no name is provided.
+--- @param db_name string|nil The name of the database to close.
+--- @return boolean result Returns true in case of success and false otherwise.
+--- @return string message Why the database failed to close.
+function db:close(db_name)
+  if db.__env == nil then
+    return false, "database environment is nil, did you forget to call db:create?"
+  end
+
+  if db_name == nil then
+    return db:_closeAll()
+  end
+
+  assert(
+    type(db_name) == "string",
+    "expected db_name to be string or nil but recieved "..type(db_name).."."
+  )
+
+  db_name = db:safe_name(db_name)
+  if not db:_isActiveDBName(db_name) then
+    return false, "can not close "..db_name.." because it does not exist.  Did you forget to call db:create?"
+  end
+
+  if db.__conn[db_name]:close() then
+    db.__conn[db_name] = nil
+
+    return true, ""
+  else
+
+    return false, "database object is already closed."
+  end
+
+
 end
 
 
@@ -1596,17 +2566,22 @@ end
 --- <b><u>TODO</u></b>
 function db:Timestamp(ts, fmt)
   local dt = {}
-  if type(ts) == "table" then
-    dt._timestamp = os.time(ts)
-  elseif type(ts) == "number" then
-    dt._timestamp = ts
-  elseif type(ts) == "string" and
-  assert(ts == "CURRENT_TIMESTAMP", "The only strings supported by db.DateTime:new is CURRENT_TIMESTAMP") then
-    dt._timestamp = "CURRENT_TIMESTAMP"
-  elseif ts == nil then
-    dt._timestamp = false
+
+  if ts == nil then
+      dt._timestamp = false
+  elseif ts == "CURRENT_TIMESTAMP" then
+      dt._timestamp = "CURRENT_TIMESTAMP"
   else
-    assert(nil, "Invalid value passed to db.Timestamp()")
+    local t = type(ts)
+    if t == "table" then
+      dt._timestamp = os.time(ts)
+    elseif t == "number" then
+      dt._timestamp = ts
+    elseif t == "string" then
+      dt._timestamp = datetime:parse(ts, fmt, true)
+    else
+      error("Invalid value passed to db.Timestamp()")
+    end
   end
   return setmetatable(dt, db.__TimestampMT)
 end
@@ -1635,16 +2610,18 @@ db.__SheetMT = {
     local sht_name = rawget(t, "_sht_name")
     local f_name = k
 
-    local errormsg = "Attempt to access field %s in sheet %s in database %s that does not exist."
+    local errormsg = "Attempt to access field '%s' which does not exist (in sheet '%s' within database '%s')"
 
     local field = db.__schema[db_name][sht_name]['columns'][f_name]
-    if assert(field, errormsg:format(k, sht_name, db_name)) then
-      type_ = type(field)
-      if type_ == "table" and field._timestamp then
-        type_ = "datetime"
+    local field_type = ""
+    local rt
+    if assert(field ~= nil, errormsg:format(k, sht_name, db_name)) then
+      field_type = type(field)
+      if field_type == "table" and field._timestamp ~= nil then
+        field_type = "datetime"
       end
 
-      rt = setmetatable({ database = db_name, sheet = sht_name, type = type_, name = f_name }, db.__FieldMT)
+      rt = setmetatable({ database = db_name, sheet = sht_name, type = field_type, name = f_name }, db.__FieldMT)
       rawset(t, k, rt)
       return rt
     end
@@ -1662,12 +2639,13 @@ db.__DatabaseMT = {
       return v
     end
 
-    local v = rawget(db.Database, k)
+    v = rawget(db.Database, k)
     if v then
       return v
     end
 
     local db_name = rawget(t, "_db_name")
+    local rt
     if assert(db.__schema[db_name][k], "Attempt to access sheet '" .. k .. "'in db '" .. db_name .. "' that does not exist.") then
       rt = setmetatable({ _db_name = db_name, _sht_name = k }, db.__SheetMT)
       rawset(t, k, rt)
@@ -1678,44 +2656,91 @@ db.__DatabaseMT = {
 
 
 
+--- Holds back every write on this database until the next commit.
+--- @return boolean result Returns true in case of success and false otherwise.
+--- @return string message Why the transaction was not opened, empty when it was.
 function db.Database:_begin()
+  -- without this the flag would be set on a database with nothing behind it, and the
+  -- reopen would quietly reset it, turning the caller's transaction into autocommit
+  if not db.__conn[self._db_name] then
+    return false, db_no_connection_message("begin a transaction on", self._db_name, A_DATABASE)
+  end
+
   db.__autocommit[self._db_name] = false
+  return true, ""
 end
 
 
 
+--- Commits the work done on this database since the last commit.
+--- @return boolean result Returns true in case of success and false otherwise.
+--- @return string message Why the work was not committed, empty when it was.
 function db.Database:_commit()
   local conn = db.__conn[self._db_name]
-  conn:commit()
+  if not conn then
+    return false, db_no_connection_message("commit", self._db_name, A_DATABASE)
+  end
+
+  -- db:create turns the driver's own autocommit off, so nothing lands until a
+  -- commit goes through and a refused one loses the work without saying so
+  local committed, err = conn:commit()
+  if not committed then
+    return false, "can not commit "..self._db_name..": "..tostring(err)
+  end
+
+  return true, ""
 end
 
 
 
+--- Discards the work done on this database since the last commit.
+--- @return boolean result Returns true in case of success and false otherwise.
+--- @return string message Why the work was not rolled back, empty when it was.
 function db.Database:_rollback()
   local conn = db.__conn[self._db_name]
-  conn:rollback()
+  if not conn then
+    return false, db_no_connection_message("roll back", self._db_name, A_DATABASE)
+  end
+
+  local rolled_back, err = conn:rollback()
+  if not rolled_back then
+    return false, "can not roll back "..self._db_name..": "..tostring(err)
+  end
+
+  return true, ""
 end
 
 
 
+--- Lets writes on this database commit on their own again.
+--- @return boolean result Returns true in case of success and false otherwise.
+--- @return string message Why the transaction was not ended, empty when it was.
 function db.Database:_end()
+  if not db.__conn[self._db_name] then
+    return false, db_no_connection_message("end a transaction on", self._db_name, A_DATABASE)
+  end
+
   db.__autocommit[self._db_name] = true
+  return true, ""
 end
 
 
 
 function db.Database:_drop(s_name)
   local conn = db.__conn[self._db_name]
-  local schema = db.__schema[self._db_name]
+  if not conn then error(db_no_connection_message("drop a sheet from", self._db_name, A_DATABASE), 2) end
 
-  if schema.options._index then
-    for _, value in schema.options._index do
-      conn:execute("DROP INDEX IF EXISTS " .. db:_index_name(s_name, value))
+  local schema = db.__schema[self._db_name][s_name]
+
+  -- db:create normalises _index and _unique to a list before they reach
+  -- db.__schema, which is written nowhere else: the string form only arrives here
+  -- from a schema built by hand
+  local index_groups = { schema.options._index, schema.options._unique }
+  for _, group in pairs(index_groups) do
+    if type(group) == "string" then
+      group = { group }
     end
-  end
-
-  if schema.options._unique then
-    for _, value in schema.options._unique do
+    for _, value in pairs(group) do
       conn:execute("DROP INDEX IF EXISTS " .. db:_index_name(s_name, value))
     end
   end
@@ -1742,7 +2767,7 @@ function db:get_database(db_name)
   db_name = db:safe_name(db_name)
   assert(db.__schema[db_name], "Attempt to access database that does not exist.")
 
-  db_inst = { _db_name = db_name }
+  local db_inst = { _db_name = db_name }
   return setmetatable(db_inst, db.__DatabaseMT)
 end
 

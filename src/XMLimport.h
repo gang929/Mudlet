@@ -26,16 +26,16 @@
 
 
 #include "dlgTriggerEditor.h"
+#include "EditorCommand.h"
+#include "utils.h"
 
-#include "pre_guard.h"
-#include <QApplication>
+#include <QCoreApplication>
 #include <QFile>
 #include <QMap>
+#include <QMargins>
 #include <QMultiHash>
 #include <QPointer>
 #include <QXmlStreamReader>
-#include <QClipboard>
-#include "post_guard.h"
 
 class Host;
 class TAction;
@@ -55,12 +55,20 @@ public:
     explicit XMLimport(Host*);
     virtual ~XMLimport() {}
     std::pair<bool, QString> importPackage(QFile*, QString packageName = QString(), int moduleFlag = 0, QString* pVersionString = nullptr);
-    std::pair<dlgTriggerEditor::EditorViewType, int> importFromClipboard();
+    std::pair<EditorViewType, int> importFromClipboard();
+    // Items whose Lua body failed to compile or run, as "<item name>: <error>". They are still
+    // imported so they can be fixed, so importPackage()'s result says nothing about them.
+    const QStringList& itemsWithErrors() const { return mItemsWithErrors; }
+    // The same items by name only, for the console: the Lua error is for the item's author, not the installer.
+    const QStringList& itemsWithErrorNames() const { return mItemsWithErrorNames; }
+    // A save file numbers the sixteen basic colours of a colour pattern its own
+    // way (see XMLexport::remapAnsiToColorNumber()), this turns them back.
+    static void remapColorsToAnsiNumber(QStringList&, const QList<int>&);
 
 private:
     const QString YES = qsl("yes");
 
-    std::pair<dlgTriggerEditor::EditorViewType, int> readPackage();
+    std::pair<EditorViewType, int> readPackage();
 
     void readHostPackage();
     int readTriggerPackage();
@@ -85,10 +93,13 @@ private:
     void readUnknownElement(const QString&);
 
     void readHost(Host*);
+    bool readHostColorElement(Host*, QStringView elementName);
+    bool readHostBorderElement(QMargins&, QStringView elementName);
     void readLegacyMapInfoContributors();
     void readMapInfoContributor();
     void readProfileShortcut();
     void readStopWatchMap();
+    void readMMCPOptions();
     int readTrigger(TTrigger*);
     int readTimer(TTimer*);
     int readAlias(TAlias*);
@@ -99,34 +110,34 @@ private:
     void readHiddenVariables();
 
     void readStringList(QStringList&, const QString&);
-    void readIntegerList(QList<int>&, const QString& parentName, const QString &whatIsParent);
+    void readIntegerList(QList<int>&, const QString& parentName, const QString& whatIsParent);
     void readModulesDetailsMap(QMap<QString, QStringList>&);
     void getVersionString(QString&);
     QString readScriptElement();
-
-    void remapColorsToAnsiNumber(QStringList&, const QList<int>&);
 
     bool readDefaultTrueBool(QString name);
 
     QPointer<Host> mpHost;
     QString mPackageName;
-    TTrigger* mpTrigger;
-    TTimer* mpTimer;
-    TAlias* mpAlias;
-    TKey* mpKey;
-    TAction* mpAction;
-    TScript* mpScript;
-    TVar* mpVar;
-    bool gotTrigger;
-    bool gotTimer;
-    bool gotAlias;
-    bool gotKey;
-    bool gotAction;
-    bool gotScript;
-    int module;
-    int mMaxRoomId;
-    quint8 mVersionMajor;
-    quint16 mVersionMinor; // Cannot be a quint8 as that only allows x.255 for the decimal
+    QStringList mItemsWithErrors;
+    QStringList mItemsWithErrorNames;
+    TTrigger* mpTrigger = nullptr;
+    TTimer* mpTimer = nullptr;
+    TAlias* mpAlias = nullptr;
+    TKey* mpKey = nullptr;
+    TAction* mpAction = nullptr;
+    TScript* mpScript = nullptr;
+    TVar* mpVar = nullptr;
+    bool gotTrigger = false;
+    bool gotTimer = false;
+    bool gotAlias = false;
+    bool gotKey = false;
+    bool gotAction = false;
+    bool gotScript = false;
+    int module = 0;
+    int mMaxRoomId = 0;
+    quint8 mVersionMajor = 1;  // 0 to 255
+    quint16 mVersionMinor = 0; // 0 to 999 for 3 digit decimal value. Cannot be a quint8 as that only allows x.255 for the decimal
 };
 
 #endif // MUDLET_XMLEXPORT_H

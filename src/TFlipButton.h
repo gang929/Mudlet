@@ -23,10 +23,8 @@
  ***************************************************************************/
 
 
-#include "pre_guard.h"
 #include <QPointer>
 #include <QPushButton>
-#include "post_guard.h"
 
 class Host;
 class TAction;
@@ -55,7 +53,11 @@ protected:
 private:
     int mID = 0;
     QPointer<Host> mpHost;
+    // This and mMirrored are derived from TAction::mButtonRotation, NOT
+    // TAction::mOrientation!
     Qt::Orientation mOrientation = Qt::Horizontal;
+    // This and mOrientation are derived from TAction::mButtonRotation, NOT
+    // TAction::mOrientation!
     bool mMirrored = false;
 };
 

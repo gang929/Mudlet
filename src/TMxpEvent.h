@@ -20,16 +20,17 @@
 #ifndef MUDLET_TMXPEVENT_H
 #define MUDLET_TMXPEVENT_H
 
-#include "pre_guard.h"
 #include <QMap>
 #include <QStringList>
-#include "post_guard.h"
 
 struct TMxpEvent
 {
     QString name;
     QMap<QString, QString> attrs;
     QStringList actions;
+    QString caption;
+    // the link a <SEND> made, whose actions are only final at its closing tag
+    int linkId = 0;
 };
 
 #endif //MUDLET_TMXPEVENT_H

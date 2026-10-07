@@ -77,12 +77,17 @@ function Geyser:base_add (window, cons)
 end
 
 --- Add a window to the list that this container manages.
--- The window will be shown after added to the container
+-- The window will be shown after added to the container, unless the container
+-- itself is hidden, in which case it joins the container's hidden children
 -- @param window The window to add this container
 -- @param cons table of Geyser window options such as name, width, and height
 function Geyser:add (window, cons)
   self:base_add(window, cons)
-  window:show()
+  if self.hidden or self.auto_hidden then
+    window:hide(true)
+  else
+    window:show()
+  end
 end
 
 --- Add a window to the list that this container manages. 
@@ -133,7 +138,7 @@ end
 -- windowList
 function Geyser:remove (window)
   self.windowList[window.name] = nil
-  index = table.index_of(self.windows, window.name) or 0
+  local index = table.index_of(self.windows, window.name) or 0
   table.remove(self.windows, index)
 end
 
@@ -200,6 +205,13 @@ function Geyser:changeContainer (container)
   --only a container has a windowList
   if not container or not container.windowList or self == container then
     return nil, "didn't get a valid container"
+  end
+  local ancestor = container.container
+  while ancestor do
+    if ancestor == self then
+      return nil, "can't move "..self.name.." into one of its own children"
+    end
+    ancestor = ancestor.container
   end
   --Nothing to change
   if self.container == container then

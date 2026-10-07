@@ -1,6 +1,6 @@
 /***************************************************************************
  *   Copyright (C) 2020 by Gustavo Sousa - gustavocms@gmail.com            *
- *   Copyright (C) 2020 by Stephen Lyons - slysven@virginmedia.com         *
+ *   Copyright (C) 2020, 2026 by Stephen Lyons - slysven@virginmedia.com   *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
  *   it under the terms of the GNU General Public License as published by  *
@@ -23,6 +23,15 @@
 #include "TMxpClient.h"
 #include "TMxpTagParser.h"
 
+// Far deeper than any game nests its elements, and shallow enough for a 1MB main-thread stack
+static constexpr qsizetype maxElementExpansionDepth = 32;
+
+// A game can define an element that expands to itself, directly or through other elements, or a
+// chain of elements long enough to exhaust the stack
+bool TMxpCustomElementTagHandler::mayExpand(const QString& key) const
+{
+    return mElementsBeingExpanded.size() < maxElementExpansionDepth && !mElementsBeingExpanded.contains(key);
+}
 
 TMxpTagHandlerResult TMxpCustomElementTagHandler::handleStartTag(TMxpContext& ctx, TMxpClient& client, MxpStartTag* tag)
 {
@@ -36,16 +45,19 @@ TMxpTagHandlerResult TMxpCustomElementTagHandler::handleStartTag(TMxpContext& ct
         }
     }
 
-    if (!el.definition.isEmpty()) {
-        for (const QSharedPointer<MxpNode>& ptr : el.parsedDefinition) {
+    const QString key = el.name.toUpper();
+    if (!el.definition.isEmpty() && mayExpand(key)) {
+        mElementsBeingExpanded.insert(key);
+        for (const QSharedPointer<MxpNode>& ptr : std::as_const(el.parsedDefinition)) {
             if (!ptr->isTag()) {
                 ctx.handleContent(ptr->asText()->getContent());
-            } else {
+            } else if (ptr->isStartTag()) {
                 // transform the custom tag to the given in the definition
                 MxpStartTag newTag = resolveElementDefinition(el, ptr->asStartTag(), tag);
                 ctx.handleTag(ctx, client, &newTag);
             }
         }
+        mElementsBeingExpanded.remove(key);
     }
 
     return MXP_TAG_HANDLED;
@@ -64,17 +76,25 @@ TMxpTagHandlerResult TMxpCustomElementTagHandler::handleEndTag(TMxpContext& ctx,
         return MXP_TAG_HANDLED; //NO DEFINITION
     }
 
+    const QString key = el.name.toUpper();
+    if (!mayExpand(key)) {
+        return MXP_TAG_HANDLED;
+    }
+
 
     // generates closing tags in the reverse order
     // in the example: <!ELEMENT boldtext '<COLOR &col;><B>' ATT='col=red'>
     // will generate </B></COLOR>
+    // Per the MXP spec a definition holds only opening tags, so any closing tag in one is ignored
+    mElementsBeingExpanded.insert(key);
     for (int i = el.parsedDefinition.size(); i > 0; i--) {
         MxpNode* node = el.parsedDefinition[i - 1].get();
-        if (node->isTag()) {
+        if (node->isStartTag()) {
             MxpEndTag endTag(node->asStartTag()->getName());
             ctx.handleTag(ctx, client, &endTag);
         }
     }
+    mElementsBeingExpanded.remove(key);
 
     return MXP_TAG_HANDLED;
 }
@@ -94,7 +114,25 @@ MxpStartTag TMxpCustomElementTagHandler::resolveElementDefinition(const TMxpElem
         return MxpTagAttribute(attr.getName(), mapAttributes(element, attr.getValue(), customTag));
     };
 
-    return definitionTag->transform(mapping);
+    // Transform the definition tag's attributes with mapped values
+    auto result = definitionTag->transform(mapping);
+
+    // Collect all attributes from the transformed result
+    QList<MxpTagAttribute> allAttrs;
+    for (int i = 0; i < result.getAttributesCount(); ++i) {
+        allAttrs.append(result.getAttribute(i));
+    }
+
+    // Add any attributes from the custom tag that aren't already present
+    for (int i = 0; i < customTag->getAttributesCount(); ++i) {
+        const auto& attr = customTag->getAttribute(i);
+        if (!result.hasAttribute(attr.getName())) {
+            allAttrs.append(attr);
+        }
+    }
+
+    // Return a new tag with all combined attributes
+    return MxpStartTag(result.getName(), allAttrs, result.isEmpty());
 }
 
 QString TMxpCustomElementTagHandler::mapAttributes(const TMxpElement& element, const QString& input, MxpStartTag* tag)

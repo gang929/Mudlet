@@ -1,5 +1,6 @@
 /***************************************************************************
- *   Copyright (C) 2023-2023 by Adam Robinson - seldon1951@hotmail.com     *
+ *   Copyright (C) 2023 by Adam Robinson - seldon1951@hotmail.com          *
+ *   Copyright (C) 2026 by Stephen Lyons - slysven@virginmedia.com         *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
  *   it under the terms of the GNU General Public License as published by  *
@@ -22,6 +23,13 @@
 
 #include "Host.h"
 
+/* We need an explicit constructor in this file as the Host class is forward
+ * declared in the header file and it is problematic to define any dereferencing
+ * of it there:*/
+GifTracker::GifTracker(Host* pHost)
+: mpHost(pHost)
+{
+}
 
 bool GifTracker::registerGif(QMovie* pT)
 {
@@ -31,7 +39,6 @@ bool GifTracker::registerGif(QMovie* pT)
 
     mMovieList.push_back(pT);
     return true;
-
 }
 
 void GifTracker::unregisterGif(QMovie* pT)
@@ -42,7 +49,6 @@ void GifTracker::unregisterGif(QMovie* pT)
 
     mMovieList.remove(pT);
     return;
-
 }
 
 std::tuple<QString, int, int> GifTracker::assembleReport()
@@ -56,12 +62,7 @@ std::tuple<QString, int, int> GifTracker::assembleReport()
         }
     }
     QStringList msg;
-    msg << QLatin1String("Gifs current total: ") << QString::number(statsItemsTotal) << QLatin1String("\n")
-        << QLatin1String("active Gifs: ") << QString::number(statsActiveItems) << QLatin1String("\n");
-    return {
-        msg.join(QString()),
-        statsItemsTotal,
-        statsActiveItems
-    };
+    msg << QLatin1String("Gifs current total: ") << QString::number(statsItemsTotal) << QLatin1String("\n") << QLatin1String("active Gifs: ") << QString::number(statsActiveItems)
+        << QLatin1String("\n");
+    return {msg.join(QString()), statsItemsTotal, statsActiveItems};
 }
-

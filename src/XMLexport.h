@@ -25,17 +25,15 @@
  ***************************************************************************/
 
 
-#include "pre_guard.h"
 #include <QClipboard>
 #include <QFuture>
 #include <QPointer>
 #include <QSaveFile>
 #include <pugixml.hpp>
-#include "post_guard.h"
+#include <memory>
 
 class QFile;
 class Host;
-class LuaInterface;
 class TAction;
 class TAlias;
 class TKey;
@@ -46,7 +44,7 @@ class TVar;
 class VarUnit;
 
 
-class XMLexport : public QObject
+class XMLexport : public QObject, public std::enable_shared_from_this<XMLexport>
 {
     Q_OBJECT
 
@@ -66,13 +64,15 @@ public:
     void writeAction(TAction*, pugi::xml_node xmlParent);
     void writeScript(TScript*, pugi::xml_node xmlParent);
     void writeKey(TKey*, pugi::xml_node xmlParent);
-    void writeVariable(TVar*, LuaInterface*, VarUnit*, pugi::xml_node xmlParent);
-    void writeModuleXML(const QString& moduleName, const QString& fileName, bool async = false);
+    void writeVariable(TVar*, VarUnit*, pugi::xml_node xmlParent, bool insideSavedTable = false, bool rideAlongAllowed = true);
+    void writeModuleXML(const QString& moduleName);
+    std::shared_ptr<pugi::xml_document> takeExportDocument();
+    static bool saveXmlDocToFile(const QString& fileName, const pugi::xml_document& doc);
 
-    void exportHost(const QString& filename_pugi_xml);
-    bool writeGenericPackage(Host* pHost, pugi::xml_node& mMudletPackage, bool ignoreModuleMember = true);
+    bool exportHost(const QString& filename_pugi_xml);
+    bool writeGenericPackage(Host* pHost, pugi::xml_node& mMudletPackage, bool ignoreModuleMember = true, bool ignoreVariables = false);
     bool exportProfile(const QString& exportFileName);
-    bool exportPackage(const QString &exportFileName, bool ignoreModuleMember = true);
+    bool exportPackage(const QString& exportFileName, bool ignoreModuleMember = true, bool ignoreVariables = false);
     bool exportTrigger(const QString& fileName);
     bool exportTimer(const QString& fileName);
     bool exportAlias(const QString& fileName);
@@ -93,12 +93,12 @@ public:
 
 private:
     QPointer<Host> mpHost;
-    TTrigger* mpTrigger;
-    TTimer* mpTimer;
-    TAlias* mpAlias;
-    TAction* mpAction;
-    TScript* mpScript;
-    TKey* mpKey;
+    TTrigger* mpTrigger{nullptr};
+    TTimer* mpTimer{nullptr};
+    TAlias* mpAlias{nullptr};
+    TAction* mpAction{nullptr};
+    TScript* mpScript{nullptr};
+    TKey* mpKey{nullptr};
     pugi::xml_document mExportDoc;
 
     void writeTriggerPackage(const Host* pHost, pugi::xml_node& mMudletPackage, bool skipModuleMembers);
@@ -108,11 +108,12 @@ private:
     void writeScriptPackage(const Host* pHost, pugi::xml_node& mMudletPackage, bool skipModuleMembers);
     void writeKeyPackage(const Host* pHost, pugi::xml_node& mMudletPackage, bool skipModuleMembers);
     void writeVariablePackage(Host* pHost, pugi::xml_node& mMudletPackage);
-    void inline replaceAll(std::string& source, const std::string& from, const std::string& to);
     bool saveXmlFile(QSaveFile& file);
     bool saveXml(const QString&);
     pugi::xml_node writeXmlHeader();
-    void sanitizeForQxml(std::string& output);
+    static void sanitizeForQxml(std::string& output);
+    static std::string serializeForQxml(const pugi::xml_document& doc);
+    void runAsyncSave(const QString& fileName, const QString& xmlSavedKey);
     QString saveXml();
     QStringList remapAnsiToColorNumber(const QStringList&, const QList<int>&);
 };

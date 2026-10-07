@@ -23,46 +23,56 @@
 #include "XMLimport.h"
 
 
-#include "dlgMapper.h"
 #include "LuaInterface.h"
-#include "TConsole.h"
+#include "CredentialManager.h"
+#include "SecureStringUtils.h"
+#include "TAction.h"
+#include "TAlias.h"
+#include "TKey.h"
 #include "TMap.h"
 #include "TRoomDB.h"
 #include "TRoom.h"
+#include "TScript.h"
+#include "TTimer.h"
+#include "TTrigger.h"
+#include "TVar.h"
 #include "VarUnit.h"
 #include "mudlet.h"
+#include "enums.h"
 
-#include "pre_guard.h"
 #include <QBuffer>
+#include <QClipboard>
+#include <QGuiApplication>
 #include <QtMath>
-#include "post_guard.h"
+#include <QVersionNumber>
+
+#include <memory>
+
+// Undoes the rich-text markup TLuaInterpreter::compile() adds (kept in step by hand), for the
+// console line and installPackage()'s reason. Unescaped in reverse order, ampersand last, so a
+// script whose own text says "&amp;lt;b&amp;gt;" comes back as itself rather than as markup.
+static QString compileErrorAsPlainText(const QString& error)
+{
+    QString plainText = error;
+    plainText.remove(qsl("<b>"));
+    plainText.remove(qsl("</b>"));
+    plainText.replace(qsl("&quot;"), qsl("\""));
+    plainText.replace(qsl("&lt;"), qsl("<"));
+    plainText.replace(qsl("&gt;"), qsl(">"));
+    plainText.replace(qsl("&amp;"), qsl("&"));
+    return plainText;
+}
 
 XMLimport::XMLimport(Host* pH)
 : mpHost(pH)
-, mPackageName(QString())
-, mpTrigger(nullptr)
-, mpTimer(nullptr)
-, mpAlias(nullptr)
-, mpKey(nullptr)
-, mpAction(nullptr)
-, mpScript(nullptr)
-, mpVar(nullptr)
-, gotTrigger(false)
-, gotTimer(false)
-, gotAlias(false)
-, gotKey(false)
-, gotAction(false)
-, gotScript(false)
-, module(0)
-, mMaxRoomId(0)
-, mVersionMajor(1) // 0 to 255
-, mVersionMinor(0) // 0 to 999 for 3 digit decimal value
 {
 }
 
 std::pair<bool, QString> XMLimport::importPackage(QFile* pfile, QString packName, int moduleFlag, QString* pVersionString)
 {
     mPackageName = packName;
+    mItemsWithErrors.clear();
+    mItemsWithErrorNames.clear();
     setDevice(pfile);
 
     module = moduleFlag;
@@ -164,22 +174,25 @@ std::pair<bool, QString> XMLimport::importPackage(QFile* pfile, QString packName
                     // Minor check is not currently relevant, just abort on 2.000f or more
 
                     const QString moanMsg = tr("[ ALERT ] - Sorry, the file being read:\n"
-                                         "\"%1\"\n"
-                                         "reports it has a version (%2) it must have come from a later Mudlet version,\n"
-                                         "and this one cannot read it, you need a newer Mudlet!")
-                                              .arg(pfile->fileName(), versionString);
+                                               "\"%1\"\n"
+                                               "reports it has a version (%2) it must have come from a later Mudlet version,\n"
+                                               "and this one cannot read it, you need a newer Mudlet!")
+                                                    .arg(pfile->fileName(), versionString);
                     mpHost->postMessage(moanMsg);
                     return {false, moanMsg};
                 }
 
                 readPackage();
             } else if (name() == qsl("map")) {
-                readMap();
-                mpHost->mpMap->audit();
-                mpHost->mpMap->mpMapper->mp2dMap->init();
-                mpHost->mpMap->mpMapper->updateAreaComboBox();
-                mpHost->mpMap->mpMapper->resetAreaComboBoxToPlayerRoomArea();
-                mpHost->mpMap->mpMapper->show();
+                if (!packName.isEmpty()) {
+                    qWarning() << "XMLimport::importPackage(...) WARNING: ignoring unexpected <map> element"
+                                  " - map data should not be present in package XML files";
+                } else {
+                    readMap();
+                    mpHost->mpMap->audit();
+                    mpHost->mpMap->announceMapLoaded(true);
+                    mpHost->mpMap->requestMapperShown();
+                }
             } else {
                 qDebug().nospace() << "XMLimport::importPackage(...) ERROR: "
                                       "unrecognised element with name: "
@@ -210,7 +223,7 @@ std::pair<bool, QString> XMLimport::importPackage(QFile* pfile, QString packName
         }
 
         if (gotAction) {
-            mpHost->getActionUnit()->updateToolbar();
+            mpHost->getActionUnit()->updateAllToolbars();
         } else {
             mpHost->getActionUnit()->unregisterAction(mpAction);
             delete mpAction;
@@ -231,11 +244,11 @@ std::pair<bool, QString> XMLimport::importPackage(QFile* pfile, QString packName
 }
 
 // returns the type of item and ID of the first (root) element
-std::pair<dlgTriggerEditor::EditorViewType, int> XMLimport::importFromClipboard()
+std::pair<EditorViewType, int> XMLimport::importFromClipboard()
 {
     QString xml;
-    QClipboard* clipboard = QApplication::clipboard();
-    std::pair<dlgTriggerEditor::EditorViewType, int> result;
+    QClipboard* clipboard = QGuiApplication::clipboard();
+    std::pair<EditorViewType, int> result;
 
     xml = clipboard->text(QClipboard::Clipboard);
 
@@ -243,7 +256,10 @@ std::pair<dlgTriggerEditor::EditorViewType, int> XMLimport::importFromClipboard(
     QBuffer xmlBuffer(&ba);
 
     setDevice(&xmlBuffer);
-    xmlBuffer.open(QIODevice::ReadOnly);
+    if (!xmlBuffer.open(QIODevice::ReadOnly)) {
+        qWarning() << "XMLimport::importFromClipboard() ERROR: failed to open XML buffer for reading";
+        return {EditorViewType::cmUnknownView, 0};
+    }
 
     while (!atEnd()) {
         readNext();
@@ -281,20 +297,20 @@ void XMLimport::readVariable(TVar* pParent)
             if (name() == qsl("name")) {
                 keyName = readElementText();
                 continue;
-            } else if (name() == qsl("value")) {
+            } else if (name() == qsl("value")) { // NOLINT(readability-else-after-return)
                 value = readElementText();
                 continue;
-            } else if (name() == qsl("keyType")) {
+            } else if (name() == qsl("keyType")) { // NOLINT(readability-else-after-return)
                 keyType = readElementText().toInt();
                 continue;
-            } else if (name() == qsl("valueType")) {
+            } else if (name() == qsl("valueType")) { // NOLINT(readability-else-after-return)
                 valueType = readElementText().toInt();
                 var->setName(keyName, keyType);
                 var->setValue(value, valueType);
                 vu->addSavedVar(var);
                 lI->setValue(var);
                 continue;
-            } else if (name() == qsl("VariableGroup") || name() == qsl("Variable")) {
+            } else if (name() == qsl("VariableGroup") || name() == qsl("Variable")) { // NOLINT(readability-else-after-return)
                 readVariable(var);
             } else {
                 readUnknownElement(what);
@@ -420,7 +436,8 @@ void XMLimport::readAreas()
 
         if (name() == qsl("areas")) {
             break;
-        } else if (name() == qsl("area")) {
+        }
+        if (name() == qsl("area")) {
             readArea();
         }
     }
@@ -463,7 +480,8 @@ void XMLimport::readRoomFeatures(TRoom* pR)
         if (Q_LIKELY(isStartElement())) {
             if (name() == qsl("features")) {
                 continue;
-            } else if (Q_LIKELY(name() == qsl("feature"))) {
+            }
+            if (Q_LIKELY(name() == qsl("feature"))) {
                 readRoomFeature(pR);
             }
         } else if (isEndElement() && name() == qsl("features")) {
@@ -483,7 +501,7 @@ void XMLimport::readRoomFeature(TRoom* pR)
 // TRoomDB::addRoom(...)
 void XMLimport::readRoom(QMultiHash<int, int>& areamRoomMultiHash, unsigned int* roomCount)
 {
-    auto pT = new TRoom(mpHost->mpMap->mpRoomDB);
+    auto pT = new TRoom(mpHost->mpMap->mpRoomDB.get());
 
     pT->id = attributes().value(qsl("id")).toString().toInt();
     pT->area = attributes().value(qsl("area")).toString().toInt();
@@ -497,7 +515,8 @@ void XMLimport::readRoom(QMultiHash<int, int>& areamRoomMultiHash, unsigned int*
             continue; // Skip further tests on exits as we'd have to throw away
                       // this invalid room and it would mess up the
                       // entranceMultiHash
-        } else if (Q_LIKELY(name() == qsl("exit"))) {
+        }
+        if (Q_LIKELY(name() == qsl("exit"))) {
             QString dir = attributes().value(qsl("direction")).toString();
             const int e = attributes().value(qsl("target")).toString().toInt();
             // If there is a "hidden" exit mark it as a locked door, otherwise
@@ -505,17 +524,21 @@ void XMLimport::readRoom(QMultiHash<int, int>& areamRoomMultiHash, unsigned int*
             // depending on the value (I.R.E. MUD maps always uses "1" for "door"
             // and/or "hidden" - though the latter does not always appear with
             // former):
-            const int door = (attributes().hasAttribute(qsl("hidden")) && attributes().value(qsl("hidden")).toString().toInt() == 1)
-                    ? 3
-                    : (attributes().hasAttribute(qsl("door")) && attributes().value(qsl("door")).toString().toInt() >= 0 && attributes().value(qsl("door")).toString().toInt() <= 3)
-                      ? attributes().value(qsl("door")).toString().toInt()
-                      : 0;
+            const int door = (attributes().hasAttribute(qsl("hidden")) && attributes().value(qsl("hidden")).toString().toInt() == 1) ? 3
+                             : (attributes().hasAttribute(qsl("door")) && attributes().value(qsl("door")).toString().toInt() >= 0 && attributes().value(qsl("door")).toString().toInt() <= 3)
+                                     ? attributes().value(qsl("door")).toString().toInt()
+                                     : 0;
             if (dir.isEmpty()) {
                 if (attributes().value(qsl("special")).toString().toInt() == 1 && !attributes().value(qsl("command")).toString().isEmpty()) {
                     // This is how IRE XML maps mark special exits, rather than
                     // by just using a different string for the direction!
                     dir = attributes().value(qsl("command")).toString();
-                    pT->setSpecialExit(e, dir);
+                    // Not setSpecialExit(), which edits the map's entrances for
+                    // this room's id while the room is not on the map yet - and
+                    // a malformed file can reuse an id another room holds
+                    if (e > 0) {
+                        pT->mSpecialExits[dir] = e;
+                    }
                     pT->setDoor(dir, door);
                 } else {
                     continue;
@@ -556,17 +579,13 @@ void XMLimport::readRoom(QMultiHash<int, int>& areamRoomMultiHash, unsigned int*
             } else if (dir == qsl("out")) {
                 pT->out = e;
                 pT->setDoor(qsl("out"), door);
-            } else {
-                // TODO: Handle Special Exits
             }
         } else if (name() == qsl("coord")) {
             if (attributes().value(qsl("x")).toString().isEmpty()) {
                 continue;
             }
 
-            pT->x = attributes().value(qsl("x")).toString().toInt();
-            pT->y = attributes().value(qsl("y")).toString().toInt();
-            pT->z = attributes().value(qsl("z")).toString().toInt();
+            pT->setCoordinates(attributes().value(qsl("x")).toString().toInt(), attributes().value(qsl("y")).toString().toInt(), attributes().value(qsl("z")).toString().toInt());
             continue;
         } else if (name() == qsl("features")) {
             readRoomFeatures(pT);
@@ -584,10 +603,15 @@ void XMLimport::readRoom(QMultiHash<int, int>& areamRoomMultiHash, unsigned int*
             mpHost->mpMap->reportStringToProgressDialog(tr("Parsing room data [count: %1]...").arg(*roomCount));
         }
         areamRoomMultiHash.insert(pT->area, pT->id);
+        mMaxRoomId = qMax(mMaxRoomId, pT->id); // Wasn't used but now maintains max Room Id
         // We are loading a map so can make some optimisation by setting the
         // third argument as true:
-        mpHost->mpMap->mpRoomDB->addRoom(pT->id, pT, true);
-        mMaxRoomId = qMax(mMaxRoomId, pT->id); // Wasn't used but now maintains max Room Id
+        if (!mpHost->mpMap->mpRoomDB->addRoom(pT->id, pT, true)) {
+            // addRoom() takes no ownership of a room whose id is taken, and
+            // ~TRoom() would remove the room holding that id, so unhook it:
+            pT->mpRoomDB = nullptr;
+            delete pT;
+        }
     } else {
         delete pT;
     }
@@ -600,47 +624,49 @@ void XMLimport::readUnknownMapElement()
 
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             readUnknownMapElement();
         }
     }
 }
 
 // returns the type of item and ID of the first (root) element
-std::pair<dlgTriggerEditor::EditorViewType, int> XMLimport::readPackage()
+std::pair<EditorViewType, int> XMLimport::readPackage()
 {
-    dlgTriggerEditor::EditorViewType objectType = dlgTriggerEditor::EditorViewType::cmUnknownView;
+    EditorViewType objectType = EditorViewType::cmUnknownView;
     int rootItemID = -1;
     while (!atEnd()) {
         readNext();
 
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("HostPackage")) {
                 readHostPackage();
             } else if (name() == qsl("TriggerPackage")) {
-                objectType = dlgTriggerEditor::EditorViewType::cmTriggerView;
+                objectType = EditorViewType::cmTriggerView;
                 rootItemID = readTriggerPackage();
             } else if (name() == qsl("TimerPackage")) {
-                objectType = dlgTriggerEditor::EditorViewType::cmTimerView;
+                objectType = EditorViewType::cmTimerView;
                 rootItemID = readTimerPackage();
             } else if (name() == qsl("AliasPackage")) {
-                objectType = dlgTriggerEditor::EditorViewType::cmAliasView;
+                objectType = EditorViewType::cmAliasView;
                 rootItemID = readAliasPackage();
             } else if (name() == qsl("ActionPackage")) {
-                objectType = dlgTriggerEditor::EditorViewType::cmActionView;
+                objectType = EditorViewType::cmActionView;
                 rootItemID = readActionPackage();
             } else if (name() == qsl("ScriptPackage")) {
-                objectType = dlgTriggerEditor::EditorViewType::cmScriptView;
+                objectType = EditorViewType::cmScriptView;
                 rootItemID = readScriptPackage();
             } else if (name() == qsl("KeyPackage")) {
-                objectType = dlgTriggerEditor::EditorViewType::cmKeysView;
+                objectType = EditorViewType::cmKeysView;
                 rootItemID = readKeyPackage();
             } else if (name() == qsl("HelpPackage")) {
                 readHelpPackage();
             } else if (name() == qsl("VariablePackage")) {
-                objectType = dlgTriggerEditor::EditorViewType::cmVarsView;
+                objectType = EditorViewType::cmVarsView;
                 readVariablePackage();
             } else {
                 readUnknownElement(qsl("MudletPackage"));
@@ -657,7 +683,8 @@ void XMLimport::readHelpPackage()
 
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("helpURL")) {
                 const QString contents = readElementText();
                 mpHost->moduleHelp[mPackageName].insert("helpURL", contents);
@@ -703,7 +730,8 @@ void XMLimport::readHostPackage()
         readNext();
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("Host")) {
                 readHost(mpHost);
             } else {
@@ -715,6 +743,19 @@ void XMLimport::readHostPackage()
 
 void XMLimport::readHost(Host* pHost)
 {
+    // This is an inline helper function to get a boolean value from a legacy attribute
+    // or return a default value. It also allows for inverting the result which is useful
+    // for attributes that have been negated in the past (e.g., mFORCE_MXP_NEGOTIATION_OFF
+    // which is now mEnableMXP, mFORCE_CHARSET_NEGOTIATION_OFF which is now mEnableCHARSET,
+    // and forceNewEnvironNegotiationOff which is now mEnableNEWENVIRON).
+    auto getBoolValueFromLegacyAttributeOrDefault = [&](const QString& legacyAttribute, const bool defaultsTo, bool invert = false) -> bool {
+        if (attributes().hasAttribute(legacyAttribute)) {
+            bool value = attributes().value(legacyAttribute) == YES;
+            return invert ? !value : value;
+        }
+        return defaultsTo;
+    };
+
     auto setBoolAttributeWithDefault = [&](const QString& attribute, bool& target, const bool defaultsTo) {
         target = attributes().hasAttribute(attribute) ? attributes().value(attribute) == YES : defaultsTo;
     };
@@ -725,12 +766,29 @@ void XMLimport::readHost(Host* pHost)
 
     setBoolAttributeWithDefault(qsl("announceIncomingText"), pHost->mAnnounceIncomingText, true);
     setBoolAttributeWithDefault(qsl("advertiseScreenReader"), pHost->mAdvertiseScreenReader, false);
+    setBoolAttributeWithDefault(qsl("enableOSC8Hyperlinks"), pHost->mEnableOSC8Hyperlinks, true);
+    setBoolAttributeWithDefault(qsl("enableClosedCaption"), pHost->mEnableClosedCaption, false);
     setBoolAttributeWithDefault(qsl("mEnableMTTS"), pHost->mEnableMTTS, true);
     setBoolAttributeWithDefault(qsl("mEnableMNES"), pHost->mEnableMNES, false);
-    setBoolAttributeWithDefault(qsl("forceNewEnvironNegotiationOff"), pHost->mForceNewEnvironNegotiationOff, false);
+    setBoolAttributeWithDefault(qsl("mEnableMXP"), pHost->mEnableMXP, getBoolValueFromLegacyAttributeOrDefault(qsl("mFORCE_MXP_NEGOTIATION_OFF"), true, true));
+    setBoolAttributeWithDefault(qsl("mEnableNAWS"), pHost->mEnableNAWS, true);
+    setBoolAttributeWithDefault(qsl("mUndoServerWrap"), pHost->mUndoServerWrap, false);
+    setBoolAttributeWithDefault(qsl("mEnableCHARSET"), pHost->mEnableCHARSET, getBoolValueFromLegacyAttributeOrDefault(qsl("mFORCE_CHARSET_NEGOTIATION_OFF"), true, true));
+    setBoolAttributeWithDefault(qsl("mEnableNEWENVIRON"), pHost->mEnableNEWENVIRON, getBoolValueFromLegacyAttributeOrDefault(qsl("forceNewEnvironNegotiationOff"), true, true));
 
     setBoolAttribute(qsl("autoClearCommandLineAfterSend"), pHost->mAutoClearCommandLineAfterSend);
-    setBoolAttribute(qsl("printCommand"), pHost->mPrintCommand);
+    setBoolAttributeWithDefault(qsl("disablePasswordMasking"), pHost->mDisablePasswordMasking, false);
+
+    // Handle command echo mode with backward compatibility
+    if (attributes().hasAttribute(qsl("commandEchoMode"))) {
+        // New tri-state attribute
+        int echoMode = attributes().value(qsl("commandEchoMode")).toInt();
+        pHost->mCommandEchoMode = static_cast<Host::CommandEchoMode>(qBound(0, echoMode, 2));
+    } else {
+        // Legacy boolean attribute - convert to new enum
+        bool legacyPrintCommand = getBoolValueFromLegacyAttributeOrDefault(qsl("printCommand"), true);
+        pHost->mCommandEchoMode = legacyPrintCommand ? Host::CommandEchoMode::ScriptControl : Host::CommandEchoMode::Never;
+    }
     setBoolAttribute(qsl("mUSE_FORCE_LF_AFTER_PROMPT"), pHost->mUSE_FORCE_LF_AFTER_PROMPT);
     setBoolAttribute(qsl("mUSE_UNIX_EOL"), pHost->mUSE_UNIX_EOL);
     setBoolAttribute(qsl("runAllKeyMatches"), pHost->getKeyUnit()->mRunAllKeyMatches);
@@ -746,18 +804,35 @@ void XMLimport::readHost(Host* pHost)
     setBoolAttribute(qsl("mEnableMSDP"), pHost->mEnableMSDP);
     setBoolAttribute(qsl("mEnableMSP"), pHost->mEnableMSP);
     setBoolAttribute(qsl("mMapStrongHighlight"), pHost->mMapStrongHighlight);
-    setBoolAttribute(qsl("mEnableSpellCheck"), pHost->mEnableSpellCheck);
+    // Via the setter, so enabling spell check always queues the dictionary read. Nothing is queued
+    // here: the import runs inside profile loading, which the setter skips, and the post-load warm covers it.
+    bool enableSpellCheck = false;
+    setBoolAttribute(qsl("mEnableSpellCheck"), enableSpellCheck);
+    pHost->setEnableSpellCheck(enableSpellCheck);
+    if (attributes().hasAttribute(QLatin1String("mShowInfo"))) {
+        // Old - pre Map Info versions of Mudlet (those before
+        // https://github.com/Mudlet/Mudlet/pull/4718) used the above
+        // setting to control the showing of what is now the "Full"
+        // map info display. So treat it as that to reproduce that
+        // behaviour:
+        if (attributes().value(qsl("mShowInfo")).toString() == YES) {
+            mpHost->mMapInfoContributors.insert(qsl("Full"));
+        }
+    }
     setBoolAttribute(qsl("mAcceptServerGUI"), pHost->mAcceptServerGUI);
     setBoolAttribute(qsl("mAcceptServerMedia"), pHost->mAcceptServerMedia);
     setBoolAttribute(qsl("mMapperUseAntiAlias"), pHost->mMapperUseAntiAlias);
+    setBoolAttribute(qsl("mMapperShowGrid"), pHost->mMapperShowGrid);
     setBoolAttribute(qsl("mEditorAutoComplete"), pHost->mEditorAutoComplete);
-    setBoolAttribute(qsl("mFORCE_MXP_NEGOTIATION_OFF"), pHost->mFORCE_MXP_NEGOTIATION_OFF);
-    setBoolAttribute(qsl("mFORCE_CHARSET_NEGOTIATION_OFF"), pHost->mFORCE_CHARSET_NEGOTIATION_OFF);
+    setBoolAttribute(qsl("mVersionInTTYPE"), pHost->mVersionInTTYPE);
+    setBoolAttribute(qsl("mPromptedForVersionInTTYPE"), pHost->mPromptedForVersionInTTYPE);
+    setBoolAttribute(qsl("mPromptedForMXPProcessorOn"), pHost->mPromptedForMXPProcessorOn);
     setBoolAttribute(qsl("enableTextAnalyzer"), pHost->mEnableTextAnalyzer);
     setBoolAttribute(qsl("mBubbleMode"), pHost->mBubbleMode);
     setBoolAttribute(qsl("mMapViewOnly"), pHost->mMapViewOnly);
     setBoolAttribute(qsl("mShowRoomIDs"), pHost->mShowRoomID);
     setBoolAttribute(qsl("mShowPanel"), pHost->mShowPanel);
+    setBoolAttribute(qsl("mShow3DView"), pHost->mShow3DView);
     setBoolAttribute(qsl("mHaveMapperScript"), pHost->mHaveMapperScript);
     setBoolAttribute(qsl("mSslTsl"), pHost->mSslTsl);
     setBoolAttribute(qsl("mSslIgnoreExpired"), pHost->mSslIgnoreExpired);
@@ -765,7 +840,9 @@ void XMLimport::readHost(Host* pHost)
     setBoolAttribute(qsl("mSslIgnoreAll"), pHost->mSslIgnoreAll);
     setBoolAttribute(qsl("mAskTlsAvailable"), pHost->mAskTlsAvailable);
     setBoolAttribute(qsl("mUseProxy"), pHost->mUseProxy);
+    setBoolAttribute(qsl("f3SearchEnabled"), pHost->mF3SearchEnabled);
 
+    pHost->setForceMXPProcessorOn(attributes().value(qsl("mForceMXPProcessorOn")) == YES);
     pHost->mProxyAddress = attributes().value(qsl("mProxyAddress")).toString();
 
     if (attributes().hasAttribute(QLatin1String("mProxyPort"))) {
@@ -775,7 +852,32 @@ void XMLimport::readHost(Host* pHost)
     }
 
     pHost->mProxyUsername = attributes().value(qsl("mProxyUsername")).toString();
-    pHost->mProxyPassword = attributes().value(qsl("mProxyPassword")).toString();
+
+    // Handle backward compatibility based on application version, not profile version
+    QString storedProxyPassword = attributes().value(qsl("mProxyPassword")).toString();
+
+    // For version 4.20.0+, use secure storage; for older versions, maintain plaintext in XML
+    // Use current application version for consistency with XMLexport behavior
+    const QString currentAppVersion = QString(APP_VERSION);
+    const QVersionNumber appVersion = QVersionNumber::fromString(currentAppVersion);
+    const QVersionNumber secureStorageVersion = QVersionNumber(4, 20, 0);
+    const bool useSecureStorage = appVersion >= secureStorageVersion;
+
+    if (!storedProxyPassword.isEmpty()) {
+        if (useSecureStorage) {
+            // Modern application: migrate plaintext password to secure storage and clear from XML
+            CredentialManager::storeCredential(pHost->getName(), "proxy", storedProxyPassword);
+            pHost->mProxyPassword = storedProxyPassword;
+            SecureStringUtils::secureStringClear(storedProxyPassword); // Clear after migration
+        } else {
+            // Legacy application: keep plaintext password for backward compatibility
+            pHost->mProxyPassword = storedProxyPassword;
+        }
+    } else if (useSecureStorage) {
+        // Modern application: load from secure storage if available
+        pHost->mProxyPassword = CredentialManager::retrieveCredential(pHost->getName(), "proxy");
+    }
+
     pHost->set_USE_IRE_DRIVER_BUGFIX(attributes().value(qsl("USE_IRE_DRIVER_BUGFIX")) == YES);
     pHost->mHighlightHistory = readDefaultTrueBool(qsl("HighlightHistory"));
     pHost->mLogDir = attributes().value(qsl("logDirectory")).toString();
@@ -786,6 +888,12 @@ void XMLimport::readHost(Host* pHost)
     pHost->mMapperShowRoomBorders = readDefaultTrueBool(qsl("mMapperShowRoomBorders"));
     pHost->mEditorTheme = attributes().value(QLatin1String("mEditorTheme")).toString();
     pHost->mEditorThemeFile = attributes().value(QLatin1String("mEditorThemeFile")).toString();
+    if (pHost->mEditorTheme.isEmpty() || pHost->mEditorThemeFile.isEmpty()) {
+        pHost->mEditorTheme = qsl("Mudlet");
+        pHost->mEditorThemeFile = qsl("Mudlet.tmTheme");
+    }
+    pHost->mEditorThemeDark = attributes().value(QLatin1String("mEditorThemeDark")).toString();
+    pHost->mEditorThemeFileDark = attributes().value(QLatin1String("mEditorThemeFileDark")).toString();
     pHost->mThemePreviewItemID = attributes().value(QLatin1String("mThemePreviewItemID")).toInt();
     pHost->mThemePreviewType = attributes().value(QLatin1String("mThemePreviewType")).toString();
     pHost->setHaveColorSpaceId(attributes().value(QLatin1String("mSGRCodeHasColSpaceId")).toString() == QLatin1String("yes"));
@@ -808,6 +916,8 @@ void XMLimport::readHost(Host* pHost)
         // which is just as well as it is needed for the automatic case...
         pHost->setWideAmbiguousEAsianGlyphs(Qt::PartiallyChecked);
     }
+
+    pHost->setEnableBlinkText(attributes().value(qsl("mEnableBlinkText")) == qsl("yes"));
 
     if (attributes().hasAttribute("logFileNameFormat")) {
         // We previously mixed "yyyy-MM-dd{#|T}hh-MM-ss" with "yyyy-MM-dd{#|T}HH-MM-ss"
@@ -864,16 +974,17 @@ void XMLimport::readHost(Host* pHost)
         pHost->mDiscordAccessFlags = static_cast<Host::DiscordOptionFlags>(attributes().value(qsl("mDiscordAccessFlags")).toString().toInt());
     }
 
+    if (attributes().hasAttribute(QLatin1String("mDiscordMode"))) {
+        const int modeInt = attributes().value(qsl("mDiscordMode")).toString().toInt();
+        if (modeInt >= Host::DiscordDisabled && modeInt <= Host::DiscordShowGameDetails) {
+            pHost->mDiscordMode = static_cast<Host::DiscordMode>(modeInt);
+        }
+    }
+
     if (attributes().hasAttribute(QLatin1String("mRequiredDiscordUserName"))) {
         pHost->mRequiredDiscordUserName = attributes().value(QLatin1String("mRequiredDiscordUserName")).toString();
     } else {
         pHost->mRequiredDiscordUserName.clear();
-    }
-
-    if (attributes().hasAttribute(QLatin1String("mRequiredDiscordUserDiscriminator"))) {
-        pHost->mRequiredDiscordUserDiscriminator = attributes().value(QLatin1String("mRequiredDiscordUserDiscriminator")).toString();
-    } else {
-        pHost->mRequiredDiscordUserDiscriminator.clear();
     }
 
     if (attributes().hasAttribute(QLatin1String("playerRoomStyle"))) {
@@ -888,8 +999,8 @@ void XMLimport::readHost(Host* pHost)
         styleCode = static_cast<quint8>(qBound(0, attributes().value(QLatin1String("playerRoomStyle")).toInt(), 255));
         outerDiameterPercentage = static_cast<quint8>(qBound(0, attributes().value(QLatin1String("playerRoomOuterDiameter")).toInt(), 255));
         innerDiameterPercentage = static_cast<quint8>(qBound(0, attributes().value(QLatin1String("playerRoomInnerDiameter")).toInt(), 255));
-        outerColor.setNamedColor(attributes().value(QLatin1String("playerRoomPrimaryColor")).toString());
-        innerColor.setNamedColor(attributes().value(QLatin1String("playerRoomSecondaryColor")).toString());
+        outerColor = QColor::fromString(attributes().value(QLatin1String("playerRoomPrimaryColor")).toString());
+        innerColor = QColor::fromString(attributes().value(QLatin1String("playerRoomSecondaryColor")).toString());
         // Store all the settings in the Host instance:
         pHost->setPlayerRoomStyleDetails(styleCode, outerDiameterPercentage, innerDiameterPercentage, outerColor, innerColor);
 
@@ -917,17 +1028,33 @@ void XMLimport::readHost(Host* pHost)
         pHost->mLineSize = 10.0; // Same value as is in Host class initializer list
     }
 
-    QStringView const ignore(attributes().value(qsl("mDoubleClickIgnore")));
+    pHost->mRoomBorderSize = attributes().value(qsl("mRoomBorderSize")).toString().toDouble();
+
+    if (qFuzzyCompare(1.0 + pHost->mRoomBorderSize, 1.0)) {
+        // For old profiles without border size, use mLineSize to preserve
+        // the previous behavior where border and exit shared the same size
+        pHost->mRoomBorderSize = pHost->mLineSize;
+    }
+
+    pHost->mMapGridLineSize = attributes().value(qsl("mMapGridLineSize")).toString().toDouble();
+
+    if (qFuzzyCompare(1.0 + pHost->mMapGridLineSize, 1.0)) {
+        pHost->mMapGridLineSize = 0.5; // Same value as is in Host class initializer list
+    }
+
+    const QStringView ignore(attributes().value(qsl("mDoubleClickIgnore")));
 
     for (auto character : ignore) {
         pHost->mDoubleClickIgnore.insert(character);
     }
 
     if (attributes().hasAttribute(QLatin1String("EditorSearchOptions"))) {
-        pHost->setSearchOptions(static_cast<dlgTriggerEditor::SearchOptions>(attributes().value(qsl("EditorSearchOptions")).toInt()));
+        pHost->setSearchOptions(static_cast<enums::EditorSearchOptions>(attributes().value(qsl("EditorSearchOptions")).toInt()));
     }
 
     pHost->setDebugShowAllProblemCodepoints(attributes().value(qsl("DebugShowAllProblemCodepoints")) == YES);
+    // On unless saved off, so a profile from before the setting existed gets it
+    pHost->setLazyCaptureGlobals(attributes().value(qsl("lazyCaptureGlobals")) != qsl("no"));
 
     const bool compactInputLine = attributes().value(QLatin1String("CompactInputLine")) == YES;
     pHost->setCompactInputLine(compactInputLine);
@@ -985,10 +1112,6 @@ void XMLimport::readHost(Host* pHost)
         pHost->setLargeAreaExitArrows(false);
     }
 
-    if (attributes().value(qsl("mShowInfo")) == qsl("no")) {
-        mpHost->mMapInfoContributors.clear();
-    }
-
     QMargins borders;
 
     while (!atEnd()) {
@@ -1020,6 +1143,10 @@ void XMLimport::readHost(Host* pHost)
                     moduleList << entryList.at(1);
                     pHost->mInstalledModules[it.key()] = moduleList;
                     pHost->mModulePriorities[it.key()] = entryList.at(2).toInt();
+                    // Also add to active modules list to match runtime state
+                    if (!pHost->mActiveModules.contains(it.key())) {
+                        pHost->mActiveModules.append(it.key());
+                    }
                 }
             } else if (name() == qsl("mInstalledPackages")) {
                 readStringList(pHost->mInstalledPackages, qsl("Host"));
@@ -1041,124 +1168,48 @@ void XMLimport::readHost(Host* pHost)
                 // otherwise). In fact this detail is normally stored outside of
                 // the game save in the profile base directory:
                 pHost->mBackupPort = readElementText().toInt();
-            } else if (name() == qsl("borderTopHeight")) {
-                borders.setTop(readElementText().toInt());
-            } else if (name() == qsl("borderBottomHeight")) {
-                borders.setBottom(readElementText().toInt());
-            } else if (name() == qsl("borderLeftWidth")) {
-                borders.setLeft(readElementText().toInt());
-            } else if (name() == qsl("borderRightWidth")) {
-                borders.setRight(readElementText().toInt());
+            } else if (readHostBorderElement(borders, name())) {
+                // Handled by helper
             } else if (name() == qsl("commandLineMinimumHeight")) {
                 pHost->commandLineMinimumHeight = readElementText().toInt();
             } else if (name() == qsl("wrapAt")) {
-                pHost->mWrapAt = readElementText().toInt();
+                // toInt() yields 0 for anything unparseable, and a profile that
+                // wraps at zero columns can show no text at all
+                pHost->mWrapAt = qMax(1, readElementText().toInt());
             } else if (name() == qsl("wrapIndentCount")) {
                 pHost->mWrapIndentCount = readElementText().toInt();
+            } else if (name() == qsl("wrapHangingIndentCount")) {
+                pHost->mWrapHangingIndentCount = readElementText().toInt();
+            } else if (name() == qsl("undoServerWrapWidth")) {
+                pHost->mUndoServerWrapWidth = qBound(20, readElementText().toInt(), 500);
+            } else if (name() == qsl("consoleBufferSize")) {
+                pHost->mConsoleBufferSize = readElementText().toInt();
+            } else if (name() == qsl("useMaxConsoleBufferSize")) {
+                pHost->mUseMaxConsoleBufferSize = (readElementText() == qsl("yes"));
             } else if (name() == qsl("mCommandSeparator")) {
                 pHost->mCommandSeparator = readElementText();
-            } else if (name() == qsl("mCommandLineFgColor")) {
-                pHost->mCommandLineFgColor.setNamedColor(readElementText());
-            } else if (name() == qsl("mCommandLineBgColor")) {
-                pHost->mCommandLineBgColor.setNamedColor(readElementText());
-            } else if (name() == qsl("mFgColor")) {
-                pHost->mFgColor.setNamedColor(readElementText());
-            } else if (name() == qsl("mBgColor")) {
-                pHost->mBgColor.setNamedColor(readElementText());
-            } else if (name() == qsl("mCommandFgColor")) {
-                pHost->mCommandFgColor.setNamedColor(readElementText());
-            } else if (name() == qsl("mCommandBgColor")) {
-                pHost->mCommandBgColor.setNamedColor(readElementText());
-            } else if (name() == qsl("mBlack")) {
-                pHost->mBlack.setNamedColor(readElementText());
-            } else if (name() == qsl("mLightBlack")) {
-                pHost->mLightBlack.setNamedColor(readElementText());
-            } else if (name() == qsl("mRed")) {
-                pHost->mRed.setNamedColor(readElementText());
-            } else if (name() == qsl("mLightRed")) {
-                pHost->mLightRed.setNamedColor(readElementText());
-            } else if (name() == qsl("mBlue")) {
-                pHost->mBlue.setNamedColor(readElementText());
-            } else if (name() == qsl("mLightBlue")) {
-                pHost->mLightBlue.setNamedColor(readElementText());
-            } else if (name() == qsl("mGreen")) {
-                pHost->mGreen.setNamedColor(readElementText());
-            } else if (name() == qsl("mLightGreen")) {
-                pHost->mLightGreen.setNamedColor(readElementText());
-            } else if (name() == qsl("mYellow")) {
-                pHost->mYellow.setNamedColor(readElementText());
-            } else if (name() == qsl("mLightYellow")) {
-                pHost->mLightYellow.setNamedColor(readElementText());
-            } else if (name() == qsl("mCyan")) {
-                pHost->mCyan.setNamedColor(readElementText());
-            } else if (name() == qsl("mLightCyan")) {
-                pHost->mLightCyan.setNamedColor(readElementText());
-            } else if (name() == qsl("mMagenta")) {
-                pHost->mMagenta.setNamedColor(readElementText());
-            } else if (name() == qsl("mLightMagenta")) {
-                pHost->mLightMagenta.setNamedColor(readElementText());
-            } else if (name() == qsl("mWhite")) {
-                pHost->mWhite.setNamedColor(readElementText());
-            } else if (name() == qsl("mLightWhite")) {
-                pHost->mLightWhite.setNamedColor(readElementText());
+            } else if (readHostColorElement(pHost, name())) {
+                // Handled by helper
             } else if (name() == qsl("mDisplayFont")) {
                 pHost->setDisplayFontFromString(readElementText());
-#if defined(Q_OS_LINUX)
-                // On Linux ensure that emojis are displayed in colour even if
-                // this font doesn't support it:
-                QFont::insertSubstitution(pHost->mDisplayFont.family(), qsl("Noto Color Emoji"));
+#if defined(Q_OS_LINUX) || defined(Q_OS_FREEBSD)
+#if QT_VERSION < QT_VERSION_CHECK(6, 9, 0)
+                // On GNU/Linux and FreeBSD ensure that emojis are displayed in
+                // colour even if this font doesn't support it:
+                QFont::insertSubstitution(pHost->getDisplayFont().family(), qsl("Noto Color Emoji"));
 #endif
-                pHost->setDisplayFontFixedPitch(true);
+                // For Qt 6.9+, emoji font support is handled globally in FontManager::addEmojiFont()
+#endif
             } else if (name() == qsl("mCommandLineFont")) {
-                pHost->mCommandLineFont.fromString(readElementText());
+                // We use the same font as the main console now so discard this
+                // one silently:
+                Q_UNUSED(readElementText())
             } else if (name() == qsl("commandSeperator")) {
                 // Ignore this misspelled duplicate, it has been removed from
                 // the Xml format but will appear in older files and trip the
                 // QDebug() error reporting associated with the following
                 // readUnknownElement(...) for "anything not otherwise parsed"
                 Q_UNUSED(readElementText())
-            } else if (name() == qsl("mFgColor2")) {
-                pHost->mFgColor_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mBgColor2")) {
-                pHost->mBgColor_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mRoomBorderColor")) {
-                pHost->mRoomBorderColor.setNamedColor(readElementText());
-            } else if (name() == qsl("mMapInfoBg")) {
-                auto alpha = (attributes().hasAttribute(qsl("alpha"))) ? attributes().value(qsl("alpha")).toInt() : 255;
-                pHost->mMapInfoBg.setNamedColor(readElementText());
-                pHost->mMapInfoBg.setAlpha(alpha);
-            } else if (name() == qsl("mBlack2")) {
-                pHost->mBlack_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mLightBlack2")) {
-                pHost->mLightBlack_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mRed2")) {
-                pHost->mRed_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mLightRed2")) {
-                pHost->mLightRed_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mBlue2")) {
-                pHost->mBlue_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mLightBlue2")) {
-                pHost->mLightBlue_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mGreen2")) {
-                pHost->mGreen_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mLightGreen2")) {
-                pHost->mLightGreen_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mYellow2")) {
-                pHost->mYellow_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mLightYellow2")) {
-                pHost->mLightYellow_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mCyan2")) {
-                pHost->mCyan_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mLightCyan2")) {
-                pHost->mLightCyan_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mMagenta2")) {
-                pHost->mMagenta_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mLightMagenta2")) {
-                pHost->mLightMagenta_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mWhite2")) {
-                pHost->mWhite_2.setNamedColor(readElementText());
-            } else if (name() == qsl("mLightWhite2")) {
-                pHost->mLightWhite_2.setNamedColor(readElementText());
             } else if (name() == qsl("mSpellDic")) {
                 pHost->setSpellDic(readElementText());
             } else if (name() == qsl("mLineSize") || name() == qsl("mRoomSize")) {
@@ -1171,7 +1222,7 @@ void XMLimport::readHost(Host* pHost)
                 // We still check for them so that we avoid falling into the
                 // QDebug() error reporting associated with the following
                 // readUnknownElement(...) for "anything not otherwise parsed"
-                Q_UNUSED(readElementText());
+                Q_UNUSED(readElementText())
             } else if (name() == qsl("mMapInfoContributors")) {
                 readLegacyMapInfoContributors();
             } else if (name() == qsl("mapInfoContributor")) {
@@ -1180,17 +1231,130 @@ void XMLimport::readHost(Host* pHost)
                 readProfileShortcut();
             } else if (name() == qsl("stopwatches")) {
                 readStopWatchMap();
+            } else if (name() == qsl("MMCP")) {
+                readMMCPOptions();
+            } else if (name() == qsl("experiment")) {
+                QString key = attributes().value(qsl("key")).toString();
+                bool enabled = attributes().value(qsl("enabled")) == YES;
+                if (enabled && !key.isEmpty()) {
+                    mpHost->setExperimentEnabled(key, true);
+                }
+                readElementText(); // consume the element
             } else {
                 readUnknownElement(qsl("Host"));
             }
         }
     }
 
-    pHost->setBorders(borders);
+    pHost->setUserBorders(borders);
     pHost->loadPackageInfo();
+    // A package import comes through here too, into a profile that does have a
+    // console - and that one needs the whole restyle, not just the model:
+    pHost->applyMainConsoleColors();
+    if (!pHost->mpConsole) {
+        TConsoleModel& model = pHost->mainConsoleModel();
+        model.setWrapAt(pHost->mWrapAt);
+        model.setIndentCount(pHost->mWrapIndentCount);
+        model.setHangingIndentCount(pHost->mWrapHangingIndentCount);
+    }
 }
 
-bool XMLimport::readDefaultTrueBool(QString name) {
+bool XMLimport::readHostColorElement(Host* pHost, QStringView elementName)
+{
+    // Simple colors (no alpha channel)
+    static const QHash<QString, QColor Host::*> simpleColors = {
+            {qsl("mCommandLineFgColor"), &Host::mCommandLineFgColor},
+            {qsl("mCommandLineBgColor"), &Host::mCommandLineBgColor},
+            {qsl("mFgColor"), &Host::mFgColor},
+            {qsl("mCommandFgColor"), &Host::mCommandFgColor},
+            {qsl("mCommandBgColor"), &Host::mCommandBgColor},
+            {qsl("mBlack"), &Host::mBlack},
+            {qsl("mLightBlack"), &Host::mLightBlack},
+            {qsl("mRed"), &Host::mRed},
+            {qsl("mLightRed"), &Host::mLightRed},
+            {qsl("mBlue"), &Host::mBlue},
+            {qsl("mLightBlue"), &Host::mLightBlue},
+            {qsl("mGreen"), &Host::mGreen},
+            {qsl("mLightGreen"), &Host::mLightGreen},
+            {qsl("mYellow"), &Host::mYellow},
+            {qsl("mLightYellow"), &Host::mLightYellow},
+            {qsl("mCyan"), &Host::mCyan},
+            {qsl("mLightCyan"), &Host::mLightCyan},
+            {qsl("mMagenta"), &Host::mMagenta},
+            {qsl("mLightMagenta"), &Host::mLightMagenta},
+            {qsl("mWhite"), &Host::mWhite},
+            {qsl("mLightWhite"), &Host::mLightWhite},
+            {qsl("mFgColor2"), &Host::mFgColor_2},
+            {qsl("mRoomBorderColor"), &Host::mRoomBorderColor},
+            {qsl("mRoomCollisionBorderColor"), &Host::mRoomCollisionBorderColor},
+            {qsl("mBlack2"), &Host::mBlack_2},
+            {qsl("mLightBlack2"), &Host::mLightBlack_2},
+            {qsl("mRed2"), &Host::mRed_2},
+            {qsl("mLightRed2"), &Host::mLightRed_2},
+            {qsl("mBlue2"), &Host::mBlue_2},
+            {qsl("mLightBlue2"), &Host::mLightBlue_2},
+            {qsl("mGreen2"), &Host::mGreen_2},
+            {qsl("mLightGreen2"), &Host::mLightGreen_2},
+            {qsl("mYellow2"), &Host::mYellow_2},
+            {qsl("mLightYellow2"), &Host::mLightYellow_2},
+            {qsl("mCyan2"), &Host::mCyan_2},
+            {qsl("mLightCyan2"), &Host::mLightCyan_2},
+            {qsl("mMagenta2"), &Host::mMagenta_2},
+            {qsl("mLightMagenta2"), &Host::mLightMagenta_2},
+            {qsl("mWhite2"), &Host::mWhite_2},
+            {qsl("mLightWhite2"), &Host::mLightWhite_2},
+    };
+
+    // Colors that support alpha channel
+    static const QHash<QString, QColor Host::*> alphaColors = {
+            {qsl("mBgColor"), &Host::mBgColor},
+            {qsl("mBgColor2"), &Host::mBgColor_2},
+            {qsl("mMapGridColor"), &Host::mMapGridColor},
+            {qsl("mMapInfoBg"), &Host::mMapInfoBg},
+            {qsl("mLowerLevelColor"), &Host::mLowerLevelColor},
+            {qsl("mUpperLevelColor"), &Host::mUpperLevelColor},
+    };
+
+    const QString elemName = elementName.toString();
+
+    if (auto it = simpleColors.find(elemName); it != simpleColors.end()) {
+        pHost->*it.value() = QColor::fromString(readElementText());
+        return true;
+    }
+
+    if (auto it = alphaColors.find(elemName); it != alphaColors.end()) {
+        const int alpha = attributes().hasAttribute(qsl("alpha")) ? attributes().value(qsl("alpha")).toInt() : 255;
+        pHost->*it.value() = QColor::fromString(readElementText());
+        (pHost->*it.value()).setAlpha(alpha);
+        return true;
+    }
+
+    return false;
+}
+
+bool XMLimport::readHostBorderElement(QMargins& borders, QStringView elementName)
+{
+    if (elementName == qsl("borderTopHeight")) {
+        borders.setTop(readElementText().toInt());
+        return true;
+    }
+    if (elementName == qsl("borderBottomHeight")) {
+        borders.setBottom(readElementText().toInt());
+        return true;
+    }
+    if (elementName == qsl("borderLeftWidth")) {
+        borders.setLeft(readElementText().toInt());
+        return true;
+    }
+    if (elementName == qsl("borderRightWidth")) {
+        borders.setRight(readElementText().toInt());
+        return true;
+    }
+    return false;
+}
+
+bool XMLimport::readDefaultTrueBool(QString name)
+{
     return attributes().value(name) == YES || !attributes().hasAttribute(name);
 }
 
@@ -1247,13 +1411,16 @@ int XMLimport::readTrigger(TTrigger* pParent)
 
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("name")) {
                 pT->setName(readElementText());
             } else if (name() == qsl("script")) {
                 const QString tempScript = readScriptElement();
                 if (!pT->setScript(tempScript)) {
                     qDebug().nospace() << "XMLimport::readTrigger(...): ERROR: can not compile trigger's lua code for: " << pT->getName();
+                    mItemsWithErrors.append(qsl("%1: %2").arg(pT->getName(), compileErrorAsPlainText(pT->getError())));
+                    mItemsWithErrorNames.append(pT->getName());
                 }
             } else if (name() == qsl("packageName")) {
                 pT->mPackageName = readElementText();
@@ -1266,6 +1433,7 @@ int XMLimport::readTrigger(TTrigger* pParent)
             } else if (name() == qsl("mCommand")) {
                 pT->mCommand = readElementText();
             } else if (name() == qsl("mFgColor")) {
+#if QT_VERSION < QT_VERSION_CHECK(6, 6, 0)
                 pT->mFgColor.setNamedColor(readElementText());
             } else if (name() == qsl("mBgColor")) {
                 pT->mBgColor.setNamedColor(readElementText());
@@ -1273,6 +1441,15 @@ int XMLimport::readTrigger(TTrigger* pParent)
                 pT->mColorTriggerFgColor.setNamedColor(readElementText());
             } else if (name() == qsl("colorTriggerBgColor")) {
                 pT->mColorTriggerBgColor.setNamedColor(readElementText());
+#else
+                pT->mFgColor = QColor::fromString(readElementText());
+            } else if (name() == qsl("mBgColor")) {
+                pT->mBgColor = QColor::fromString(readElementText());
+            } else if (name() == qsl("colorTriggerFgColor")) {
+                pT->mColorTriggerFgColor = QColor::fromString(readElementText());
+            } else if (name() == qsl("colorTriggerBgColor")) {
+                pT->mColorTriggerBgColor = QColor::fromString(readElementText());
+#endif
             } else if (name() == qsl("mSoundFile")) {
                 pT->mSoundFile = readElementText();
             } else if (name() == qsl("regexCodeList")) {
@@ -1282,14 +1459,9 @@ int XMLimport::readTrigger(TTrigger* pParent)
                 // commented out in the XMLexporter class.
                 readStringList(pT->mPatterns, what);
             } else if (name() == qsl("regexCodePropertyList")) {
+                // A save whose two lists disagree is reported and repaired by
+                // TTrigger::setRegexCodeList(), which every reader funnels through
                 readIntegerList(pT->mPatternKinds, pT->getName(), what);
-                if (Q_UNLIKELY(pT->mPatterns.count() != pT->mPatternKinds.count())) {
-                    qWarning().nospace() << "XMLimport::readTrigger(...) ERROR: "
-                                            "mismatch in regexCode details for Trigger: "
-                                         << pT->getName() << " there were " << pT->mPatterns.count() << " 'regexCodeList' sub-elements and " << pT->mPatternKinds.count()
-                                         << " 'regexCodePropertyList' sub-elements so "
-                                            "something is broken!";
-                }
                 // Fixup the first 16 incorrect ANSI colour numbers from old
                 // code if there are any
                 if (!pT->mPatterns.isEmpty()) {
@@ -1320,7 +1492,8 @@ int XMLimport::readTimerPackage()
         readNext();
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("TimerGroup") || name() == qsl("Timer")) {
                 gotTimer = true;
                 lastImportedTimerID = readTimer(mPackageName.isEmpty() ? nullptr : mpTimer);
@@ -1357,7 +1530,8 @@ int XMLimport::readTimer(TTimer* pParent)
         readNext();
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("name")) {
                 pT->setName(readElementText());
             } else if (name() == qsl("packageName")) {
@@ -1366,6 +1540,8 @@ int XMLimport::readTimer(TTimer* pParent)
                 const QString tempScript = readScriptElement();
                 if (!pT->setScript(tempScript)) {
                     qDebug().nospace() << "XMLimport::readTimer(...): ERROR: can not compile timer's lua code for: " << pT->getName();
+                    mItemsWithErrors.append(qsl("%1: %2").arg(pT->getName(), compileErrorAsPlainText(pT->getError())));
+                    mItemsWithErrorNames.append(pT->getName());
                 }
             } else if (name() == qsl("command")) {
                 pT->mCommand = readElementText();
@@ -1395,7 +1571,8 @@ int XMLimport::readAliasPackage()
         readNext();
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("AliasGroup") || name() == qsl("Alias")) {
                 gotAlias = true;
                 lastImportedAliasID = readAlias(mPackageName.isEmpty() ? nullptr : mpAlias);
@@ -1425,7 +1602,8 @@ int XMLimport::readAlias(TAlias* pParent)
 
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("name")) {
                 pT->setName(readElementText());
             } else if (name() == qsl("packageName")) {
@@ -1434,6 +1612,8 @@ int XMLimport::readAlias(TAlias* pParent)
                 const QString tempScript = readScriptElement();
                 if (!pT->setScript(tempScript)) {
                     qDebug().nospace() << "XMLimport::readAlias(...): ERROR: can not compile alias's lua code for: " << pT->getName();
+                    mItemsWithErrors.append(qsl("%1: %2").arg(pT->getName(), compileErrorAsPlainText(pT->getError())));
+                    mItemsWithErrorNames.append(pT->getName());
                 }
             } else if (name() == qsl("command")) {
                 pT->mCommand = readElementText();
@@ -1458,7 +1638,8 @@ int XMLimport::readActionPackage()
         readNext();
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("ActionGroup") || name() == qsl("Action")) {
                 gotAction = true;
                 lastImportedActionID = readAction(mPackageName.isEmpty() ? nullptr : mpAction);
@@ -1476,8 +1657,8 @@ int XMLimport::readAction(TAction* pParent)
     auto pT = new TAction(pParent, mpHost);
 
     pT->setIsFolder(attributes().value(qsl("isFolder")) == YES);
-    pT->mIsPushDownButton = attributes().value(qsl("isPushButton")) == YES;
-    pT->mButtonFlat = attributes().value(qsl("isFlatButton")) == YES;
+    pT->setIsPushDownButton(attributes().value(qsl("isPushButton")) == YES);
+    pT->setButtonFlat(attributes().value(qsl("isFlatButton")) == YES);
     pT->mUseCustomLayout = attributes().value(qsl("useCustomLayout")) == YES;
     mpHost->getActionUnit()->registerAction(pT);
     pT->setIsActive(attributes().value(qsl("isActive")) == YES);
@@ -1491,34 +1672,37 @@ int XMLimport::readAction(TAction* pParent)
         readNext();
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("name")) {
-                pT->mName = readElementText();
+                pT->setName(readElementText());
             } else if (name() == qsl("packageName")) {
                 pT->mPackageName = readElementText();
             } else if (name() == qsl("script")) {
                 const QString tempScript = readScriptElement();
                 if (!pT->setScript(tempScript)) {
                     qDebug().nospace() << "XMLimport::readAction(...): ERROR: can not compile action's lua code for: " << pT->getName();
+                    mItemsWithErrors.append(qsl("%1: %2").arg(pT->getName(), compileErrorAsPlainText(pT->getError())));
+                    mItemsWithErrorNames.append(pT->getName());
                 }
             } else if (name() == qsl("css")) {
                 pT->css = readElementText();
             } else if (name() == qsl("commandButtonUp")) {
-                pT->mCommandButtonUp = readElementText();
+                pT->setCommandButtonUp(readElementText());
             } else if (name() == qsl("commandButtonDown")) {
-                pT->mCommandButtonDown = readElementText();
+                pT->setCommandButtonDown(readElementText());
             } else if (name() == qsl("icon")) {
-                pT->mIcon = readElementText();
+                pT->setIcon(readElementText());
             } else if (name() == qsl("orientation")) {
                 pT->mOrientation = readElementText().toInt();
             } else if (name() == qsl("location")) {
                 pT->mLocation = readElementText().toInt();
             } else if (name() == qsl("buttonRotation")) {
-                pT->mButtonRotation = readElementText().toInt();
+                pT->setButtonRotation(readElementText().toInt());
             } else if (name() == qsl("sizeX")) {
-                pT->mSizeX = readElementText().toInt();
+                pT->setSizeX(readElementText().toInt());
             } else if (name() == qsl("sizeY")) {
-                pT->mSizeY = readElementText().toInt();
+                pT->setSizeY(readElementText().toInt());
             } else if (name() == qsl("mButtonState")) {
                 // We now use a boolean but file must use original "1" (false)
                 // or "2" (true) for backward compatibility
@@ -1527,7 +1711,10 @@ int XMLimport::readAction(TAction* pParent)
                 // Not longer present/used, skip over it if it is still in file:
                 skipCurrentElement();
             } else if (name() == qsl("buttonColumn")) {
-                pT->mButtonColumns = readElementText().toInt();
+                // The above ought to have been plural!
+                pT->setButtonColumns(readElementText().toInt());
+            } else if (name() == qsl("buttonFillerOffset")) {
+                pT->setButtonFillerOffset(readElementText().toInt());
             } else if (name() == qsl("posX")) {
                 pT->mPosX = readElementText().toInt();
             } else if (name() == qsl("posY")) {
@@ -1551,7 +1738,8 @@ int XMLimport::readScriptPackage()
         readNext();
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("ScriptGroup") || name() == qsl("Script")) {
                 gotScript = true;
                 lastImportedScriptID = readScript(mPackageName.isEmpty() ? nullptr : mpScript);
@@ -1581,7 +1769,8 @@ int XMLimport::readScript(TScript* pParent)
         readNext();
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("name")) {
                 script->mName = readElementText();
             } else if (name() == qsl("packageName")) {
@@ -1590,6 +1779,8 @@ int XMLimport::readScript(TScript* pParent)
                 const QString tempScript = readScriptElement();
                 if (!script->setScript(tempScript)) {
                     qDebug().nospace().noquote() << "XMLimport::readScript(...) ERROR - can not compile script's lua code for \"" << script->getName() << "\"; reason: " << script->getError() << ".";
+                    mItemsWithErrors.append(qsl("%1: %2").arg(script->getName(), compileErrorAsPlainText(script->getError())));
+                    mItemsWithErrorNames.append(script->getName());
                 }
             } else if (name() == qsl("eventHandlerList")) {
                 readStringList(script->mEventHandlerList, what);
@@ -1613,7 +1804,8 @@ int XMLimport::readKeyPackage()
         readNext();
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("KeyGroup") || name() == qsl("Key")) {
                 gotKey = true;
                 lastImportedKeyID = readKey(mPackageName.isEmpty() ? nullptr : mpKey);
@@ -1643,7 +1835,8 @@ int XMLimport::readKey(TKey* pParent)
 
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("name")) {
                 pT->setName(readElementText());
             } else if (name() == qsl("packageName")) {
@@ -1652,6 +1845,8 @@ int XMLimport::readKey(TKey* pParent)
                 const QString tempScript = readScriptElement();
                 if (!pT->setScript(tempScript)) {
                     qDebug().nospace() << "XMLimport::readKey(...): ERROR: can not compile key's lua code for: " << pT->getName();
+                    mItemsWithErrors.append(qsl("%1: %2").arg(pT->getName(), compileErrorAsPlainText(pT->getError())));
+                    mItemsWithErrorNames.append(pT->getName());
                 }
             } else if (name() == qsl("command")) {
                 pT->mCommand = readElementText();
@@ -1680,7 +1875,8 @@ void XMLimport::readModulesDetailsMap(QMap<QString, QStringList>& map)
 
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("key")) {
                 key = readElementText();
             } else if (name() == qsl("filepath")) {
@@ -1697,7 +1893,14 @@ void XMLimport::readModulesDetailsMap(QMap<QString, QStringList>& map)
                 // The last expected detail for the entry - so store this
                 // completed entry into the QMap
                 entry << readElementText();
-                map[key] = entry;
+                // Every reader of an entry indexes its file, sync flag and priority, so a hand-edited or
+                // truncated file that leaves one out would read past the end of it
+                if (entry.size() >= 3) {
+                    map[key] = entry;
+                } else {
+                    // Quoted so that QDebug escapes any control characters the file put in the name
+                    qWarning().nospace() << "XMLimport::readModulesDetailsMap() WARNING - ignoring the module " << key << " as its entry is missing some of its details.";
+                }
                 entry.clear();
             } else {
                 readUnknownElement(qsl("ModulesDetailsMap"));
@@ -1713,7 +1916,8 @@ void XMLimport::readStringList(QStringList& list, const QString& whatIsParent)
 
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("string")) {
                 list << readElementText();
             } else {
@@ -1730,7 +1934,8 @@ void XMLimport::readIntegerList(QList<int>& list, const QString& parentName, con
 
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("integer")) {
                 const QString numberText = readElementText();
                 bool ok = false;
@@ -1755,15 +1960,20 @@ void XMLimport::readIntegerList(QList<int>& list, const QString& parentName, con
                         list << num;
                         break;
                     default:
-                        mpHost->postMessage(qsl("[ ERROR ] - \"%1\" as a number when reading the 'regexCodePropertyList' element of the 'Trigger' or 'TriggerGroup' element \"%2\" cannot be understood by this version of Mudlet, is it from a later version? Converting it to a SUBSTRING type so the data can be shown but it will probably not work as expected.").arg(numberText, parentName));
+                        mpHost->postMessage(
+                                qsl("[ ERROR ] - \"%1\" as a number when reading the 'regexCodePropertyList' element of the 'Trigger' or 'TriggerGroup' element \"%2\" cannot be understood by this "
+                                    "version of Mudlet, is it from a later version? Converting it to a SUBSTRING type so the data can be shown but it will probably not work as expected.")
+                                        .arg(numberText, parentName));
                         list << REGEX_SUBSTRING; //Set it to the default type
                     }
 
                 } else {
-                    qWarning(R"(XMLimport::readIntegerList(...) ERROR: unable to convert: "%s" to a number when reading the 'regexCodePropertyList' element of the 'Trigger' or 'TriggerGroup' element "%s"!)",
-                           numberText.toUtf8().constData(),
-                           parentName.toUtf8().constData());
-                    mpHost->postMessage(qsl("[ ERROR ] - Unable to convert: \"%1\" to a number when reading the 'regexCodePropertyList' element of the 'Trigger' or 'TriggerGroup' element \"%2\"!").arg(numberText, parentName));
+                    qWarning(
+                            R"(XMLimport::readIntegerList(...) ERROR: unable to convert: "%s" to a number when reading the 'regexCodePropertyList' element of the 'Trigger' or 'TriggerGroup' element "%s"!)",
+                            numberText.toUtf8().constData(),
+                            parentName.toUtf8().constData());
+                    mpHost->postMessage(qsl("[ ERROR ] - Unable to convert: \"%1\" to a number when reading the 'regexCodePropertyList' element of the 'Trigger' or 'TriggerGroup' element \"%2\"!")
+                                                .arg(numberText, parentName));
                     list << REGEX_SUBSTRING; //Just assume most common one
                 }
             } else {
@@ -1787,9 +1997,9 @@ QString XMLimport::readScriptElement()
         qDebug() << "XMLimport::readScriptElement() ERROR:" << errorString();
     }
 
-    if (mVersionMajor > 1 || (mVersionMajor == 1 && mVersionMinor > 0)) {
-        // This is NOT the original version, so it will have control characters
-        // encoded up using Object Replacement and Control Symbol (for relevant ASCII control code) code-points
+    // From format 1.001, control characters are stored as U+FFFC then the matching Control Picture.
+    // Few scripts hold a U+FFFC, so one contains() spares most scripts the 29 replace() scans below:
+    if ((mVersionMajor > 1 || (mVersionMajor == 1 && mVersionMinor > 0)) && localScript.contains(QChar(0xFFFC))) {
         localScript.replace(qsl("\xFFFC\x2401"), QChar('\x01')); // SOH
         localScript.replace(qsl("\xFFFC\x2402"), QChar('\x02')); // STX
         localScript.replace(qsl("\xFFFC\x2403"), QChar('\x03')); // ETX
@@ -1825,18 +2035,18 @@ QString XMLimport::readScriptElement()
 }
 
 // Unlike the reverse operation in the XMLexport this can modify the supplied patternList:
-void XMLimport::remapColorsToAnsiNumber(QStringList & patternList, const QList<int> & typeList)
+void XMLimport::remapColorsToAnsiNumber(QStringList& patternList, const QList<int>& typeList)
 {
     // The regexp is slightly modified compared to the one we once used to allow
     // it to capture a '-' sign as part of the color numbers as we use -2 for
     // ignored which was/is/will not handled by code before Mudlet 3.17.x (and
     // we might have more  negative numbers in the future!)
-    QRegularExpression const regex = QRegularExpression(qsl("FG(-?\\d+)BG(-?\\d+)"));
+    const QRegularExpression regex = QRegularExpression(qsl("FG(-?\\d+)BG(-?\\d+)"));
     QMutableStringListIterator itPattern(patternList);
     QListIterator<int> itType(typeList);
     while (itPattern.hasNext() && itType.hasNext()) {
         if (itType.next() == REGEX_COLOR_PATTERN) {
-            QRegularExpressionMatch const match = regex.match(itPattern.next());
+            const QRegularExpressionMatch match = regex.match(itPattern.next());
             // Although we define two '('...')' capture groups the count/size is
             // 3 (0 is the whole string)!
             if (match.capturedTexts().size() == 3) {
@@ -1846,7 +2056,8 @@ void XMLimport::remapColorsToAnsiNumber(QStringList & patternList, const QList<i
                 int ansibg = TTrigger::scmIgnored;
                 int fg = match.captured(1).toInt(&isFgOk);
                 if (!isFgOk) {
-                    qDebug() << "XMLimport::remapColorsToAnsiNumber(...) ERROR - failed to extract FG color code from pattern text:" << itPattern.peekPrevious() << " setting colour to default foreground";
+                    qDebug() << "XMLimport::remapColorsToAnsiNumber(...) ERROR - failed to extract FG color code from pattern text:" << itPattern.peekPrevious()
+                             << " setting colour to default foreground";
                     fg = TTrigger::scmDefault;
                 } else {
                     // clang-format off
@@ -1877,7 +2088,8 @@ void XMLimport::remapColorsToAnsiNumber(QStringList & patternList, const QList<i
 
                 int bg = match.captured(2).toInt(&isBgOk);
                 if (!isBgOk) {
-                    qDebug() << "XMLimport::remapColorsToAnsiNumber(...) ERROR - failed to extract BG color code from pattern text:" << itPattern.peekPrevious() << " setting colour to default background";
+                    qDebug() << "XMLimport::remapColorsToAnsiNumber(...) ERROR - failed to extract BG color code from pattern text:" << itPattern.peekPrevious()
+                             << " setting colour to default background";
                     bg = TTrigger::scmDefault;
                 } else {
                     // clang-format off
@@ -1926,24 +2138,30 @@ void XMLimport::readStopWatchMap()
 
         if (isEndElement()) {
             break;
-        } else if (isStartElement()) {
+        }
+        if (isStartElement()) {
             if (name() == qsl("stopwatch")) {
                 const int watchId = attributes().value(qsl("id")).toInt();
-                auto pStopWatch = new stopWatch();
+                auto pStopWatch = std::make_unique<stopWatch>();
                 pStopWatch->setName(attributes().value(qsl("name")).toString());
                 pStopWatch->mIsPersistent = true;
                 pStopWatch->mIsInitialised = true;
+                // Clamp both stored times as the stopwatch's own operations do, so an edited or damaged
+                // profile cannot load a time that no longer fits:
                 if (attributes().value(qsl("running")) == YES) {
                     pStopWatch->mIsRunning = true;
                     // The stored value is the point in epoch time that the
                     // stopwatch appears to have been started so we need to
-                    // make that into a QDateTime that is the equivalent:
-                    pStopWatch->mEffectiveStartDateTime.setMSecsSinceEpoch(attributes().value(qsl("effectiveStartDateTimeEpochMSecs")).toLongLong());
+                    // make that into a QDateTime that is the equivalent.
+                    // Bounding the instant, not the elapsed time, keeps that subtraction from overflowing:
+                    const qint64 nowMSecs = QDateTime::currentMSecsSinceEpoch();
+                    pStopWatch->mEffectiveStartDateTime.setMSecsSinceEpoch(qBound(
+                            nowMSecs - stopWatch::csmMaximumMilliSeconds, attributes().value(qsl("effectiveStartDateTimeEpochMSecs")).toLongLong(), nowMSecs + stopWatch::csmMaximumMilliSeconds));
                 } else {
                     pStopWatch->mIsRunning = false;
-                    pStopWatch->mElapsedTime = attributes().value(qsl("elapsedDateTimeMSecs")).toLongLong();
+                    pStopWatch->mElapsedTime = stopWatch::clampToRange(attributes().value(qsl("elapsedDateTimeMSecs")).toLongLong());
                 }
-                mpHost->mStopWatchMap.insert(watchId, pStopWatch);
+                mpHost->mStopWatchMap[watchId] = std::move(pStopWatch);
                 // A dummy read as there should not be any text for this element:
                 readElementText();
             } else {
@@ -1951,7 +2169,22 @@ void XMLimport::readStopWatchMap()
             }
         }
     }
+}
 
+void XMLimport::readMMCPOptions()
+{
+    mpHost->mMMCPChatName = attributes().value(qsl("chatName")).toString();
+    mpHost->mMMCPChatPort = attributes().value(qsl("chatPort")).toUShort();
+    mpHost->mMMCPChatPrefix = attributes().value(qsl("chatPrefix")).toString();
+    mpHost->mMMCPAutostartServer = attributes().value(qsl("autostartServer")) == YES;
+    mpHost->mMMCPAllowPeekRequests = attributes().value(qsl("allowPeekRequests")) == YES;
+    mpHost->mMMCPPrefixEmotes = attributes().value(qsl("prefixEmotes")) == YES;
+    mpHost->mMMCPAddChatMessageNewline = attributes().value(qsl("chatMessageNewline")) == YES;
+    mpHost->mMMCPAutoAcceptCalls = attributes().value(qsl("autoAcceptCalls")) == YES;
+    mpHost->mMMCPShowSnoopInMainConsole = attributes().value(qsl("snoopInMain")) == YES;
+
+    // MMCP is a self-closing tag, need to call readNext to move along..
+    readNext();
 }
 
 void XMLimport::readMapInfoContributor()
@@ -1978,9 +2211,8 @@ void XMLimport::readProfileShortcut()
 {
     auto key = attributes().value(qsl("key"));
     auto sequenceString = readElementText();
-    if (mpHost->profileShortcuts.value(key.toString())) {
-        QKeySequence* sequence = !sequenceString.isEmpty() ? new QKeySequence(sequenceString) : new QKeySequence();
-        mpHost->profileShortcuts.value(key.toString())->swap(*sequence);
-        delete sequence;
+    if (auto it = mpHost->profileShortcuts.find(key.toString()); it != mpHost->profileShortcuts.end()) {
+        QKeySequence sequence = !sequenceString.isEmpty() ? QKeySequence(sequenceString) : QKeySequence();
+        it->second->swap(sequence);
     }
 }

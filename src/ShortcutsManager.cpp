@@ -20,21 +20,22 @@
 
 #include "ShortcutsManager.h"
 
+#include <QDebug>
+
+ShortcutsManager::ShortcutsManager(QObject* parent)
+: QObject(parent)
+{
+    if (smpSelf) {
+        qWarning() << "ShortcutsManager::ShortcutsManager() WARNING - a ShortcutsManager already exists, so self() keeps pointing at that one.";
+        return;
+    }
+    smpSelf = this;
+}
+
 ShortcutsManager::~ShortcutsManager()
 {
-    QMutableMapIterator<QString, QKeySequence*> itShortcut(shortcuts);
-    while (itShortcut.hasNext()) {
-        itShortcut.next();
-        auto pKeySequence = itShortcut.value();
-        delete pKeySequence;
-        itShortcut.remove();
-    }
-    QMutableMapIterator<QString, QKeySequence*> itDefault(defaults);
-    while (itDefault.hasNext()) {
-        itDefault.next();
-        auto pKeySequence = itDefault.value();
-        delete pKeySequence;
-        itDefault.remove();
+    if (smpSelf == this) {
+        smpSelf = nullptr;
     }
 }
 
@@ -43,14 +44,14 @@ void ShortcutsManager::registerShortcut(const QString& key, const QString& trans
     shortcutKeys << key;
     shortcuts.insert(key, sequence);
     translations.insert(key, translation);
-    defaults.insert(key, new QKeySequence(*sequence));
+    defaults[key] = std::make_unique<QKeySequence>(*sequence);
 }
 
 void ShortcutsManager::setShortcut(const QString& key, QKeySequence* sequence)
 {
-    QKeySequence* newSequence = new QKeySequence(*sequence);
-    shortcuts.value(key)->swap(*newSequence);
-    delete newSequence;
+    if (auto* existing = shortcuts.value(key)) {
+        *existing = *sequence;
+    }
 }
 
 QKeySequence* ShortcutsManager::getSequence(const QString& key)
@@ -60,7 +61,8 @@ QKeySequence* ShortcutsManager::getSequence(const QString& key)
 
 QKeySequence* ShortcutsManager::getDefault(const QString& key)
 {
-    return defaults.value(key);
+    auto it = defaults.find(key);
+    return (it != defaults.end()) ? it->second.get() : nullptr;
 }
 
 QString ShortcutsManager::getLabel(const QString& key)

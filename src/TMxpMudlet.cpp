@@ -20,13 +20,19 @@
 #include "TMxpMudlet.h"
 #include "Host.h"
 #include "TMedia.h"
-#include "TConsole.h"
+#include "TConsoleModel.h"
 #include "TLinkStore.h"
+#include "MudletApp.h"
+
+#include <QSet>
+#include <QStack>
+
+static const QString PLACEHOLDER_TEXT = QLatin1String("&text;");
 
 
 QString TMxpMudlet::getVersion()
 {
-    return mudlet::self()->scmVersion;
+    return MudletApp::scmVersion();
 }
 
 void TMxpMudlet::sendToServer(QString& str)
@@ -48,12 +54,15 @@ void TMxpMudlet::popColor()
 
 void TMxpMudlet::pushColor(QList<QColor>& stack, const QString& color)
 {
-    if (color.isEmpty()) {
+    // An unknown name gives an invalid QColor, which a TChar would store as opaque black, so
+    // repeat the color in force instead; still pushing keeps the stack in step with popColor().
+    const QColor newColor(color);
+    if (!newColor.isValid()) {
         if (!stack.isEmpty()) {
             stack.push_back(stack.last());
         }
     } else {
-        stack.push_back(QColor(color));
+        stack.push_back(newColor);
     }
 }
 void TMxpMudlet::popColor(QList<QColor>& stack)
@@ -66,6 +75,16 @@ void TMxpMudlet::popColor(QList<QColor>& stack)
 int TMxpMudlet::setLink(const QStringList& links, const QStringList& hints)
 {
     return getLinkStore().addLinks(links, hints, mpHost);
+}
+
+int TMxpMudlet::setLink(const QStringList& links, const QStringList& hints, const QString& expireName)
+{
+    return getLinkStore().addLinks(links, hints, mpHost, QVector<int>(), expireName);
+}
+
+void TMxpMudlet::expireLinks(const QString& expireName)
+{
+    getLinkStore().expireLinks(expireName, mpHost);
 }
 
 bool TMxpMudlet::getLink(int id, QStringList** links, QStringList** hints)
@@ -86,33 +105,71 @@ void TMxpMudlet::stopMedia(TMediaData& mediaData)
     mpHost->mpMedia->stopMedia(mediaData);
 }
 
-TMxpTagHandlerResult TMxpMudlet::tagHandled(MxpTag* tag, TMxpTagHandlerResult result)
+TMxpTagHandlerResult TMxpMudlet::tagHandled(MxpTag* tag, TMxpTagHandlerResult result, TMxpContext& context)
 {
     if (tag->isStartTag()) {
-        if (mpContext->getElementRegistry().containsElement(tag->getName())) {
-            enqueueMxpEvent(tag->asStartTag());
+        if (context.getElementRegistry().containsElement(tag->getName())) {
+            enqueueMxpEvent(tag->asStartTag(), context.getElementRegistry().getElement(tag->getName()));
         } else if (tag->isNamed("SEND")) {
-            enqueueMxpEvent(tag->asStartTag());
+            // send events are queued on closing tag so the caption is available
+            TMxpEvent event;
+            event.name = tag->getName();
+            auto* startTag = tag->asStartTag();
+            for (const auto& attrName : startTag->getAttributesNames()) {
+                event.attrs[attrName] = startTag->getAttributeValue(attrName);
+            }
+            event.linkId = getLinkStore().getCurrentLinkID();
+            event.caption.clear();
+            mPendingSendEvents.push(event);
         }
     }
 
     return result;
 }
 
-void TMxpMudlet::enqueueMxpEvent(MxpStartTag* tag)
+void TMxpMudlet::enqueueMxpEvent(MxpStartTag* tag, const TMxpElement& element)
 {
     TMxpEvent mxpEvent;
     mxpEvent.name = tag->getName();
     for (const auto& attrName : tag->getAttributesNames()) {
         mxpEvent.attrs[attrName] = tag->getAttributeValue(attrName);
     }
+    // Also resolve the element's declared (ATT) attribute names - like
+    // TMxpCustomElementTagHandler::parseFlagAttributes() does - so a
+    // positional token like <RMob "Urthguk"> is reachable under a stable,
+    // case-preserving key: mxp.rmob.name = "Urthguk" for ATT="Name"
+    for (int i = 0, total = element.attrs.size(); i < total; ++i) {
+        const QString& attrName = element.attrs.at(i);
+        if (tag->hasAttribute(attrName)) {
+            mxpEvent.attrs[attrName] = tag->getAttributeValue(attrName);
+        } else if (tag->getAttributesCount() > i) {
+            mxpEvent.attrs[attrName] = tag->getAttribute(i).getName();
+        } else if (element.defaultValues.contains(attrName)) {
+            mxpEvent.attrs[attrName] = element.defaultValues.value(attrName);
+        }
+    }
     mxpEvent.actions = getLinkStore().getCurrentLinks();
+    mxpEvent.caption.clear();
     mMxpEvents.enqueue(mxpEvent);
+}
+
+void TMxpMudlet::setCaptionForSendEvent(const QString& caption)
+{
+    if (!mPendingSendEvents.isEmpty()) {
+        TMxpEvent event = mPendingSendEvents.pop();
+        event.caption = caption;
+        // The handler has already quoted the wrapped text into these
+        event.actions = getLinkStore().getLinksConst(event.linkId);
+        for (auto it = event.attrs.begin(); it != event.attrs.end(); ++it) {
+            it.value().replace(PLACEHOLDER_TEXT, caption, Qt::CaseInsensitive);
+        }
+        mMxpEvents.enqueue(event);
+    }
 }
 
 TLinkStore& TMxpMudlet::getLinkStore()
 {
-    return mpHost->mpConsole->getLinkStore();
+    return mpHost->mainConsoleModel().buffer.mLinkStore;
 }
 
 // Handle 'stacks' of attribute settings:
@@ -171,4 +228,135 @@ void TMxpMudlet::resetTextProperties()
     while (!bgColors.isEmpty()) {
         bgColors.pop_back();
     }
+}
+
+bool TMxpMudlet::startTagReceived(MxpStartTag* startTag)
+{
+    // Get the current MXP mode from the processor
+    TMXPMode currentMode = mpHost->mMxpProcessor.mode();
+    const QString tagName = startTag->getName().toUpper();
+
+    // In LOCKED mode, no tags are allowed
+    if (currentMode == MXP_MODE_LOCKED) {
+        return false;
+    }
+
+    // Check if this tag is allowed in the current mode
+    if (!isTagAllowedInMode(tagName, currentMode)) {
+        return false;
+    }
+
+    return true;
+}
+
+bool TMxpMudlet::isTagAllowedInMode(const QString& tagName, TMXPMode mode) const
+{
+    // In SECURE or TEMP_SECURE mode, all tags are allowed
+    if (mode == MXP_MODE_SECURE || mode == MXP_MODE_TEMP_SECURE) {
+        return true;
+    }
+
+    // In LOCKED mode, no tags are allowed (handled in startTagReceived)
+    if (mode == MXP_MODE_LOCKED) {
+        return false;
+    }
+
+    // In OPEN mode, only specific formatting tags are allowed
+    // According to MXP spec: https://www.zuggsoft.com/zmud/mxp.htm
+    // OPEN tags are: B, I, U, S, C (color), H (high), FONT, NOBR, P, BR, SBR
+    // Plus their variations: BOLD, ITALIC, UNDERLINE, STRIKEOUT, EM, STRONG, HIGH
+    static const QSet<QString> openModeTags = {qsl("B"),
+                                               qsl("BOLD"),
+                                               qsl("STRONG"),
+                                               qsl("I"),
+                                               qsl("ITALIC"),
+                                               qsl("EM"),
+                                               qsl("U"),
+                                               qsl("UNDERLINE"),
+                                               qsl("S"),
+                                               qsl("STRIKEOUT"),
+                                               qsl("C"),
+                                               qsl("COLOR"),
+                                               qsl("H"),
+                                               qsl("HIGH"),
+                                               qsl("FONT"),
+                                               qsl("NOBR"),
+                                               qsl("P"),
+                                               qsl("BR"),
+                                               qsl("SBR")};
+
+    return openModeTags.contains(tagName);
+}
+
+QByteArray TMxpMudlet::getEncoding() const
+{
+    return mpHost->mTelnet.getEncoding();
+}
+
+int TMxpMudlet::getWrapWidth() const
+{
+    // Return the host's configured wrap width, with a sensible minimum
+    return qMax(mpHost->mWrapAt, 40);
+}
+
+void TMxpMudlet::insertText(const QString& text)
+{
+    // Insert text by feeding it back through the MXP processing pipeline
+    // This ensures it respects the current line buffer state
+    if (mpHost) {
+        std::string textToInsert = text.toStdString();
+        mpHost->mainConsoleModel().buffer.translateToPlainText(textToInsert, false);
+    }
+}
+
+bool TMxpMudlet::shouldLockModeToSecure() const
+{
+    return mpHost && mpHost->getForceMXPProcessorOn();
+}
+
+bool TMxpMudlet::createMxpFrame(const QString& name, const QMap<QString, QString>& attributes)
+{
+    if (!mpHost) {
+        return false;
+    }
+
+    return mpHost->mMxpFrameManager.createFrame(name, attributes);
+}
+
+bool TMxpMudlet::closeMxpFrame(const QString& name)
+{
+    if (!mpHost) {
+        return false;
+    }
+
+    return mpHost->mMxpFrameManager.closeFrame(name);
+}
+
+bool TMxpMudlet::setMxpDestination(const QString& frameName, bool eol, bool eof)
+{
+    if (!mpHost) {
+        return false;
+    }
+
+    mpHost->mMxpFrameManager.setDestination(frameName, eol, eof);
+    return true;
+}
+
+void TMxpMudlet::clearMxpDestination()
+{
+    if (mpHost) {
+        mpHost->mainConsoleModel().buffer.flushPendingDestinationContent();
+        // Reset text formatting to prevent color bleeding from frame content to main console
+        mpHost->mainConsoleModel().buffer.resetCurrentTextFormat();
+        mpHost->mMxpFrameManager.clearDestination();
+    }
+}
+
+QString TMxpMudlet::getMxpCurrentDestination() const
+{
+    if (!mpHost) {
+        return QString();
+    }
+
+    return mpHost->mMxpFrameManager.getCurrentDestination();
 }

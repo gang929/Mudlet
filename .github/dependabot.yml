@@ -5,6 +5,11 @@ updates:
     schedule:
       interval: "weekly"
       day: "friday"
+    ignore:
+      # v3's Pipeline Connector rejects our requests with "User has no access to the requested GitHub resource"
+      # https://github.com/signpath/github-action-submit-signing-request/issues/18
+      - dependency-name: "signpath/github-action-submit-signing-request"
+        versions: [">= 3"]
     commit-message:
       prefix: "Infrastructure:"
   - package-ecosystem: "gitsubmodule"
@@ -13,7 +18,8 @@ updates:
       interval: "weekly"
       day: "friday"
     ignore:
-      # ignore vcpkg as it is updated often, and this goes off commits, not releases
-      - dependency-name: "3rdparty/vcpkg"
+      # ignore lcf as we track a specific branch (5.1-syntax_5.1), not master
+      # the update-3rdparty.yml workflow handles this correctly
+      - dependency-name: "3rdparty/lcf"
     commit-message:
       prefix: "Infrastructure:"

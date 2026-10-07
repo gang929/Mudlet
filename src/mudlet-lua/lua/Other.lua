@@ -5,6 +5,7 @@
 mudlet = mudlet or {}
 mudlet.supports = {
   coroutines = true,
+  mmcp = true,
   namedPatterns = true,
   osVersion = true
 }
@@ -100,8 +101,9 @@ SavedVariables = {}
 
 
 --- Sends a list of commands to the MUD. You can use this to send some things at once instead of having
---- to use multiple send() commands one after another.
+--- to use multiple send() commands one after another.  Optionally you can delay the sends using a number.
 ---
+--- @param seconds [optional] number of seconds to delay the sending of commands
 --- @param ... list of commands
 --- @param echoTheValue optional boolean flag (default value is true) which determine if value should
 ---   be echoed back on client.
@@ -116,6 +118,10 @@ SavedVariables = {}
 ---   send ("wield shield")
 ---   send ("say ha!")
 ---   </pre>
+---   with a time delay of 2 seconds between each command:
+---   <pre>
+---   sendAll(2, "stand", "wield shield", "say ha!")
+---   </pre>
 --- @usage Use sendAll and do not echo sent command on the main window.
 ---   <pre>
 ---   sendAll("stand", "wield shield", "say ha!", false)
@@ -123,44 +129,63 @@ SavedVariables = {}
 ---
 --- @see send
 function sendAll(...)
+  local time = 0
   local args = { ... }
   local echo = true
+
   if type(args[#args]) == 'boolean' then
     echo = table.remove(args, #args)
   end
-  for i, v in ipairs(args) do
-    if type(v) == 'string' then
-      send(v, echo)
+  if type(args[1]) == 'number' then
+    time = table.remove(args, 1)
+    for i, v in ipairs(args) do
+      if type(v) == 'string' then
+        tempTimer(time*i, function() send(v, echo) end, false)
+      end
     end
+    return
+  end
+  for i, v in ipairs(args) do
+    send(v, echo)
   end
 end
 
 
 --- Table of functions used by permGroup to create the appropriate group, based on itemtype.
+--- Each perm* binding raises a Lua error on failure (for example a missing parent)
+--- rather than returning -1, so permGroup pcalls these and turns a raised error
+--- into a false return.
 local group_creation_functions = {
   timer = function(name, parent)
-    return not (permTimer(name, parent, 0, "") == -1)
+    return permTimer(name, parent, 0, "")
   end,
   trigger = function(name, parent)
-    return not (permSubstringTrigger(name, parent, {}, "") == -1)
+    return permSubstringTrigger(name, parent, {}, "")
   end,
   alias = function(name, parent)
-    return not (permAlias(name, parent, "", "") == -1)
+    return permAlias(name, parent, "", "")
   end,
   key = function(name, parent)
-    return not (permKey(name, parent, -1, "") == -1)
+    return permKey(name, parent, -1, "")
   end,
   script = function(name, parent)
-    return not (permScript(name, parent, "", "") == -1)
+    return permScript(name, parent, "", "")
   end
 }
 
 --- Creates a group of a given type that will persist through sessions.
 ---
+--- Trigger, alias and key groups are created enabled. Timer and script groups
+--- are created disabled, as every permTimer() and permScript() is - enable them
+--- with enableTimer()/enableScript() once their contents are in place.
+---
 --- @param name name of the item
---- @param itemtype type of the item - can be trigger, alias, or timer
+--- @param itemtype type of the item - can be trigger, alias, timer, key, or script
 --- @param parent optional name of existing item which the new item
 ---   will be created as a child of
+---
+--- @return true on success, or false plus an error message if the item could
+---   not be created (for example when the named parent does not exist)
 ---
 --- @usage
 --- <pre>
@@ -178,18 +203,31 @@ function permGroup(name, itemtype, parent)
   assert(type(name) == "string", "permGroup: need a name for the new thing")
   parent = parent or ""
   assert(group_creation_functions[itemtype], "permGroup: " .. tostring(itemtype) .. " isn't a valid type")
-  return group_creation_functions[itemtype](name, parent)
+  local ok, err = pcall(group_creation_functions[itemtype], name, parent)
+  if not ok then
+    return false, err
+  end
+  return true
 end
 
 --- Appends code to an existing script
 ---
 --- @param name name of the script item
---- @param luaCode
+--- @param luaCode code to add on a line of its own after what is already there
+--- @param pos which script of that name to append to, defaults to the first
+---
+--- @return the id of the script, or raises an error if no script of that name
+---   is at that position
 function appendScript(name, luaCode, pos)
   pos = pos or 1
   assert(type(name) == "string", "appendScript: bad argument #1 type (script name as string expected, got "..type(name).."!)")
   assert(type(luaCode) == "string", "appendScript: bad argument #2 type (lua code as string expected, got "..type(luaCode).."!)")
-  return setScript(name, getScript(name, pos).."\n"..luaCode, pos)
+  assert(type(pos) == "number", "appendScript: bad argument #3 type (script position as number expected, got "..type(pos).."!)")
+  local existingCode, message = getScript(name, pos)
+  if existingCode == -1 then
+    error("appendScript: cannot append to script ("..message..")", 0)
+  end
+  return setScript(name, existingCode.."\n"..luaCode, pos)
 end
 
 --- Checks to see if a given file or folder exists. If it exists, it'll return the Lua true boolean value, otherwise false.
@@ -255,8 +293,11 @@ end
 ---
 --- @see remember
 function loadVars()
+  local _sep = ""
   if string.char(getMudletHomeDir():byte()) == "/" then
-    _sep = "/" else _sep = "\\"
+    _sep = "/"
+  else
+    _sep = "\\"
   end
   local l_SettingsFile = getMudletHomeDir() .. _sep .. "SavedVariables.lua"
   local lt_VariableHolder = {}
@@ -274,8 +315,11 @@ end
 ---
 --- @see loadVars
 function saveVars()
+  local _sep = ""
   if string.char(getMudletHomeDir():byte()) == "/" then
-    _sep = "/" else _sep = "\\"
+    _sep = "/"
+  else
+    _sep = "\\"
   end
   local l_SettingsFile = getMudletHomeDir() .. _sep .. "SavedVariables.lua"
   for k, _ in pairs(_saveTable) do
@@ -334,7 +378,8 @@ function table.pickle( t, file, tables, lookup )
       if type( i ) == "table" then
         if not lookup[i] then
           table.insert( tables, i )
-          lookup[i] = table.maxn( tables )
+          -- not table.maxn(), which walks every entry: once per table saved, that is quadratic
+          lookup[i] = #tables
         end
         file:write( "[{" .. lookup[i] .. "}] = " )
       else
@@ -345,7 +390,7 @@ function table.pickle( t, file, tables, lookup )
       if type( v ) == "table" then
         if not lookup[v] then
           table.insert( tables, v )
-          lookup[v] = table.maxn( tables )
+          lookup[v] = #tables
         end
         file:write( "{" .. lookup[v] .. "}," )
       else
@@ -479,7 +524,7 @@ end
 
 --- <b><u>TODO</u></b> speedwalk(dirString, backwards, delay, optional show)
 function speedwalk(dirString, backwards, delay, show)
-  local dirString = dirString:lower()
+  dirString = dirString:lower()
   local walkdelay = delay
   if show ~= false then show = true end
   speedwalkShow = show
@@ -544,9 +589,9 @@ function _comp(a, b)
     local a_size = 0
     for k, v in pairs(a) do
       a_size = a_size + 1
-      if not b[k] then
-        return false
-      end
+      -- A key missing from b is already caught by the _comp call below, whose
+      -- first check is a type comparison and so fails against nil. Testing
+      -- `not b[k]` here as well rejected a legitimate `false` value.
       if not _comp(v, b[k]) then
         return false
       end
@@ -562,6 +607,10 @@ function _comp(a, b)
   return true
 end
 
+--- exposes _comp as compare as it's a global, has been for years, and is also
+--- extremely useful. But documenting it as _comp is inconsistent with the rest
+--- of the API
+compare = _comp
 
 
 --- <b><u>TODO</u></b> phpTable(...) - abuse to: http://richard.warburton.it
@@ -577,8 +626,14 @@ function phpTable(...)
   end
   setmetatable(newTable, {
     __newindex = function(self, key, value)
-      if not self[key] then
-        table.insert(keys, key)
+      -- Only a nil read means the key is absent: `not self[key]` also matched a
+      -- stored false, which appended a second copy of the key to the order list
+      -- and left it undeletable. Assigning nil to an absent key must not
+      -- register one either.
+      if self[key] == nil then
+        if value ~= nil then
+          table.insert(keys, key)
+        end
       elseif value == nil then
         -- Handle item delete
         local count = 1
@@ -607,7 +662,8 @@ end
 
 --- <b><u>TODO</u></b> getColorWildcard(color)
 function getColorWildcard(color)
-  local color, results, startc, endc = tonumber(color), {}, nil, nil
+  color = tonumber(color)
+  local results, startc, endc = {}, nil, nil
 
   for i = 0, string.len(line) do
     selectSection(i, 1)
@@ -687,9 +743,17 @@ if not _TEST then
   end
 end
 
+-- One function shared by every deleteFull() call: a string script would be
+-- compiled into a new Lua chunk each time a line is gagged.
+local function deletePromptLine()
+  if isPrompt() then
+    deleteLine()
+  end
+end
+
 function deleteFull()
   deleteLine()
-  tempLineTrigger(1, 1, [[if isPrompt() then deleteLine() end]])
+  tempLineTrigger(1, 1, deletePromptLine)
 end
 
 function deleteMultiline(maxLines)
@@ -708,22 +772,6 @@ function deleteMultiline(maxLines)
     moveCursorUp()
   end
   return true
-end
-
-function shms(seconds, bool)
-  local seconds = tonumber(seconds)
-  assert(type(seconds) == "number", "Assertion failed for function 'shms' - Please supply a valid number.")
-
-  local s = seconds
-  local ss = string.format("%02d", math.fmod(s, 60))
-  local mm = string.format("%02d", math.fmod((s / 60 ), 60))
-  local hh = string.format("%02d", (s / (60 * 60)))
-
-  if bool then
-    cecho("<green>" .. s .. " <grey>seconds converts to: <green>" .. hh .. "<white>h,<green> " .. mm .. "<white>m <grey>and<green> " .. ss .. "<white>s.")
-  else
-    return hh, mm, ss
-  end
 end
 
 -- returns true if your Mudlet is older than the given version
@@ -942,10 +990,13 @@ function timeframe(vname, true_time, nil_time, ...)
   -- aggregate timerlist data
   local timerlist = {
     {0, nil},
-    type(true_time) == "number" and {true_time, true} or type(true_time) == "table" and true_time,
-    type(nil_time) == "number" and {nil_time, nil} or type(nil_time) == "table" and nil_time,
+    (type(true_time) == "number" and {true_time, true}) or (type(true_time) == "table" and true_time),
     ...
   }
+  table.insert(
+    timerlist,
+    (type(nil_time) == "number" and {nil_time, nil}) or (type(nil_time) == "table" and nil_time) or nil
+  )
 
   -- reinitialise timeframe for vname
   killtimeframe(vname)
@@ -1052,6 +1103,7 @@ function loadTranslations(packageName, fileName, languageCode, folder)
   folder = folder or io.exists("../translations/lua") and "../translations/lua/"
   folder = folder or io.exists("../../translations/lua") and "../../translations/lua/"
   folder = folder or io.exists(luaGlobalPath.."/../../translations/lua") and luaGlobalPath.."/../../translations/lua/"
+  folder = folder or io.exists(luaGlobalPath.."/../../../translations/lua") and luaGlobalPath.."/../../../translations/lua/"
   folder = folder or luaGlobalPath.."/translations/"
 
   assert(type(packageName) == "string", string.format("loadTranslations: bad argument #1 type (packageName as string expected, got %s)", type(packageName)))
@@ -1088,11 +1140,21 @@ end
 local acceptableSuffix = {"xml", "mpackage", "zip", "trigger"}
 
 function verbosePackageInstall(fileName)
-  local ok, err = installPackage(fileName)
-  local packageName = string.gsub(fileName, getMudletHomeDir() .. "/", "")
+  local ok, reason = installPackage(fileName)
+  -- this has to stay a literal prefix strip: as a Lua pattern the profile path's
+  -- magic characters bite, and a "-" (as in "Mudlet self-test") stops it
+  -- matching at all
+  local profileFolder = getMudletHomeDir() .. "/"
+  local packageName = fileName:starts(profileFolder) and fileName:sub(#profileFolder + 1) or fileName
   -- That is all for installing, now to announce the result to the user:
   mudlet.Locale = mudlet.Locale or loadTranslations("Mudlet")
-  if ok then
+  if ok and reason and reason ~= "" then
+    -- installed, but with problems already reported on the console
+    local partialText = mudlet.Locale.packageInstallPartial.message
+    partialText = string.format(partialText, packageName)
+    local warnPrefix = mudlet.Locale.prefixWarn.message
+    decho('<0,150,190>' .. warnPrefix .. '<190,150,0>' .. partialText .. '\n')
+  elseif ok then
     local successText = mudlet.Locale.packageInstallSuccess.message
     successText = string.format(successText, packageName)
     local okPrefix = mudlet.Locale.prefixOk.message
@@ -1100,7 +1162,7 @@ function verbosePackageInstall(fileName)
     -- Light Green and Orange-ish; see cTelnet::postMessage for color comparison
   else
     local failureText = mudlet.Locale.packageInstallFail.message
-    failureText = string.format(failureText, packageName, err)
+    failureText = string.format(failureText, packageName, reason)
     local warnPrefix = mudlet.Locale.prefixWarn.message
     decho('<0,150,190>' .. warnPrefix .. '<190,150,0>' .. failureText .. '\n')
     -- Cyan and Orange; see cTelnet::postMessage for color comparison
@@ -1108,11 +1170,16 @@ function verbosePackageInstall(fileName)
 end
 
 function verboseModuleInstall(fileName)
-  local ok, err = installModule(fileName)
+  local ok, reason = installModule(fileName)
   local moduleName = fileName
   -- That is all for installing, now to announce the result to the user:
   mudlet.Locale = mudlet.Locale or loadTranslations("Mudlet")
-  if ok then
+  if ok and reason and reason ~= "" then
+    local partialText = mudlet.Locale.moduleInstallPartial.message
+    partialText = string.format(partialText, moduleName)
+    local warnPrefix = mudlet.Locale.prefixWarn.message
+    decho('<0,150,190>' .. warnPrefix .. '<190,150,0>' .. partialText .. '\n')
+  elseif ok then
     local successText = mudlet.Locale.moduleInstallSuccess.message
     successText = string.format(successText, moduleName)
     local okPrefix = mudlet.Locale.prefixOk.message
@@ -1120,7 +1187,7 @@ function verboseModuleInstall(fileName)
     -- Light Green and Orange-ish; see cTelnet::postMessage for color comparison
   else
     local failureText = mudlet.Locale.moduleInstallFail.message
-    failureText = string.format(failureText, moduleName, err)
+    failureText = string.format(failureText, moduleName, reason)
     local warnPrefix = mudlet.Locale.prefixWarn.message
     decho('<0,150,190>' .. warnPrefix .. '<190,150,0>' .. failureText .. '\n')
     -- Cyan and Orange; see cTelnet::postMessage for color comparison
@@ -1226,35 +1293,67 @@ function getConfig(...)
   local result = {}
 
   if #args == 0 then
+    -- Please sort this list alphabetically (case insensitive) as it helps to follow changes:
+    -- This list contains all configuration options that are available in both getConfig and setConfig
+    -- NOTE: Some options like "showMapInfo", "hideMapInfo" are setConfig-only write operations
+    -- Some options like "logDirectory", "specialForceMXPProcessorOn" are getConfig-only read operations  
     local list = {
-      "mapRoomSize", 
-      "mapExitSize", 
-      "mapRoundRooms", 
-      "showRoomIdsOnMap", 
-      "show3dMapView", 
-      "mapperPanelVisible", 
-      "mapShowRoomBorders", 
-      "enableGMCP", 
-      "enableMSDP", 
-      "enableMSSP", 
-      "enableMSP", 
-      "enableMTTS",
-      "enableMNES",
+      "advertiseScreenReader",
+      "ambiguousEAsianWidthCharacters",
+      "announceIncomingText",
       "askTlsAvailable", 
-      "inputLineStrictUnixEndings", 
-      "autoClearInputLine", 
-      "showSentText", 
-      "fixUnnecessaryLinebreaks", 
-      "specialForceCompressionOff", 
-      "specialForceGAOff", 
-      "specialForceCharsetNegotiationOff", 
-      "specialForceMxpNegotiationOff", 
-      "forceNewEnvironNegotiationOff", 
-      "compactInputLine", 
-      "announceIncomingText", 
-      "blankLinesBehaviour", 
-      "caretShortcut", 
-      "commandLineHistorySaveSize", 
+      "autoClearInputLine",
+      "blankLinesBehaviour",
+      "caretShortcut",
+      "commandLineHistorySaveSize",
+      "compactInputLine",
+      "controlCharacterHandling",
+      "editorAutoComplete",
+      "enableBlinkText",
+      "enableClosedCaption",
+      "enableGMCP",
+      "enableMNES",
+      "enableMSDP", 
+      "enableMSP",
+      "enableMSSP",
+      "enableMTTS",
+      "enableMXP",
+      "enableNAWS",
+      "f3SearchEnabled",
+      "fixUnnecessaryLinebreaks",
+      "forceNewEnvironNegotiationOff",
+      "inputLineStrictUnixEndings",
+      "lazyCaptureGlobals",
+      "logDirectory",                    -- read-only in getConfig
+      "logInHTML",
+      "mapExitSize",
+      "mapInfoColor",
+      "mapperButton",
+      "mapperPanelVisible",
+      "mapRoomSize",
+      "mapRoundRooms",
+      "mapShowGrid",
+      "mapShowRoomBorders",
+      "mapSymbolFont",
+      "mapSymbolFontOnlyUseSelected",
+      "mapSymbolFontScaling",
+      "muteMediaAPI",
+      "muteMediaGame",
+      "promptForMXPProcessorOn",
+      "promptForVersionInTTYPE",
+      "show3dMapView",
+      "showRoomIdsOnMap", 
+      "showSentText",
+      "showTabConnectionIndicators",
+      "showUpperLowerLevels",
+      "specialForceCharsetNegotiationOff",
+      "specialForceCompressionOff",
+      "specialForceGAOff",
+      "specialForceMxpNegotiationOff",
+      "specialForceMXPProcessorOn",      -- read-only in getConfig
+      "undoServerWrap",
+      "undoServerWrapWidth",
+      "versionInTTYPE",
     }
     for _,v in ipairs(list) do
       result[v] = oldgetConfig(v)
@@ -1269,5 +1368,10 @@ function getConfig(...)
     return result
   end
 
-  return oldgetConfig(args[1])
+  -- Pass all arguments to the C++ function to support enhanced API
+  return oldgetConfig(unpack(args))
+end
+
+function openMudletHomeDir()
+  openUrl("file:" .. getMudletHomeDir())
 end

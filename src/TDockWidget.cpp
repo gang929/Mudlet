@@ -1,6 +1,6 @@
 /***************************************************************************
  *   Copyright (C) 2017 by Fae - itsthefae@gmail.com                       *
- *   Copyright (C) 2019-2020, 2022-2023 by Stephen Lyons                   *
+ *   Copyright (C) 2019-2020, 2022-2023, 2026 by Stephen Lyons             *
  *                                               - slysven@virginmedia.com *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
@@ -21,11 +21,16 @@
 
 #include "TDockWidget.h"
 
+#include "Host.h"
+#include "mudlet.h"
+#include "TConsole.h"
+
 TDockWidget::TDockWidget(Host* pH, const QString& consoleName)
 : QDockWidget()
 , mWidgetConsoleName(consoleName)
 , mpHost(pH)
 {
+    setFeatures(QDockWidget::DockWidgetClosable | QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
 }
 
 // This sets the mutual pointers that the TConsole and the TDockWidget now
@@ -40,44 +45,46 @@ void TDockWidget::setTConsole(TConsole* pC)
 
 void TDockWidget::closeEvent(QCloseEvent* event)
 {
-    if (!mpHost->isClosingDown()) {
+    if (mpHost && !mpHost->isClosingDown()) {
         mpHost->hideWindow(mWidgetConsoleName);
         event->ignore();
         return;
-    } else {
-        event->accept();
-        return;
     }
+    event->accept();
 }
 
 void TDockWidget::resizeEvent(QResizeEvent* event)
 {
     Q_UNUSED(event)
+    if (!mpHost) {
+        return;
+    }
     mpHost->setDockLayoutUpdated(mWidgetConsoleName);
 }
 
 void TDockWidget::moveEvent(QMoveEvent* event)
 {
     Q_UNUSED(event)
+    if (!mpHost) {
+        return;
+    }
     mpHost->setDockLayoutUpdated(mWidgetConsoleName);
 }
 
 void TDockWidget::setVisible(bool visible)
 {
-    if (!mpHost || !mpHost->mpConsole) {
+    auto pC = (mpHost && mpHost->mpConsole) ? mpHost->mpConsole->subConsoleWidget(mWidgetConsoleName) : nullptr;
+    if (!pC) {
         // During shutdown / profile closure TDockWidgets will get a hide event
         // as part of the underlying Qt class's built in handling of a close
         // event as the base class QDockWidget::setVisible(bool) method is being
         // overridden - at this point it seems there is not a Main Console left
-        // to be used to look some stuff up in - so in that case - just hide
-        // this widget and bail out:
+        // to be used to look some stuff up in. deleteMiniConsole() likewise lets
+        // go of the console before it takes the dock down. So in either case
+        // just hide this widget and bail out:
         if (!visible) {
             QWidget::setVisible(false);
         }
-        return;
-    }
-    auto pC = mpHost->mpConsole->mSubConsoleMap.value(mWidgetConsoleName);
-    if (!pC) {
         return;
     }
     //do not change the ->show() order! Otherwise, it will automatically minimize the floating/dock window(!!)
@@ -88,4 +95,12 @@ void TDockWidget::setVisible(bool visible)
     } else {
         QWidget::setVisible(false);
     }
+}
+
+/* We need to have this method defined in this file as the TConsole class is
+ * forward declared in the header file and it is problematic to define any
+ * dereferencing of it there:*/
+TConsole* TDockWidget::getConsole()
+{
+    return mpConsole;
 }

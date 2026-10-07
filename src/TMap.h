@@ -25,27 +25,20 @@
 
 
 #include "TAstar.h"
-#if defined(INCLUDE_3DMAPPER)
-#include "glwidget.h"
-#endif
 #include "utils.h"
 
-#include "pre_guard.h"
-#include <QApplication>
 #include <QColor>
+#include <QElapsedTimer>
 #include <QFont>
-#include <QJsonArray>
-#include <QJsonDocument>
 #include <QJsonObject>
 #include <QMap>
 #include <QNetworkReply>
-#include <QPixmap>
 #include <QPointer>
-#include <QSizeF>
+#include <QSet>
 #include <QVector3D>
 #include <stdlib.h>
+#include <memory>
 #include <optional>
-#include "post_guard.h"
 
 #define DIR_NORTH 1
 #define DIR_NORTHEAST 2
@@ -64,20 +57,61 @@
 class dlgMapper;
 class Host;
 #if defined(INCLUDE_3DMAPPER)
-class GLWidget;
+class QOpenGLWidget;
 #endif
 class TArea;
+class TMapViewManager;
 class TRoom;
 class TRoomDB;
 class QFile;
 class QNetworkAccessManager;
-class QProgressDialog;
 class MapInfoContributorManager;
 
 class TMap : public QObject
 {
     Q_OBJECT
 
+public:
+    // Host settings the 2D map keeps a copy of to draw with
+    enum class MapperSetting { RoomSize, ExitSize, RoundRooms, ShowRoomIds, ShowGrid };
+
+signals:
+    void signal_saveErrorChanged(bool hasError);
+    void signal_areaChanged(int areaId);
+    void signal_mmpMapLocationChanged();
+    void signal_mapSymbolFontChanged();
+
+    // Cues for the mapper drawing this map (mpMapper); the symbol cache one
+    // also reaches every secondary map view. With no mapper nothing listens.
+    void signal_mapperColoursChanged();
+    void signal_mapCleared();
+    void signal_mapLabelsChanged();
+    void signal_mapLoaded(bool showPlayerArea);
+    void signal_mapperShowRequested();
+    void signal_mapDownloadEnded();
+    void signal_symbolCachesStale();
+    void signal_playerRoomStyleChanged();
+    void signal_areaListChanged();
+    void signal_areaRenamed(const QString& oldName, const QString& newName);
+    void signal_playerAreaShowRequested();
+    void signal_defaultAreaVisibilitySet(bool wasShown);
+    void signal_mapInfoContributorsChanged();
+    void signal_mapRepaintRequested();
+    void signal_mapperSettingChanged(TMap::MapperSetting setting);
+
+    // Map-progress seam for the libmudlet split (#8681, #9011): the map engine
+    // must stay free of Qt Widgets, so it emits these pre-translated payloads for
+    // the frontend (TMainConsole) to render as a QProgressDialog. Cancellation
+    // returns through slot_mapProgressDialogCancelled().
+    void signal_mapTransferProgressStart(const QString& title, const QString& label, const QString& cancelButtonText);
+    void signal_mapJsonProgressStart(const QString& title, const QString& label, const QString& cancelButtonText, int maximum);
+    void signal_mapProgressSetLabel(const QString& text);
+    void signal_mapProgressSetRange(int minimum, int maximum);
+    void signal_mapProgressSetValue(int value);
+    void signal_mapProgressDisableCancel();
+    void signal_mapProgressClose();
+
+private:
     QString mDefaultAreaName;
     QString mUnnamedAreaName;
 
@@ -86,16 +120,8 @@ public:
     TMap(Host*, const QString&);
     ~TMap();
     void mapClear();
-    int createMapImageLabel(int area,
-                            QString filePath,
-                            float x,
-                            float y,
-                            float z,
-                            float width,
-                            float height,
-                            float zoom,
-                            bool showOnTop,
-                            bool temporary);
+    void refreshMapperColours();
+    int createMapImageLabel(int area, QString filePath, float x, float y, float z, float width, float height, float zoom, bool showOnTop, bool temporary);
     int createMapLabel(int area,
                        const QString& text,
                        float x,
@@ -108,18 +134,31 @@ public:
                        bool temporary = false,
                        qreal zoom = 30.0,
                        int fontSize = 50,
-                       std::optional<QString> fontName = std::nullopt);
+                       std::optional<QString> fontName = std::nullopt,
+                       QColor outline = Qt::black);
     void deleteMapLabel(int area, int labelID);
     bool addRoom(int id = 0);
-    bool setRoomArea(int id, int area, bool isToDeferAreaRelatedRecalculations = false);
+    bool setRoomArea(int id, int area);
     void deleteArea(int id);
     int createNewRoomID(int minimumId = 1);
-    void logError(QString& msg);
+    void logError(const QString&);
     bool setExit(int from, int to, int dir);
     bool setRoomCoordinates(int id, int x, int y, int z);
-    void update();
+    void updateArea(int areaId);
+    // For a whole map read in outside TMap, as XMLimport does:
+    void announceMapLoaded(bool showPlayerArea);
+    void requestMapperShown();
+    // For changes the Lua API makes to the map or to the mapper's settings:
+    void announceAreaListChanged();
+    void announceAreaRenamed(const QString& oldName, const QString& newName);
+    void requestPlayerAreaShown();
+    void announceDefaultAreaVisibilitySet(bool wasShown);
+    void announceMapInfoContributorsChanged();
+    void requestMapRepaint();
+    void announceMapperSettingChanged(MapperSetting setting);
 
     void audit();
+    inline static bool smShowMapAuditErrors = false;
 
     QList<int> detectRoomCollisions(int id);
     void setRoom(int);
@@ -127,16 +166,14 @@ public:
     bool gotoRoom(int);
     bool gotoRoom(int, int);
     bool serialize(QDataStream&, int saveVersion = 0);
-    bool restore(QString location, bool downloadIfNotFound = true);
+    static bool listLengthFits(QDataStream&, qint64 minBytesPerElement);
+    bool restore(QString location);
     bool retrieveMapFileStats(QString, QString*, int*, int*, qsizetype*, qsizetype*);
     void initGraph();
     QString connectExitStubByDirection(const int fromRoomId, const int dirType);
     QString connectExitStubByToId(const int fromRoomId, const int toRoomId);
     QString connectExitStubByDirectionAndToId(const int fromRoomId, const int dirType, const int toRoomId);
     void postMessage(QString text);
-
-    // Used by the 2D mapper to send view center coordinates to 3D one
-    void set3DViewCenter(int, int, int, int);
 
     void appendRoomErrorMsg(int, QString, bool isToSetFileViewingRecommended = false);
     void appendAreaErrorMsg(int, QString, bool isToSetFileViewingRecommended = false);
@@ -165,10 +202,60 @@ public:
     // Use progress dialog for post-download operations.
     void reportProgressToProgressDialog(int, int);
 
+    // Download/import progress helpers. Use the inline progress widget in the
+    // mapper when it is visible, otherwise ask the frontend for a standalone
+    // progress dialog via signal_mapTransferProgressStart(). Do NOT use these
+    // from the JSON export/import paths - those drive their own frontend dialog
+    // through signal_mapJsonProgressStart().
+    void createTransferProgress(const QString& title, const QString& label, bool cancelable);
+    void updateTransferProgressLabel(const QString& text);
+    void updateTransferProgressRange(int minimum, int maximum);
+    void updateTransferProgressValue(int value);
+    int transferProgressMaximum() const;
+    bool hasActiveTransferProgress() const;
+    void disableTransferProgressCancel();
+    void clearTransferProgress();
+
+    // True while a map import, export or download is on the stack. Those pump
+    // qApp->processEvents() to keep their progress display alive, so anything
+    // delivered from an event loop can find itself running nested inside one -
+    // and destroying this map's Host from there would free the operation's own
+    // "this" (#9520). Whoever would do that has to wait for this to go false.
+    bool mapOperationInProgress() const { return mMapOperationDepth > 0; }
+    // Ask an operation that is in progress to stop at its next opportunity, so
+    // that a caller waiting on the above does not wait for a whole map. Only the
+    // JSON import and export poll this; an XML import or a download runs to its
+    // own end. Asking twice does nothing, which mapOperationAbortRequested()
+    // also lets a caller polling in a loop see.
+    void requestMapOperationAbort();
+    bool mapOperationAbortRequested() const { return mMapOperationAbortRequested; }
+
+    // Held while Lua runs from inside C++ that keeps raw TRoom/TArea pointers across the call (the
+    // exit weight filter while the graph is built, map info contributors while the map is painted),
+    // so the Lua functions that free rooms or areas must refuse while this is held.
+    class ScriptCallbackScope
+    {
+    public:
+        explicit ScriptCallbackScope(TMap* pMap)
+        : mpMap(pMap)
+        {
+            ++mpMap->mScriptCallbackDepth;
+        }
+        ~ScriptCallbackScope() { --mpMap->mScriptCallbackDepth; }
+        ScriptCallbackScope(const ScriptCallbackScope&) = delete;
+        ScriptCallbackScope& operator=(const ScriptCallbackScope&) = delete;
+
+    private:
+        TMap* mpMap = nullptr;
+    };
+    bool scriptCallbackInProgress() const { return mScriptCallbackDepth > 0; }
+    // initGraph() runs the exit weight filter, which must not start another search mid-build.
+    bool graphBuildInProgress() const { return mGraphBuildInProgress; }
+
     // Show which rooms have which symbols:
     QHash<QString, QSet<int>> roomSymbolsHash();
 
-    void setMmpMapLocation(const QString &location);
+    void setMmpMapLocation(const QString& location);
     QString getMmpMapLocation() const;
 
     // has setRoomNamesShown ever been called on this map?
@@ -177,10 +264,31 @@ public:
     bool getRoomNamesShown();
     void setRoomNamesShown(bool shown);
 
+    // The 2D map room symbol settings, shared by the preferences dialog and
+    // the Lua API. Each returns whether the setting actually changed:
+    QFont getSymbolFont() const { return mMapSymbolFont; }
+    bool setSymbolFont(const QFont&);
+    bool getOnlySymbolFontUsed() const { return mIsOnlyMapSymbolFontToBeUsed; }
+    bool setOnlySymbolFontUsed(bool);
+    qreal getSymbolFontFudgeFactor() const { return mMapSymbolFontFudgeFactor; }
+    bool setSymbolFontFudgeFactor(qreal);
+    // The range setSymbolFontFudgeFactor() accepts; also what the preferences
+    // spin-box offers. Zero and below blanks every symbol (issue #10176):
+    static constexpr qreal scmMinimumSymbolFontFudgeFactor = 0.50;
+    static constexpr qreal scmMaximumSymbolFontFudgeFactor = 2.00;
+    // The 2D zoom a new area starts at, and the smallest one a view accepts:
+    static constexpr qreal scmDefaultXYZoom = 20.0;
+    static constexpr qreal scmMinXYZoom = 3.0;
+    // Which of the symbols in use would be drawn as the replacement character
+    // if the given font were the symbol font:
+    QStringList symbolsNotInFont(const QFont&);
+
     std::pair<bool, QString> writeJsonMapFile(const QString&);
-    std::pair<bool, QString> readJsonMapFile(const QString&, const bool translatableTexts = false, const bool allowUserCancellation = true);
+    std::pair<bool, QString> readJsonMapFile(const QString&, const bool translatableTexts = false);
     qsizetype getCurrentProgressRoomCount() const { return mProgressDialogRoomsCount; }
     bool incrementJsonProgressDialog(const bool isExportNotImport, const bool isRoomNotLabel, const int increment = 1);
+    // TRoomDB calls this before it deletes an area or clears the map.
+    void areasAboutToBeDeleted();
     QString getDefaultAreaName() const { return mDefaultAreaName; }
     QString getUnnamedAreaName() const { return mUnnamedAreaName; }
 
@@ -196,14 +304,22 @@ public:
     void setUnsaved(const char*);
     void resetUnsaved() { mUnsavedMap = false; }
     bool isUnsaved() const { return mUnsavedMap; }
+    void setSaveError(bool state);
+    bool hasSaveError() const { return mSaveError; }
     void setDefaultAreaShown(bool);
     bool getDefaultAreaShown() { return mShowDefaultArea; }
 
 
-    TRoomDB* mpRoomDB = nullptr;
+    std::unique_ptr<TRoomDB> mpRoomDB;
+    // Made by the GUI when it gives the profile a console, so null without one.
+    // Non-owning: Qt parent-child system (TMap as parent) handles lifetime.
+    TMapViewManager* mpViewManager = nullptr;
     QMap<int, int> mEnvColors;
     QPointer<Host> mpHost;
     QString mProfileName;
+
+    TMapViewManager* getViewManager() { return mpViewManager; }
+    void setViewManager(TMapViewManager* pViewManager) { mpViewManager = pViewManager; }
 
     // Was a single int mRoomId but that breaks things when maps are
     // copied/shared between profiles - so now we track the profile name
@@ -217,38 +333,43 @@ public:
     QList<QString> mDirList;
     QList<int> mWeightList;
     QMap<int, QColor> mCustomEnvColors;
-    inline static const QMap<int, QVector3D> scmUnitVectors = {
-        {DIR_NORTH, {0, -1, 0}},
-        {DIR_NORTHEAST, {1, -1, 0}},
-        {DIR_NORTHWEST, {-1, -1, 0}},
-        {DIR_EAST, {1, 0, 0}},
-        {DIR_WEST, {-1, 0, 0}},
-        {DIR_SOUTH, {0, 1, 0}},
-        {DIR_SOUTHEAST, {1, 1, 0}},
-        {DIR_SOUTHWEST, {-1, 1, 0}},
-        {DIR_UP, {0, 0, 1}},
-        {DIR_DOWN, {0, 0, -1}}};
+    inline static const QMap<int, QVector3D> scmUnitVectors = {{DIR_NORTH, {0, -1, 0}},
+                                                               {DIR_NORTHEAST, {1, -1, 0}},
+                                                               {DIR_NORTHWEST, {-1, -1, 0}},
+                                                               {DIR_EAST, {1, 0, 0}},
+                                                               {DIR_WEST, {-1, 0, 0}},
+                                                               {DIR_SOUTH, {0, 1, 0}},
+                                                               {DIR_SOUTHEAST, {1, 1, 0}},
+                                                               {DIR_SOUTHWEST, {-1, 1, 0}},
+                                                               {DIR_UP, {0, 0, 1}},
+                                                               {DIR_DOWN, {0, 0, -1}}};
 
     // contains complementary directions of DIR_XXXX
-    inline static const QMap<int, int> scmReverseDirections = {
-        {DIR_NORTH, DIR_SOUTH},
-        {DIR_NORTHEAST, DIR_SOUTHWEST},
-        {DIR_NORTHWEST, DIR_SOUTHEAST},
-        {DIR_EAST, DIR_WEST},
-        {DIR_WEST, DIR_EAST},
-        {DIR_SOUTH, DIR_NORTH},
-        {DIR_SOUTHEAST, DIR_NORTHWEST},
-        {DIR_SOUTHWEST, DIR_NORTHEAST},
-        {DIR_UP, DIR_DOWN},
-        {DIR_DOWN, DIR_UP},
-        {DIR_IN, DIR_OUT},
-        {DIR_OUT, DIR_IN}};
+    inline static const QMap<int, int> scmReverseDirections = {{DIR_NORTH, DIR_SOUTH},
+                                                               {DIR_NORTHEAST, DIR_SOUTHWEST},
+                                                               {DIR_NORTHWEST, DIR_SOUTHEAST},
+                                                               {DIR_EAST, DIR_WEST},
+                                                               {DIR_WEST, DIR_EAST},
+                                                               {DIR_SOUTH, DIR_NORTH},
+                                                               {DIR_SOUTHEAST, DIR_NORTHWEST},
+                                                               {DIR_SOUTHWEST, DIR_NORTHEAST},
+                                                               {DIR_UP, DIR_DOWN},
+                                                               {DIR_DOWN, DIR_UP},
+                                                               {DIR_IN, DIR_OUT},
+                                                               {DIR_OUT, DIR_IN}};
 
 #if defined(INCLUDE_3DMAPPER)
-    QPointer<GLWidget> mpM;
+    QPointer<QOpenGLWidget> mpM;
 #endif
     QPointer<dlgMapper> mpMapper;
-    QMap<int, int> roomidToIndex;
+    QHash<int, int> roomidToIndex;
+
+    // User-registered mapper context menu entries (addMapEvent()/addMapMenu());
+    // session-only state, never saved with the map.
+    // string list: 0 is event name, 1 is menu it is under if it is
+    QMap<QString, QStringList> mUserActions;
+    // unique name, List:parent name ("" if null), display name
+    QMap<QString, QStringList> mUserMenus;
 
     typedef boost::adjacency_list<boost::listS, boost::vecS, boost::directedS, boost::no_property, boost::property<boost::edge_weight_t, cost>> mygraph_t;
     typedef boost::property_map<mygraph_t, boost::edge_weight_t>::type WeightMap;
@@ -260,7 +381,9 @@ public:
     bool mMapGraphNeedsUpdate = true;
     bool mNewMove = true;
 
-    // Replaced CURRENT_MAP_VERSION, default map version that new maps will get:
+    // WARNING: Do not change this value without careful consideration - increasing
+    // the default map format makes it difficult for players to share maps with
+    // others who may be using older Mudlet versions.
     const int mDefaultVersion = 20;
 
     // Normally the same as mDefaultVersion but can be higher for development
@@ -282,6 +405,8 @@ public:
      *   directly into the TArea class serialization - for lower map versions it
      *   is placed into a "system.fallback_map2DZoom" value in the Area userdata.
      *   SlySven - 2023/03
+     * * Version 22 adds the 'hidden' property to rooms, allowing rooms and their
+     *   exits to be hidden from display in the mapper.
      */
     const int mMaxVersion = 20;
 
@@ -341,13 +466,68 @@ public slots:
     void slot_downloadCancel();
     void slot_downloadError(QNetworkReply::NetworkError);
     void slot_replyFinished(QNetworkReply*);
+    // Called by the frontend when the user cancels the standalone map-progress
+    // dialog it owns on our behalf.
+    void slot_mapProgressDialogCancelled();
 
 
 private:
+    void resetSearchState(const std::size_t roomCount);
+
+    // A* leaving the route in mSearchPredecessor; see the definition for why not boost::astar_search().
+    bool searchGraph(const vertex start, const vertex goal);
+
+    // Kept between searches. The first three have one entry per room; mSearchTouched lists only
+    // the rooms the last search wrote, so the next resets just those. initGraph() must resync all four.
+    std::vector<vertex> mSearchPredecessor;
+    std::vector<cost> mSearchDistance;
+    std::vector<quint8> mSearchState;
+    std::vector<vertex> mSearchTouched;
+
+    // Held for the whole of a map operation that pumps the event loop, so that
+    // mapOperationInProgress() can tell anything re-entered from that pump that
+    // this map is on the stack. Nested operations are counted, not flagged: an
+    // XML import can start from inside a download's pump.
+    class MapOperationScope
+    {
+    public:
+        explicit MapOperationScope(TMap* pMap)
+        : mpMap(pMap)
+        {
+            if (!mpMap->mMapOperationDepth) {
+                mpMap->mMapOperationAbortRequested = false;
+            }
+            ++mpMap->mMapOperationDepth;
+        }
+        ~MapOperationScope() { --mpMap->mMapOperationDepth; }
+        MapOperationScope(const MapOperationScope&) = delete;
+        MapOperationScope& operator=(const MapOperationScope&) = delete;
+
+    private:
+        TMap* mpMap = nullptr;
+    };
+
+    int mMapOperationDepth = 0;
+    // requestMapOperationAbort() is asked again on every retry of a deferred
+    // profile close, and asking twice would abort a network reply twice over.
+    bool mMapOperationAbortRequested = false;
+    int mScriptCallbackDepth = 0;
+    bool mGraphBuildInProgress = false;
+
+    void addDirectionalRoute(std::vector<std::pair<unsigned int, route>>& bestRoutes,
+                             const QMap<QString, int>& exitWeights,
+                             unsigned int source,
+                             TRoom* pSourceR,
+                             int target,
+                             quint8 direction,
+                             const QString& exitKey,
+                             const QSet<unsigned int>& unUsableRoomSet);
     const QString createFileHeaderLine(QString, QChar);
+    void warnIfMapProgressUnwired(const char* context, bool transferPath);
     void writeJsonUserData(QJsonObject&) const;
     void readJsonUserData(const QJsonObject&);
     bool validatePotentialMapFile(QFile&, QDataStream&);
+    void flushSymbolCaches();
 
     QStringList mStoredMessages;
 
@@ -371,7 +551,15 @@ private:
     int mExpectedFileSize = 0;
     bool mImportRunning = false;
 
-    QProgressDialog* mpProgressDialog = nullptr;
+    // Engine-side mirror of the frontend-owned dialog, which the engine can't
+    // read back. mMapProgressStandalone also serves as the "import/export already
+    // running" guard (see writeJsonMapFile()/readJsonMapFile()).
+    bool mMapProgressStandalone = false;
+    bool mMapProgressIsTransfer = false;
+    bool mMapProgressCancelRequested = false;
+    int mMapProgressStandaloneMaximum = 0;
+    bool mJsonExportInProgress = false;
+    bool mJsonExportLostAnArea = false;
     // Using during updates of text in progress dialog partially from other
     // classes:
     qsizetype mProgressDialogAreasTotal = 0;
@@ -380,9 +568,13 @@ private:
     qsizetype mProgressDialogRoomsCount = 0;
     qsizetype mProgressDialogLabelsTotal = 0;
     qsizetype mProgressDialogLabelsCount = 0;
+    // When incrementJsonProgressDialog() last showed the counts; invalid until it first does:
+    QElapsedTimer mJsonProgressShown;
 
     // Used to flag whether the map auto-save needs to be done after the next interval:
     bool mUnsavedMap = false;
+    // Used to indicate that the last map save attempt failed:
+    bool mSaveError = false;
     // Used to hide the default area from casual viewing for those MUDs that
     // want to script a "fog-of-war" system by hiding rooms in the -1 area:
     bool mShowDefaultArea = true;

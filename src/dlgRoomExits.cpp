@@ -3,6 +3,7 @@
  *   Copyright (C) 2013-2016, 2021 by Stephen Lyons                        *
  *                                               - slysven@virginmedia.com *
  *   Copyright (C) 2014 by Ahmed Charles - acharles@outlook.com            *
+ *   Copyright (C) 2025 by Lecker Kebap - Leris@mudlet.org                 *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
  *   it under the terms of the GNU General Public License as published by  *
@@ -31,9 +32,8 @@
 #include "utils.h"
 
 
-#include "pre_guard.h"
 #include <QAction>
-#include "post_guard.h"
+#include <set>
 
 // A template for tooltip HTML formatting so that we do not have
 // 30 copies of the same QString in the read-only segment of the code:
@@ -41,7 +41,8 @@ const QString doubleParagraph{qsl("<p>%1</p><p>%2</p>")};
 
 WeightSpinBoxDelegate::WeightSpinBoxDelegate(QObject* parent)
 : QStyledItemDelegate(parent)
-{}
+{
+}
 
 QWidget* WeightSpinBoxDelegate::createEditor(QWidget* parent, const QStyleOptionViewItem& /* option */, const QModelIndex& /* index */) const
 {
@@ -78,7 +79,8 @@ void WeightSpinBoxDelegate::updateEditorGeometry(QWidget* pEditor, const QStyleO
 
 RoomIdLineEditDelegate::RoomIdLineEditDelegate(QObject* parent)
 : QStyledItemDelegate(parent)
-{}
+{
+}
 
 QWidget* RoomIdLineEditDelegate::createEditor(QWidget* parent, const QStyleOptionViewItem& /* option */, const QModelIndex& index) const
 {
@@ -102,6 +104,8 @@ QWidget* RoomIdLineEditDelegate::createEditor(QWidget* parent, const QStyleOptio
     mpEditor = new QLineEdit(parent);
     mpEditor->setFrame(false);
     mpEditor->setPlaceholderText(mpDlgRoomExits->mSpecialExitRoomIdPlaceholder);
+    // Hide anything in the original QLineEdit that this sits on top of:
+    mpEditor->setAutoFillBackground(true);
     if (mpDlgRoomExits) {
         if (!mpHost) {
             mpHost = mpDlgRoomExits->getHost();
@@ -126,11 +130,10 @@ QWidget* RoomIdLineEditDelegate::createEditor(QWidget* parent, const QStyleOptio
                 const int exitAreaID = exitToRoom->getArea();
                 const bool outOfAreaExit = (exitAreaID && exitAreaID != mAreaID);
                 const bool exitRoomLocked = exitToRoom->isLocked;
-                mpDlgRoomExits->setActionOnExit(mpEditor, exitRoomLocked
-                                                ? mpDlgRoomExits->mpAction_exitRoomLocked
-                                                : outOfAreaExit
-                                                  ? mpDlgRoomExits->mpAction_otherAreaExit
-                                                  : mpDlgRoomExits->mpAction_inAreaExit);
+                mpDlgRoomExits->setActionOnExit(mpEditor,
+                                                exitRoomLocked  ? mpDlgRoomExits->mpAction_exitRoomLocked
+                                                : outOfAreaExit ? mpDlgRoomExits->mpAction_otherAreaExit
+                                                                : mpDlgRoomExits->mpAction_inAreaExit);
                 QString exitAreaName;
                 if (outOfAreaExit) {
                     exitAreaName = mpHost->mpMap->mpRoomDB->getAreaNamesMap().value(exitAreaID);
@@ -210,11 +213,10 @@ void RoomIdLineEditDelegate::slot_specialRoomExitIdEdited(const QString& text) c
             exitAreaName = mpHost->mpMap->mpRoomDB->getAreaNamesMap().value(exitAreaID);
         }
 
-        mpDlgRoomExits->setActionOnExit(mpEditor, exitRoomLocked
-                                        ? mpDlgRoomExits->mpAction_exitRoomLocked
-                                        : outOfAreaExit
-                                          ? mpDlgRoomExits->mpAction_otherAreaExit
-                                          : mpDlgRoomExits->mpAction_inAreaExit);
+        mpDlgRoomExits->setActionOnExit(mpEditor,
+                                        exitRoomLocked  ? mpDlgRoomExits->mpAction_exitRoomLocked
+                                        : outOfAreaExit ? mpDlgRoomExits->mpAction_otherAreaExit
+                                                        : mpDlgRoomExits->mpAction_inAreaExit);
         roomIdToolTipText = mpDlgRoomExits->generateToolTip(pExitToRoom->name, exitAreaName, exitRoomLocked, outOfAreaExit, pExitToRoom->getWeight());
     } else if (text.toInt() > 0) {
         // A number but not valid
@@ -277,17 +279,11 @@ dlgRoomExits::dlgRoomExits(Host* pH, const int roomNumber, QWidget* pW)
 
     init();
 
-    specialExits->setItemDelegateForColumn(ExitsTreeWidget::colIndex_exitRoomId, new RoomIdLineEditDelegate);
-    specialExits->setItemDelegateForColumn(ExitsTreeWidget::colIndex_exitWeight, new WeightSpinBoxDelegate);
+    specialExits->setItemDelegateForColumn(ExitsTreeWidget::colIndex_exitRoomId, new RoomIdLineEditDelegate(specialExits));
+    specialExits->setItemDelegateForColumn(ExitsTreeWidget::colIndex_exitWeight, new WeightSpinBoxDelegate(specialExits));
 }
 
-dlgRoomExits::~dlgRoomExits()
-{
-    delete mpAction_otherAreaExit;
-    delete mpAction_inAreaExit;
-    delete mpAction_invalidExit;
-    delete mpAction_noExit;
-}
+dlgRoomExits::~dlgRoomExits() = default;
 
 void dlgRoomExits::slot_endEditSpecialExits()
 {
@@ -298,13 +294,30 @@ void dlgRoomExits::slot_endEditSpecialExits()
     if (mpEditItem != nullptr && mEditColumn >= 0) {
         specialExits->closePersistentEditor(mpEditItem, mEditColumn);
         // Restore placeholder text for the exitRoomID field
-        if (mEditColumn == ExitsTreeWidget::colIndex_exitRoomId && !mpEditItem->text(ExitsTreeWidget::colIndex_exitRoomId).trimmed().length()) {
+        if (mEditColumn == ExitsTreeWidget::colIndex_exitRoomId && mpEditItem->text(ExitsTreeWidget::colIndex_exitRoomId).trimmed().isEmpty()) {
             mpEditItem->setText(ExitsTreeWidget::colIndex_exitRoomId, mSpecialExitRoomIdPlaceholder);
         }
         mpEditItem = nullptr;
         mEditColumn = -1;
     }
     specialExits->clearSelection();
+}
+
+// Delete (ExitsTreeWidget::keyPressEvent()) can remove the item being edited.
+void dlgRoomExits::slot_specialExitRowsAboutToBeRemoved(const QModelIndex& parent, const int first, const int last)
+{
+    if (!mpEditItem || parent.isValid()) {
+        return;
+    }
+    for (int row = first; row <= last; ++row) {
+        if (specialExits->topLevelItem(row) == mpEditItem) {
+            mpEditItem = nullptr;
+            mEditColumn = -1;
+            button_endEditing->setDisabled(true);
+            button_addSpecialExit->setEnabled(true);
+            return;
+        }
+    }
 }
 
 void dlgRoomExits::slot_editSpecialExit(QTreeWidgetItem* pI, int column)
@@ -329,7 +342,10 @@ void dlgRoomExits::slot_editSpecialExit(QTreeWidgetItem* pI, int column)
             break;
 
         case ExitsTreeWidget::colIndex_exitWeight:
-            mpEditItem->setText(ExitsTreeWidget::colIndex_exitWeight, QString::number((mpEditItem->text(ExitsTreeWidget::colIndex_exitWeight).toInt() < 0) ? (-1 * mpEditItem->text(ExitsTreeWidget::colIndex_exitWeight).toInt()) : mpEditItem->text(ExitsTreeWidget::colIndex_exitWeight).toInt())); //Force result to be non-negative integer
+            mpEditItem->setText(ExitsTreeWidget::colIndex_exitWeight,
+                                QString::number((mpEditItem->text(ExitsTreeWidget::colIndex_exitWeight).toInt() < 0)
+                                                        ? (-1 * mpEditItem->text(ExitsTreeWidget::colIndex_exitWeight).toInt())
+                                                        : mpEditItem->text(ExitsTreeWidget::colIndex_exitWeight).toInt())); //Force result to be non-negative integer
             specialExits->closePersistentEditor(mpEditItem, mEditColumn);
             break;
 
@@ -362,15 +378,15 @@ void dlgRoomExits::slot_editSpecialExit(QTreeWidgetItem* pI, int column)
             break;
 
         case ExitsTreeWidget::colIndex_command:
-            if (!mpEditItem->text(ExitsTreeWidget::colIndex_command).trimmed().length()) {
+            if (mpEditItem->text(ExitsTreeWidget::colIndex_command).trimmed().isEmpty()) {
                 // Restore the placeholder text if there is nothing but spaces in the entry:
                 mpEditItem->setText(ExitsTreeWidget::colIndex_command, mSpecialExitCommandPlaceholder);
             }
             specialExits->closePersistentEditor(mpEditItem, mEditColumn);
             //            qDebug().nospace().noquote() << "dlgRoomExits::slot_editSpecialExit(...) INFO - Closed PE on item: \"" << mpEditItem->text(ExitsTreeWidget::colIndex_command) << "\" column: " << mEditColumn;
             break;
-        default:
-            {} //noop for other column (ExitsTreeWidget::colIndex_lockExit)
+        default: {
+        } //noop for other column (ExitsTreeWidget::colIndex_lockExit)
         }
         setIconAndToolTipsOnSpecialExit(mpEditItem, true);
 
@@ -399,7 +415,9 @@ void dlgRoomExits::slot_editSpecialExit(QTreeWidgetItem* pI, int column)
     //    qDebug().nospace().noquote() << "dlgRoomExits::slot_editSpecialExit(...) INFO - A Special Exit is been edited, it has the command: \"" << pI->text(ExitsTreeWidget::colIndex_command) << "\" and the editing is on column:" << column;
     switch (column) {
     case ExitsTreeWidget::colIndex_exitWeight:
-        pI->setText(ExitsTreeWidget::colIndex_exitWeight, QString::number((pI->text(ExitsTreeWidget::colIndex_exitWeight).toInt() < 0) ? (-1 * pI->text(ExitsTreeWidget::colIndex_exitWeight).toInt()) : pI->text(ExitsTreeWidget::colIndex_exitWeight).toInt())); //Force result to be non-negative
+        pI->setText(ExitsTreeWidget::colIndex_exitWeight,
+                    QString::number((pI->text(ExitsTreeWidget::colIndex_exitWeight).toInt() < 0) ? (-1 * pI->text(ExitsTreeWidget::colIndex_exitWeight).toInt())
+                                                                                                 : pI->text(ExitsTreeWidget::colIndex_exitWeight).toInt())); //Force result to be non-negative
         break;
 
     case ExitsTreeWidget::colIndex_doorNone: // Enforce exclusive Radio Button type behaviour on the checkboxes in these four columns
@@ -449,21 +467,25 @@ void dlgRoomExits::slot_addSpecialExit()
 
     pI->setText(ExitsTreeWidget::colIndex_exitWeight, qsl("0")); //Exit Weight
     pI->setTextAlignment(ExitsTreeWidget::colIndex_exitWeight, Qt::AlignRight);
-    pI->setToolTip(ExitsTreeWidget::colIndex_exitWeight, utils::richText(tr("Set to a positive value to override the default (Room) Weight for using this Exit route, zero value assigns the default.")));
+    //: Tooltip for exit weight column
+    pI->setToolTip(ExitsTreeWidget::colIndex_exitWeight, utils::richText(tr("Positive value overrides room weight; zero uses default.")));
 
     pI->setCheckState(ExitsTreeWidget::colIndex_doorNone, Qt::Checked); //Doortype: none
-    pI->setToolTip(ExitsTreeWidget::colIndex_doorNone, utils::richText(tr("No door symbol is drawn on 2D Map for this exit (only functional choice currently).")));
+    //: Tooltip for no door symbol option
+    pI->setToolTip(ExitsTreeWidget::colIndex_doorNone, utils::richText(tr("No door symbol drawn on the 2D map for this exit.")));
     pI->setCheckState(ExitsTreeWidget::colIndex_doorOpen, Qt::Unchecked); //Doortype: open
-    pI->setToolTip(ExitsTreeWidget::colIndex_doorOpen, utils::richText(tr("Green (Open) door symbol would be drawn on a custom exit line for this exit on 2D Map (but not currently).")));
+    //: Tooltip for open door symbol option
+    pI->setToolTip(ExitsTreeWidget::colIndex_doorOpen, utils::richText(tr("Green (open) door symbol drawn on the 2D map.")));
     pI->setCheckState(ExitsTreeWidget::colIndex_doorClosed, Qt::Unchecked); //Doortype: closed
-    pI->setToolTip(ExitsTreeWidget::colIndex_doorClosed, utils::richText(tr("Orange (Closed) door symbol would be drawn on a custom exit line for this exit on 2D Map (but not currently).")));
+    //: Tooltip for closed door symbol option
+    pI->setToolTip(ExitsTreeWidget::colIndex_doorClosed, utils::richText(tr("Orange (closed) door symbol drawn on the 2D map.")));
     pI->setCheckState(ExitsTreeWidget::colIndex_doorLocked, Qt::Unchecked); //Doortype: locked
-    pI->setToolTip(ExitsTreeWidget::colIndex_doorLocked, utils::richText(tr("Red (Locked) door symbol would be drawn on a custom exit line for this exit on 2D Map (but not currently).")));
+    //: Tooltip for locked door symbol option
+    pI->setToolTip(ExitsTreeWidget::colIndex_doorLocked, utils::richText(tr("Red (locked) door symbol drawn on the 2D map.")));
 
     pI->setText(ExitsTreeWidget::colIndex_command, mSpecialExitCommandPlaceholder); //Exit command
     pI->setTextAlignment(ExitsTreeWidget::colIndex_command, Qt::AlignLeft);
 
-// >>>>>>> development
     specialExits->addTopLevelItem(pI);
 
     setIconAndToolTipsOnSpecialExit(pI, true);
@@ -472,7 +494,12 @@ void dlgRoomExits::slot_addSpecialExit()
 void dlgRoomExits::save()
 {
     mpHost->mpMap->mMapGraphNeedsUpdate = true;
-    if (!pR) {
+    // The dialog is not modal, so since init() a script may have deleted the
+    // room, or replaced it with a new one under the same id
+    pR = mpHost->mpMap->mpRoomDB->getRoom(mRoomID);
+    if (!pR || pR->serial() != mRoomSerial) {
+        pR = nullptr;
+        close();
         return;
     }
 
@@ -481,6 +508,9 @@ void dlgRoomExits::save()
 
     for (int i = 0; i < specialExits->topLevelItemCount(); ++i) {
         QTreeWidgetItem* pI = specialExits->topLevelItem(i);
+        if (!pI) {
+            continue;
+        }
         const int value = pI->text(ExitsTreeWidget::colIndex_exitRoomId).toInt();
         const int weight = pI->text(ExitsTreeWidget::colIndex_exitWeight).toInt();
         int door = 0;
@@ -495,8 +525,7 @@ void dlgRoomExits::save()
             door = 0;
         }
         const QString key = pI->text(ExitsTreeWidget::colIndex_command);
-        if (key != mSpecialExitCommandPlaceholder
-            && value != 0 && mpHost->mpMap->mpRoomDB->getRoom(value) != nullptr) {
+        if (key != mSpecialExitCommandPlaceholder && value != 0 && mpHost->mpMap->mpRoomDB->getRoom(value) != nullptr) {
             originalExitCmds.remove(key);
             locked = (pI->checkState(ExitsTreeWidget::colIndex_lockExit) != Qt::Unchecked);
             pR->setSpecialExit(value, key); // Now can overwrite an existing exit with a different destination
@@ -511,7 +540,7 @@ void dlgRoomExits::save()
     }
 
     // Clean up after any deleted specialExits originally present but not now so
-    for (auto value : originalExitCmds) {
+    for (const auto& value : originalExitCmds) {
         pR->customLinesArrow.remove(value);
         pR->customLinesColor.remove(value);
         pR->customLinesStyle.remove(value);
@@ -523,7 +552,8 @@ void dlgRoomExits::save()
 
     QString exitKey = qsl("nw");
     int dirCode = DIR_NORTHWEST;
-    auto pExit = originalExits.value(dirCode);
+    auto it_nw = originalExits.find(dirCode);
+    TExit* pExit = (it_nw != originalExits.end()) ? it_nw->second.get() : nullptr;
     if (nw->isEnabled() && !nw->text().isEmpty() && mpHost->mpMap->mpRoomDB->getRoom(nw->text().toInt()) != nullptr) {
         // There IS a valid exit on the dialogue in this direction
         if (pExit && pExit->destination != nw->text().toInt()) {
@@ -554,7 +584,10 @@ void dlgRoomExits::save()
 
     exitKey = qsl("n");
     dirCode = DIR_NORTH;
-    pExit = originalExits.value(dirCode);
+    {
+        auto it = originalExits.find(dirCode);
+        pExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+    }
     if (n->isEnabled() && !n->text().isEmpty() && mpHost->mpMap->mpRoomDB->getRoom(n->text().toInt()) != nullptr) {
         if (pExit && pExit->destination != n->text().toInt()) {
             pR->setExit(n->text().toInt(), dirCode);
@@ -583,7 +616,10 @@ void dlgRoomExits::save()
 
     exitKey = qsl("ne");
     dirCode = DIR_NORTHEAST;
-    pExit = originalExits.value(dirCode);
+    {
+        auto it = originalExits.find(dirCode);
+        pExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+    }
     if (ne->isEnabled() && !ne->text().isEmpty() && mpHost->mpMap->mpRoomDB->getRoom(ne->text().toInt()) != nullptr) {
         if (pExit && pExit->destination != ne->text().toInt()) {
             pR->setExit(ne->text().toInt(), dirCode);
@@ -612,7 +648,10 @@ void dlgRoomExits::save()
 
     exitKey = qsl("up");
     dirCode = DIR_UP;
-    pExit = originalExits.value(dirCode);
+    {
+        auto it = originalExits.find(dirCode);
+        pExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+    }
     if (up->isEnabled() && !up->text().isEmpty() && mpHost->mpMap->mpRoomDB->getRoom(up->text().toInt()) != nullptr) {
         if (pExit && pExit->destination != up->text().toInt()) {
             pR->setExit(up->text().toInt(), dirCode);
@@ -641,7 +680,10 @@ void dlgRoomExits::save()
 
     exitKey = qsl("w");
     dirCode = DIR_WEST;
-    pExit = originalExits.value(dirCode);
+    {
+        auto it = originalExits.find(dirCode);
+        pExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+    }
     if (w->isEnabled() && !w->text().isEmpty() && mpHost->mpMap->mpRoomDB->getRoom(w->text().toInt()) != nullptr) {
         if (pExit && pExit->destination != w->text().toInt()) {
             pR->setExit(w->text().toInt(), dirCode);
@@ -670,7 +712,10 @@ void dlgRoomExits::save()
 
     exitKey = qsl("e");
     dirCode = DIR_EAST;
-    pExit = originalExits.value(dirCode);
+    {
+        auto it = originalExits.find(dirCode);
+        pExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+    }
     if (e->isEnabled() && !e->text().isEmpty() && mpHost->mpMap->mpRoomDB->getRoom(e->text().toInt()) != nullptr) {
         if (pExit && pExit->destination != e->text().toInt()) {
             pR->setExit(e->text().toInt(), dirCode);
@@ -699,7 +744,10 @@ void dlgRoomExits::save()
 
     exitKey = qsl("down");
     dirCode = DIR_DOWN;
-    pExit = originalExits.value(dirCode);
+    {
+        auto it = originalExits.find(dirCode);
+        pExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+    }
     if (down->isEnabled() && !down->text().isEmpty() && mpHost->mpMap->mpRoomDB->getRoom(down->text().toInt()) != nullptr) {
         if (pExit && pExit->destination != down->text().toInt()) {
             pR->setExit(down->text().toInt(), dirCode);
@@ -728,7 +776,10 @@ void dlgRoomExits::save()
 
     exitKey = qsl("sw");
     dirCode = DIR_SOUTHWEST;
-    pExit = originalExits.value(dirCode);
+    {
+        auto it = originalExits.find(dirCode);
+        pExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+    }
     if (sw->isEnabled() && !sw->text().isEmpty() && mpHost->mpMap->mpRoomDB->getRoom(sw->text().toInt()) != nullptr) {
         if (pExit && pExit->destination != sw->text().toInt()) {
             pR->setExit(sw->text().toInt(), dirCode);
@@ -757,7 +808,10 @@ void dlgRoomExits::save()
 
     exitKey = qsl("s");
     dirCode = DIR_SOUTH;
-    pExit = originalExits.value(dirCode);
+    {
+        auto it = originalExits.find(dirCode);
+        pExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+    }
     if (s->isEnabled() && !s->text().isEmpty() && mpHost->mpMap->mpRoomDB->getRoom(s->text().toInt()) != nullptr) {
         if (pExit && pExit->destination != s->text().toInt()) {
             pR->setExit(s->text().toInt(), dirCode);
@@ -786,7 +840,10 @@ void dlgRoomExits::save()
 
     exitKey = qsl("se");
     dirCode = DIR_SOUTHEAST;
-    pExit = originalExits.value(dirCode);
+    {
+        auto it = originalExits.find(dirCode);
+        pExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+    }
     if (se->isEnabled() && !se->text().isEmpty() && mpHost->mpMap->mpRoomDB->getRoom(se->text().toInt()) != nullptr) {
         if (pExit && pExit->destination != se->text().toInt()) {
             pR->setExit(se->text().toInt(), dirCode);
@@ -815,7 +872,10 @@ void dlgRoomExits::save()
 
     exitKey = qsl("in");
     dirCode = DIR_IN;
-    pExit = originalExits.value(dirCode);
+    {
+        auto it = originalExits.find(dirCode);
+        pExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+    }
     if (in->isEnabled() && !in->text().isEmpty() && mpHost->mpMap->mpRoomDB->getRoom(in->text().toInt()) != nullptr) {
         if (pExit && pExit->destination != in->text().toInt()) {
             pR->setExit(in->text().toInt(), dirCode);
@@ -844,7 +904,10 @@ void dlgRoomExits::save()
 
     exitKey = qsl("out");
     dirCode = DIR_OUT;
-    pExit = originalExits.value(dirCode);
+    {
+        auto it = originalExits.find(dirCode);
+        pExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+    }
     if (out->isEnabled() && !out->text().isEmpty() && mpHost->mpMap->mpRoomDB->getRoom(out->text().toInt()) != nullptr) {
         if (pExit && pExit->destination != out->text().toInt()) {
             pR->setExit(out->text().toInt(), dirCode);
@@ -941,6 +1004,13 @@ void dlgRoomExits::save()
         pA->determineAreaExitsOfRoom(pR->getId());
     }
 
+    // Repaint the mapper so the changed exits/doors/locks show immediately -
+    // without this the map stays stale until the next scroll/pan forces a
+    // paint. updateArea() queues a throttled mp2dMap->update(). Also mark the
+    // map unsaved, since editing exits is a map change.
+    mpHost->mpMap->updateArea(pR->getArea());
+    mpHost->mpMap->setUnsaved(__func__);
+
     close();
 }
 
@@ -964,24 +1034,20 @@ void dlgRoomExits::setIconAndToolTipsOnSpecialExit(QTreeWidgetItem* pSpecialExit
         // This is the toolTip text for the roomID number column (and the
         // status icons)
         const QString roomIdToolTipText{generateToolTip(pExitToRoom->name, exitAreaName, exitRoomLocked, outOfAreaExit, pExitToRoom->getWeight())};
-        pSpecialExit->setToolTip(ExitsTreeWidget::colIndex_exitStatus, utils::richText(tr("The roomID of the room that this special exit leads to is expected here. "
-                                                                                          "If left like this, this exit will be deleted when <tt>save</tt> is clicked.")));
+        pSpecialExit->setToolTip(ExitsTreeWidget::colIndex_exitStatus,
+                                 utils::richText(tr("The roomID of the room that this special exit leads to is expected here. "
+                                                    "If left like this, this exit will be deleted when <tt>save</tt> is clicked.")));
 
-        pSpecialExit->setIcon(ExitsTreeWidget::colIndex_exitStatus, !showIconOnExitStatus
-                              ? QIcon()
-                              : exitRoomLocked
-                                ? mIcon_exitRoomLocked
-                                : outOfAreaExit
-                                  ? mIcon_otherAreaExit
-                                  : mIcon_inAreaExit);
+        pSpecialExit->setIcon(ExitsTreeWidget::colIndex_exitStatus, !showIconOnExitStatus ? QIcon() : exitRoomLocked ? mIcon_exitRoomLocked : outOfAreaExit ? mIcon_otherAreaExit : mIcon_inAreaExit);
         pSpecialExit->setToolTip(ExitsTreeWidget::colIndex_exitRoomId, roomIdToolTipText);
         pSpecialExit->setToolTip(ExitsTreeWidget::colIndex_exitStatus, roomIdToolTipText);
 
     } else if (pSpecialExit->text(ExitsTreeWidget::colIndex_exitRoomId).toInt() > 0) {
         // A number but not valid:
         pSpecialExit->setIcon(ExitsTreeWidget::colIndex_exitStatus, showIconOnExitStatus ? mIcon_invalidExit : QIcon());
-        pSpecialExit->setToolTip(ExitsTreeWidget::colIndex_exitRoomId, doubleParagraph.arg(tr("Entered number is invalid. If left like this, this exit will be deleted when <tt>save</tt> is clicked."),
-                                                                                           tr("Set the number of the room that this special exit leads to.")));
+        pSpecialExit->setToolTip(ExitsTreeWidget::colIndex_exitRoomId,
+                                 doubleParagraph.arg(tr("Entered number is invalid. If left like this, this exit will be deleted when <tt>save</tt> is clicked."),
+                                                     tr("Set the number of the room that this special exit leads to.")));
     } else if (pSpecialExit->text(ExitsTreeWidget::colIndex_exitRoomId).isEmpty() || pSpecialExit->text(ExitsTreeWidget::colIndex_exitRoomId) == mSpecialExitRoomIdPlaceholder) {
         // Nothing:
         pSpecialExit->setIcon(ExitsTreeWidget::colIndex_exitStatus, QIcon());
@@ -989,23 +1055,22 @@ void dlgRoomExits::setIconAndToolTipsOnSpecialExit(QTreeWidgetItem* pSpecialExit
     } else {
         // Something else that isn't a positive number:
         pSpecialExit->setIcon(ExitsTreeWidget::colIndex_exitStatus, showIconOnExitStatus ? mIcon_invalidExit : QIcon());
-        pSpecialExit->setToolTip(ExitsTreeWidget::colIndex_exitRoomId, utils::richText(tr("The roomID of the room that this special exit leads to is expected here. "
-                                                                                          "If left like this, this exit will be deleted when <tt>save</tt> is clicked.")));
+        //: Tooltip for invalid room ID in special exits
+        pSpecialExit->setToolTip(ExitsTreeWidget::colIndex_exitRoomId, utils::richText(tr("Invalid room ID: exit will be deleted on save.")));
     }
 
     if (pSpecialExit->text(ExitsTreeWidget::colIndex_command) == mSpecialExitCommandPlaceholder) {
-        pSpecialExit->setToolTip(ExitsTreeWidget::colIndex_command, utils::richText(tr("No command or Lua script entered, if left like this, this exit will be deleted when <tt>save</tt> is clicked.")));
+        pSpecialExit->setToolTip(ExitsTreeWidget::colIndex_command,
+                                 utils::richText(tr("No command or Lua script entered, if left like this, this exit will be deleted when <tt>save</tt> is clicked.")));
     } else {
-        pSpecialExit->setToolTip(ExitsTreeWidget::colIndex_command, utils::richText(tr("(Lua scripts for those profiles using the <tt>mudlet-mapper</tt> package need to be prefixed with \"script:\").")));
+        pSpecialExit->setToolTip(ExitsTreeWidget::colIndex_command, utils::richText(tr("Some mapper scripts may require prefixing the keyword \"script:\").")));
     }
 }
 
 void dlgRoomExits::setActionOnExit(QLineEdit* pExitLineEdit, QAction* pWantedAction) const
 {
-    auto pActions = pExitLineEdit->actions();
     bool found = false;
-    for (int index = 0, total = pActions.count(); index < total; ++index) {
-        auto pAction = pActions[index];
+    for (auto pAction : pExitLineEdit->actions()) {
         if (pAction && mAllExitActionsSet.contains(pAction)) {
             // This is one of the set we are looking for.
             if (pAction != pWantedAction) {
@@ -1028,9 +1093,7 @@ void dlgRoomExits::setActionOnExit(QLineEdit* pExitLineEdit, QAction* pWantedAct
 // icon on the ExitRoomID - this is actually only used for the special exits:
 QAction* dlgRoomExits::getActionOnExit(QLineEdit* pExitLineEdit) const
 {
-    auto pActions = pExitLineEdit->actions();
-    for (int index = 0, total = pActions.count(); index < total; ++index) {
-        auto pAction = pActions[index];
+    for (auto pAction : pExitLineEdit->actions()) {
         if (pAction && mAllExitActionsSet.contains(pAction)) {
             // This is one of the four we are looking for.
             return pAction;
@@ -1042,36 +1105,30 @@ QAction* dlgRoomExits::getActionOnExit(QLineEdit* pExitLineEdit) const
 
 /* static */ QString dlgRoomExits::generateToolTip(const QString& exitRoomName, const QString& exitAreaName, const bool exitRoomLocked, const bool outOfAreaExit, const int exitRoomWeight)
 {
-    if (exitRoomName.trimmed().length()) {
+    if (!exitRoomName.trimmed().isEmpty()) {
         if (exitRoomLocked) {
             if (outOfAreaExit) {
-                return doubleParagraph.arg(tr("Exit to \"%1\" in area: \"%2\".")
-                                               .arg(exitRoomName.toHtmlEscaped(), exitAreaName.toHtmlEscaped()),
+                return doubleParagraph.arg(tr("Exit to \"%1\" in area: \"%2\".").arg(exitRoomName.toHtmlEscaped(), exitAreaName.toHtmlEscaped()),
                                            //: Bold HTML tags are used to emphasis that destination room locked status overrides any weight or lock ("No route") setting of any exit that goes to it.
                                            tr("<b>Room is locked</b>, it will not be used for speed-walks for any exit that leads to it."));
             }
-            return doubleParagraph.arg(tr("Exit to \"%1\".")
-                                           .arg(exitRoomName.toHtmlEscaped()),
+            return doubleParagraph.arg(tr("Exit to \"%1\".").arg(exitRoomName.toHtmlEscaped()),
                                        //: Bold HTML tags are used to emphasis that destination room locked status overrides any weight or lock ("No route") setting of any exit that goes to it.
                                        tr("<b>Room is locked</b>, it will not be used for speed-walks for any exit that leads to it."));
-
         }
         if (outOfAreaExit) {
-            return doubleParagraph.arg(tr("Exit to \"%1\" in area: \"%2\".")
-                                           .arg(exitRoomName.toHtmlEscaped(), exitAreaName.toHtmlEscaped()),
+            return doubleParagraph.arg(tr("Exit to \"%1\" in area: \"%2\".").arg(exitRoomName.toHtmlEscaped(), exitAreaName.toHtmlEscaped()),
                                        //: Bold HTML tags are used to emphasis that the value is destination room's weight whether overridden by a non-zero exit weight here or not
                                        tr("<b>Room</b> Weight of destination: %1.").arg(exitRoomWeight));
         }
-        return doubleParagraph.arg(tr("Exit to \"%1\".")
-                                       .arg(exitRoomName.toHtmlEscaped()),
+        return doubleParagraph.arg(tr("Exit to \"%1\".").arg(exitRoomName.toHtmlEscaped()),
                                    //: Bold HTML tags are used to emphasis that the value is destination room's weight whether overridden by a non-zero exit weight here or not
                                    tr("<b>Room</b> Weight of destination: %1.").arg(exitRoomWeight));
     }
 
     if (exitRoomLocked) {
         if (outOfAreaExit) {
-            return doubleParagraph.arg(tr("Exit to unnamed room in area: \"%1\", is valid.")
-                                           .arg(exitAreaName.toHtmlEscaped()),
+            return doubleParagraph.arg(tr("Exit to unnamed room in area: \"%1\", is valid.").arg(exitAreaName.toHtmlEscaped()),
                                        //: Bold HTML tags are used to emphasis that destination room locked status overrides any weight or lock ("No route") setting of any exit that goes to it.
                                        tr("<b>Room is locked</b>, it will not be used for speed-walks for any exit that leads to it."));
         }
@@ -1082,8 +1139,7 @@ QAction* dlgRoomExits::getActionOnExit(QLineEdit* pExitLineEdit) const
     }
 
     if (outOfAreaExit) {
-        return doubleParagraph.arg(tr("Exit to unnamed room in area: \"%1\", is valid.")
-                                       .arg(exitAreaName.toHtmlEscaped()),
+        return doubleParagraph.arg(tr("Exit to unnamed room in area: \"%1\", is valid.").arg(exitAreaName.toHtmlEscaped()),
                                    //: Bold HTML tags are used to emphasis that the value is destination room's weight whether overridden by a non-zero exit weight here or not.
                                    tr("<b>Room</b> Weight of destination: %1.").arg(exitRoomWeight));
     }
@@ -1093,7 +1149,17 @@ QAction* dlgRoomExits::getActionOnExit(QLineEdit* pExitLineEdit) const
                                tr("<b>Room</b> Weight of destination: %1.").arg(exitRoomWeight));
 }
 
-void dlgRoomExits::normalExitEdited(const QString& roomExitIdText, QLineEdit* pExit, QCheckBox* pNoRoute, QCheckBox* pStub, QSpinBox* pWeight, QRadioButton* pDoorType_none, QRadioButton* pDoorType_open, QRadioButton* pDoorType_closed, QRadioButton* pDoorType_locked, const QString& invalidExitToolTipText, const QString& noExitToolTipText)
+void dlgRoomExits::normalExitEdited(const QString& roomExitIdText,
+                                    QLineEdit* pExit,
+                                    QCheckBox* pNoRoute,
+                                    QCheckBox* pStub,
+                                    QSpinBox* pWeight,
+                                    QRadioButton* pDoorType_none,
+                                    QRadioButton* pDoorType_open,
+                                    QRadioButton* pDoorType_closed,
+                                    QRadioButton* pDoorType_locked,
+                                    const QString& invalidExitToolTipText,
+                                    const QString& noExitToolTipText)
 {
     TRoom* exitToRoom = mpHost->mpMap->mpRoomDB->getRoom(roomExitIdText.toInt());
     if (exitToRoom) {
@@ -1113,11 +1179,7 @@ void dlgRoomExits::normalExitEdited(const QString& roomExitIdText, QLineEdit* pE
         pDoorType_open->setEnabled(true);
         pDoorType_closed->setEnabled(true);
         pDoorType_locked->setEnabled(true);
-        setActionOnExit(pExit, exitRoomLocked
-                        ? mpAction_exitRoomLocked
-                        : outOfAreaExit
-                          ? mpAction_otherAreaExit
-                          : mpAction_inAreaExit);
+        setActionOnExit(pExit, exitRoomLocked ? mpAction_exitRoomLocked : outOfAreaExit ? mpAction_otherAreaExit : mpAction_inAreaExit);
         pExit->setToolTip(generateToolTip(exitToRoom->name, exitAreaName, exitRoomLocked, outOfAreaExit, exitToRoom->getWeight()));
     } else {
         if (!roomExitIdText.isEmpty()) {
@@ -1140,10 +1202,17 @@ void dlgRoomExits::normalExitEdited(const QString& roomExitIdText, QLineEdit* pE
         pDoorType_locked->setEnabled(false);
         pStub->setEnabled(true);
     }
- }
+}
 
-void dlgRoomExits::normalStubExitChanged(const int state, QLineEdit* pExit, QCheckBox* pNoRoute, QSpinBox* pWeight,
-                                         QRadioButton* pDoorType_none, QRadioButton* pDoorType_open, QRadioButton* pDoorType_closed, QRadioButton* pDoorType_locked, const QString& noExitToolTipText) const
+void dlgRoomExits::normalStubExitChanged(const int state,
+                                         QLineEdit* pExit,
+                                         QCheckBox* pNoRoute,
+                                         QSpinBox* pWeight,
+                                         QRadioButton* pDoorType_none,
+                                         QRadioButton* pDoorType_open,
+                                         QRadioButton* pDoorType_closed,
+                                         QRadioButton* pDoorType_locked,
+                                         const QString& noExitToolTipText) const
 {
     if (state == Qt::Checked) {
         if (!pExit->text().isEmpty()) {
@@ -1151,11 +1220,10 @@ void dlgRoomExits::normalStubExitChanged(const int state, QLineEdit* pExit, QChe
             // Id still in that field - so clear it:
             pExit->setText(QString());
             setActionOnExit(pExit, mpAction_noExit);
-            pWeight->setValue(0);        // Can't have a weight for a stub pExit
-            pNoRoute->setChecked(false); // nor a "lock"
+            pWeight->setValue(0); // Can't have a weight for a stub pExit
         }
-        pNoRoute->setEnabled(false); // Disable "lock" on this exit
-        pExit->setEnabled(false);         // Prevent entry of an exit roomID
+        pNoRoute->setEnabled(true); // Permit a stub to be locked ("No route"), matching what the Lua API allows
+        pExit->setEnabled(false);   // Prevent entry of an exit roomID
         pExit->setToolTip(utils::richText(tr("Clear the stub exit for this exit to enter an exit roomID.")));
         pDoorType_none->setEnabled(true);
         pDoorType_open->setEnabled(true);
@@ -1166,8 +1234,11 @@ void dlgRoomExits::normalStubExitChanged(const int state, QLineEdit* pExit, QChe
         pExit->setEnabled(true);
         setActionOnExit(pExit, mpAction_noExit);
         pExit->setToolTip(noExitToolTipText);
-        //  pNoRoute->setEnabled(true); although this branch will enable the exit entry
-        //  there will not be a valid one there yet so don't enable the noroute(lock) control here!
+        // Although this branch enables the exit entry there will not be a valid
+        // exit nor a stub there yet, so there is nothing to lock - disable and
+        // clear the noroute(lock) control:
+        pNoRoute->setEnabled(false);
+        pNoRoute->setChecked(false);
         pDoorType_none->setEnabled(false);
         pDoorType_open->setEnabled(false);
         pDoorType_closed->setEnabled(false);
@@ -1182,8 +1253,15 @@ void dlgRoomExits::normalStubExitChanged(const int state, QLineEdit* pExit, QChe
 // These slots are called as the text for the exitID is edited
 void dlgRoomExits::slot_nw_textEdited(const QString& text)
 {
-    normalExitEdited(text, nw, noroute_nw, stub_nw, weight_nw,
-                     doortype_none_nw, doortype_open_nw, doortype_closed_nw, doortype_locked_nw,
+    normalExitEdited(text,
+                     nw,
+                     noroute_nw,
+                     stub_nw,
+                     weight_nw,
+                     doortype_none_nw,
+                     doortype_open_nw,
+                     doortype_closed_nw,
+                     doortype_locked_nw,
                      doubleParagraph.arg(tr("Entered number is invalid."), tr("Set the number of the room northwest of this one.")),
                      utils::richText(tr("Set the number of the room northwest of this one.")));
     slot_checkModified();
@@ -1191,8 +1269,15 @@ void dlgRoomExits::slot_nw_textEdited(const QString& text)
 
 void dlgRoomExits::slot_n_textEdited(const QString& text)
 {
-    normalExitEdited(text, n, noroute_n, stub_n, weight_n,
-                     doortype_none_n, doortype_open_n, doortype_closed_n, doortype_locked_n,
+    normalExitEdited(text,
+                     n,
+                     noroute_n,
+                     stub_n,
+                     weight_n,
+                     doortype_none_n,
+                     doortype_open_n,
+                     doortype_closed_n,
+                     doortype_locked_n,
                      doubleParagraph.arg(tr("Entered number is invalid."), tr("Set the number of the room north of this one.")),
                      utils::richText(tr("Set the number of the room north of this one.")));
     slot_checkModified();
@@ -1200,8 +1285,15 @@ void dlgRoomExits::slot_n_textEdited(const QString& text)
 
 void dlgRoomExits::slot_ne_textEdited(const QString& text)
 {
-    normalExitEdited(text, ne, noroute_ne, stub_ne, weight_ne,
-                     doortype_none_ne, doortype_open_ne, doortype_closed_ne, doortype_locked_ne,
+    normalExitEdited(text,
+                     ne,
+                     noroute_ne,
+                     stub_ne,
+                     weight_ne,
+                     doortype_none_ne,
+                     doortype_open_ne,
+                     doortype_closed_ne,
+                     doortype_locked_ne,
                      doubleParagraph.arg(tr("Entered number is invalid."), tr("Set the number of the room northeast of this one.")),
                      utils::richText(tr("Set the number of the room northeast of this one.")));
     slot_checkModified();
@@ -1209,8 +1301,15 @@ void dlgRoomExits::slot_ne_textEdited(const QString& text)
 
 void dlgRoomExits::slot_up_textEdited(const QString& text)
 {
-    normalExitEdited(text, up, noroute_up, stub_up, weight_up,
-                     doortype_none_up, doortype_open_up, doortype_closed_up, doortype_locked_up,
+    normalExitEdited(text,
+                     up,
+                     noroute_up,
+                     stub_up,
+                     weight_up,
+                     doortype_none_up,
+                     doortype_open_up,
+                     doortype_closed_up,
+                     doortype_locked_up,
                      doubleParagraph.arg(tr("Entered number is invalid."), tr("Set the number of the room up from this one.")),
                      utils::richText(tr("Set the number of the room up from this one.")));
     slot_checkModified();
@@ -1218,8 +1317,15 @@ void dlgRoomExits::slot_up_textEdited(const QString& text)
 
 void dlgRoomExits::slot_w_textEdited(const QString& text)
 {
-    normalExitEdited(text, w, noroute_w, stub_w, weight_w,
-                     doortype_none_w, doortype_open_w, doortype_closed_w, doortype_locked_w,
+    normalExitEdited(text,
+                     w,
+                     noroute_w,
+                     stub_w,
+                     weight_w,
+                     doortype_none_w,
+                     doortype_open_w,
+                     doortype_closed_w,
+                     doortype_locked_w,
                      doubleParagraph.arg(tr("Entered number is invalid."), tr("Set the number of the room west of this one.")),
                      utils::richText(tr("Set the number of the room west of this one.")));
     slot_checkModified();
@@ -1227,8 +1333,15 @@ void dlgRoomExits::slot_w_textEdited(const QString& text)
 
 void dlgRoomExits::slot_e_textEdited(const QString& text)
 {
-    normalExitEdited(text, e, noroute_e, stub_e, weight_e,
-                     doortype_none_e, doortype_open_e, doortype_closed_e, doortype_locked_e,
+    normalExitEdited(text,
+                     e,
+                     noroute_e,
+                     stub_e,
+                     weight_e,
+                     doortype_none_e,
+                     doortype_open_e,
+                     doortype_closed_e,
+                     doortype_locked_e,
                      doubleParagraph.arg(tr("Entered number is invalid."), tr("Set the number of the room east of this one.")),
                      utils::richText(tr("Set the number of the room east of this one.")));
     slot_checkModified();
@@ -1236,8 +1349,15 @@ void dlgRoomExits::slot_e_textEdited(const QString& text)
 
 void dlgRoomExits::slot_down_textEdited(const QString& text)
 {
-    normalExitEdited(text, down, noroute_down, stub_down, weight_down,
-                     doortype_none_down, doortype_open_down, doortype_closed_down, doortype_locked_down,
+    normalExitEdited(text,
+                     down,
+                     noroute_down,
+                     stub_down,
+                     weight_down,
+                     doortype_none_down,
+                     doortype_open_down,
+                     doortype_closed_down,
+                     doortype_locked_down,
                      doubleParagraph.arg(tr("Entered number is invalid."), tr("Set the number of the room down from this one.")),
                      utils::richText(tr("Set the number of the room down from this one.")));
     slot_checkModified();
@@ -1245,8 +1365,15 @@ void dlgRoomExits::slot_down_textEdited(const QString& text)
 
 void dlgRoomExits::slot_sw_textEdited(const QString& text)
 {
-    normalExitEdited(text, sw, noroute_sw, stub_sw, weight_sw,
-                     doortype_none_sw, doortype_open_sw, doortype_closed_sw, doortype_locked_sw,
+    normalExitEdited(text,
+                     sw,
+                     noroute_sw,
+                     stub_sw,
+                     weight_sw,
+                     doortype_none_sw,
+                     doortype_open_sw,
+                     doortype_closed_sw,
+                     doortype_locked_sw,
                      doubleParagraph.arg(tr("Entered number is invalid."), tr("Set the number of the room southwest of this one.")),
                      utils::richText(tr("Set the number of the room southwest of this one.")));
     slot_checkModified();
@@ -1254,8 +1381,15 @@ void dlgRoomExits::slot_sw_textEdited(const QString& text)
 
 void dlgRoomExits::slot_s_textEdited(const QString& text)
 {
-    normalExitEdited(text, s, noroute_s, stub_s, weight_s,
-                     doortype_none_s, doortype_open_s, doortype_closed_s, doortype_locked_s,
+    normalExitEdited(text,
+                     s,
+                     noroute_s,
+                     stub_s,
+                     weight_s,
+                     doortype_none_s,
+                     doortype_open_s,
+                     doortype_closed_s,
+                     doortype_locked_s,
                      doubleParagraph.arg(tr("Entered number is invalid."), tr("Set the number of the room south of this one.")),
                      utils::richText(tr("Set the number of the room south of this one.")));
     slot_checkModified();
@@ -1263,8 +1397,15 @@ void dlgRoomExits::slot_s_textEdited(const QString& text)
 
 void dlgRoomExits::slot_se_textEdited(const QString& text)
 {
-    normalExitEdited(text, se, noroute_se, stub_se, weight_se,
-                     doortype_none_se, doortype_open_se, doortype_closed_se, doortype_locked_se,
+    normalExitEdited(text,
+                     se,
+                     noroute_se,
+                     stub_se,
+                     weight_se,
+                     doortype_none_se,
+                     doortype_open_se,
+                     doortype_closed_se,
+                     doortype_locked_se,
                      doubleParagraph.arg(tr("Entered number is invalid."), tr("Set the number of the room southeast of this one.")),
                      utils::richText(tr("Set the number of the room southeast of this one.")));
     slot_checkModified();
@@ -1272,8 +1413,15 @@ void dlgRoomExits::slot_se_textEdited(const QString& text)
 
 void dlgRoomExits::slot_in_textEdited(const QString& text)
 {
-    normalExitEdited(text, in, noroute_in, stub_in, weight_in,
-                     doortype_none_in, doortype_open_in, doortype_closed_in, doortype_locked_in,
+    normalExitEdited(text,
+                     in,
+                     noroute_in,
+                     stub_in,
+                     weight_in,
+                     doortype_none_in,
+                     doortype_open_in,
+                     doortype_closed_in,
+                     doortype_locked_in,
                      doubleParagraph.arg(tr("Entered number is invalid."), tr("Set the number of the room in from this one.")),
                      utils::richText(tr("Set the number of the room in from this one.")));
     slot_checkModified();
@@ -1281,8 +1429,15 @@ void dlgRoomExits::slot_in_textEdited(const QString& text)
 
 void dlgRoomExits::slot_out_textEdited(const QString& text)
 {
-    normalExitEdited(text, out, noroute_out, stub_out, weight_out,
-                     doortype_none_out, doortype_open_out, doortype_closed_out, doortype_locked_out,
+    normalExitEdited(text,
+                     out,
+                     noroute_out,
+                     stub_out,
+                     weight_out,
+                     doortype_none_out,
+                     doortype_open_out,
+                     doortype_closed_out,
+                     doortype_locked_out,
                      doubleParagraph.arg(tr("Entered number is invalid."), tr("Set the number of the room out from this one.")),
                      utils::richText(tr("Set the number of the room out from this one.")));
     slot_checkModified();
@@ -1291,97 +1446,88 @@ void dlgRoomExits::slot_out_textEdited(const QString& text)
 // These slots are called as the stub exit checkboxes are clicked
 void dlgRoomExits::slot_stub_nw_stateChanged(int state)
 {
-    normalStubExitChanged(state, nw, noroute_nw, weight_nw,
-                          doortype_none_nw, doortype_open_nw, doortype_closed_nw, doortype_locked_n,
-                          utils::richText(tr("Set the number of the room northwest of this one.")));
+    normalStubExitChanged(
+            state, nw, noroute_nw, weight_nw, doortype_none_nw, doortype_open_nw, doortype_closed_nw, doortype_locked_nw, utils::richText(tr("Set the number of the room northwest of this one.")));
     slot_checkModified();
 }
 
 void dlgRoomExits::slot_stub_n_stateChanged(int state)
 {
-    normalStubExitChanged(state, n, noroute_n, weight_n,
-                          doortype_none_n, doortype_open_n, doortype_closed_n, doortype_locked_n,
-                          utils::richText(tr("Set the number of the room north of this one.")));
+    normalStubExitChanged(state, n, noroute_n, weight_n, doortype_none_n, doortype_open_n, doortype_closed_n, doortype_locked_n, utils::richText(tr("Set the number of the room north of this one.")));
     slot_checkModified();
 }
 
 void dlgRoomExits::slot_stub_ne_stateChanged(int state)
 {
-    normalStubExitChanged(state, ne, noroute_ne, weight_ne,
-                          doortype_none_ne, doortype_open_ne, doortype_closed_ne, doortype_locked_ne,
-                          utils::richText(tr("Set the number of the room northeast of this one.")));
+    normalStubExitChanged(
+            state, ne, noroute_ne, weight_ne, doortype_none_ne, doortype_open_ne, doortype_closed_ne, doortype_locked_ne, utils::richText(tr("Set the number of the room northeast of this one.")));
     slot_checkModified();
 }
 
 void dlgRoomExits::slot_stub_up_stateChanged(int state)
 {
-    normalStubExitChanged(state, up, noroute_up, weight_up,
-                          doortype_none_up, doortype_open_up, doortype_closed_up, doortype_locked_up,
-                          utils::richText(tr("Set the number of the room up from this one.")));
+    normalStubExitChanged(
+            state, up, noroute_up, weight_up, doortype_none_up, doortype_open_up, doortype_closed_up, doortype_locked_up, utils::richText(tr("Set the number of the room up from this one.")));
     slot_checkModified();
 }
 
 void dlgRoomExits::slot_stub_w_stateChanged(int state)
 {
-    normalStubExitChanged(state, w, noroute_w, weight_w,
-                          doortype_none_w, doortype_open_w, doortype_closed_w, doortype_locked_w,
-                          utils::richText(tr("Set the number of the room west of this one.")));
+    normalStubExitChanged(state, w, noroute_w, weight_w, doortype_none_w, doortype_open_w, doortype_closed_w, doortype_locked_w, utils::richText(tr("Set the number of the room west of this one.")));
     slot_checkModified();
 }
 
 void dlgRoomExits::slot_stub_e_stateChanged(int state)
 {
-    normalStubExitChanged(state, e, noroute_e, weight_e,
-                          doortype_none_e, doortype_open_e, doortype_closed_e, doortype_locked_e,
-                          utils::richText(tr("Set the number of the room east of this one.")));
+    normalStubExitChanged(state, e, noroute_e, weight_e, doortype_none_e, doortype_open_e, doortype_closed_e, doortype_locked_e, utils::richText(tr("Set the number of the room east of this one.")));
     slot_checkModified();
 }
 
 void dlgRoomExits::slot_stub_down_stateChanged(int state)
 {
-    normalStubExitChanged(state, down, noroute_down, weight_down,
-                          doortype_none_down, doortype_open_down, doortype_closed_down, doortype_locked_down,
+    normalStubExitChanged(state,
+                          down,
+                          noroute_down,
+                          weight_down,
+                          doortype_none_down,
+                          doortype_open_down,
+                          doortype_closed_down,
+                          doortype_locked_down,
                           utils::richText(tr("Set the number of the room down from this one.")));
     slot_checkModified();
 }
 
 void dlgRoomExits::slot_stub_sw_stateChanged(int state)
 {
-    normalStubExitChanged(state, sw, noroute_sw, weight_sw,
-                          doortype_none_sw, doortype_open_sw, doortype_closed_sw, doortype_locked_sw,
-                          utils::richText(tr("Set the number of the room southwest of this one.")));
+    normalStubExitChanged(
+            state, sw, noroute_sw, weight_sw, doortype_none_sw, doortype_open_sw, doortype_closed_sw, doortype_locked_sw, utils::richText(tr("Set the number of the room southwest of this one.")));
     slot_checkModified();
 }
 
 void dlgRoomExits::slot_stub_s_stateChanged(int state)
 {
-    normalStubExitChanged(state, s, noroute_s, weight_s,
-                          doortype_none_s, doortype_open_s, doortype_closed_s, doortype_locked_s,
-                          utils::richText(tr("Set the number of the room south of this one.")));
+    normalStubExitChanged(state, s, noroute_s, weight_s, doortype_none_s, doortype_open_s, doortype_closed_s, doortype_locked_s, utils::richText(tr("Set the number of the room south of this one.")));
     slot_checkModified();
 }
 
 void dlgRoomExits::slot_stub_se_stateChanged(int state)
 {
-    normalStubExitChanged(state, se, noroute_se, weight_se,
-                          doortype_none_se, doortype_open_se, doortype_closed_se, doortype_locked_se,
-                          utils::richText(tr("Set the number of the room southeast of this one.")));
+    normalStubExitChanged(
+            state, se, noroute_se, weight_se, doortype_none_se, doortype_open_se, doortype_closed_se, doortype_locked_se, utils::richText(tr("Set the number of the room southeast of this one.")));
     slot_checkModified();
 }
 
 void dlgRoomExits::slot_stub_in_stateChanged(int state)
 {
-    normalStubExitChanged(state, in, noroute_in, weight_in,
-                          doortype_none_in, doortype_open_in, doortype_closed_in, doortype_locked_in,
-                          utils::richText(tr("Set the number of the room in from this one.")));
+    normalStubExitChanged(
+            state, in, noroute_in, weight_in, doortype_none_in, doortype_open_in, doortype_closed_in, doortype_locked_in, utils::richText(tr("Set the number of the room in from this one.")));
     slot_checkModified();
 }
 
 void dlgRoomExits::slot_stub_out_stateChanged(int state)
 {
-    normalStubExitChanged(state, out, noroute_out, weight_out,
-                          doortype_none_out, doortype_open_out, doortype_closed_out, doortype_locked_out,
-                          utils::richText(tr("Set the number of the room out from this one.")));
+    normalStubExitChanged(
+            state, out, noroute_out, weight_out, doortype_none_out, doortype_open_out, doortype_closed_out, doortype_locked_out, utils::richText(tr("Set the number of the room out from this one.")));
     slot_checkModified();
 }
 
@@ -1399,18 +1545,42 @@ void dlgRoomExits::initExit(int direction,
 {
     QString doorAndWeightText; // lowercase, initials for XY-plane, words for others
     switch (direction) {
-        case DIR_NORTHWEST: doorAndWeightText = qsl("nw");   break;
-        case DIR_NORTH    : doorAndWeightText = qsl("n");    break;
-        case DIR_NORTHEAST: doorAndWeightText = qsl("ne");   break;
-        case DIR_UP       : doorAndWeightText = qsl("up");   break;
-        case DIR_WEST     : doorAndWeightText = qsl("w");    break;
-        case DIR_EAST     : doorAndWeightText = qsl("e");    break;
-        case DIR_DOWN     : doorAndWeightText = qsl("down"); break;
-        case DIR_SOUTHWEST: doorAndWeightText = qsl("sw");   break;
-        case DIR_SOUTH    : doorAndWeightText = qsl("s");    break;
-        case DIR_SOUTHEAST: doorAndWeightText = qsl("se");   break;
-        case DIR_IN       : doorAndWeightText = qsl("in");   break;
-        case DIR_OUT      : doorAndWeightText = qsl("out");  break;
+    case DIR_NORTHWEST:
+        doorAndWeightText = qsl("nw");
+        break;
+    case DIR_NORTH:
+        doorAndWeightText = qsl("n");
+        break;
+    case DIR_NORTHEAST:
+        doorAndWeightText = qsl("ne");
+        break;
+    case DIR_UP:
+        doorAndWeightText = qsl("up");
+        break;
+    case DIR_WEST:
+        doorAndWeightText = qsl("w");
+        break;
+    case DIR_EAST:
+        doorAndWeightText = qsl("e");
+        break;
+    case DIR_DOWN:
+        doorAndWeightText = qsl("down");
+        break;
+    case DIR_SOUTHWEST:
+        doorAndWeightText = qsl("sw");
+        break;
+    case DIR_SOUTH:
+        doorAndWeightText = qsl("s");
+        break;
+    case DIR_SOUTHEAST:
+        doorAndWeightText = qsl("se");
+        break;
+    case DIR_IN:
+        doorAndWeightText = qsl("in");
+        break;
+    case DIR_OUT:
+        doorAndWeightText = qsl("out");
+        break;
     }
 
     weight->setValue(pR->hasExitWeight(doorAndWeightText) ? pR->getExitWeight(doorAndWeightText) : 0);
@@ -1452,11 +1622,7 @@ void dlgRoomExits::initExit(int direction,
         if (outOfAreaExit) {
             exitAreaName = mpHost->mpMap->mpRoomDB->getAreaNamesMap().value(exitAreaID);
         }
-        setActionOnExit(exitLineEdit, exitRoomLocked
-                        ? mpAction_exitRoomLocked
-                        : outOfAreaExit
-                          ? mpAction_otherAreaExit
-                          : mpAction_inAreaExit);
+        setActionOnExit(exitLineEdit, exitRoomLocked ? mpAction_exitRoomLocked : outOfAreaExit ? mpAction_otherAreaExit : mpAction_inAreaExit);
         exitLineEdit->setToolTip(generateToolTip(pExitR->name, exitAreaName, exitRoomLocked, outOfAreaExit, pExitR->getWeight()));
         noRoute->setEnabled(true); //Enable speedwalk lock control
         none->setEnabled(true);    //Enable door type controls...
@@ -1470,16 +1636,16 @@ void dlgRoomExits::initExit(int direction,
     } else {                                             //No exit is set on initialisation
         exitLineEdit->setText(QString());                //Nothing to put in exitID box
         setActionOnExit(exitLineEdit, mpAction_noExit);
-        noRoute->setEnabled(false); //Disable lock control, can't lock a non-existent exit..
-        noRoute->setChecked(false); //.. and ensure there isn't one
-        weight->setEnabled(false);  //Disable exit weight control...
-        weight->setValue(0);        //And reset to default value (which will now cause the room's one to be used
-        stub->setEnabled(true);     //Enable stub exit control
+        weight->setEnabled(false); //Disable exit weight control...
+        weight->setValue(0);       //And reset to default value (which will now cause the room's one to be used
+        stub->setEnabled(true);    //Enable stub exit control
         if (pR->hasExitStub(direction)) {
             exitLineEdit->setEnabled(false); //There is a stub exit, so prevent exit number entry...
             exitLineEdit->setToolTip(utils::richText(tr("Clear the stub exit for this exit to enter an exit roomID.")));
             stub->setChecked(true);
-            none->setEnabled(true); //Enable door type controls, can have a door on a stub exit..
+            noRoute->setEnabled(true);                       //A stub can be locked ("No route"), matching the Lua API
+            noRoute->setChecked(pR->hasExitLock(direction)); //Set/reset "lock" control as appropriate
+            none->setEnabled(true);                          //Enable door type controls, can have a door on a stub exit..
             open->setEnabled(true);
             closed->setEnabled(true);
             locked->setEnabled(true);
@@ -1487,8 +1653,10 @@ void dlgRoomExits::initExit(int direction,
             exitLineEdit->setEnabled(true);
             exitLineEdit->setToolTip(validExitToolTip);
             stub->setChecked(false);
-            none->setEnabled(false); //Disable door type controls, can't lock a non-existent exit..
-            open->setEnabled(false); //.. and ensure the "none" one is set if it ever gets enabled
+            noRoute->setEnabled(false); //Disable lock control, can't lock a non-existent exit..
+            noRoute->setChecked(false); //.. and ensure there isn't one
+            none->setEnabled(false);    //Disable door type controls, can't lock a non-existent exit..
+            open->setEnabled(false);    //.. and ensure the "none" one is set if it ever gets enabled
             closed->setEnabled(false);
             locked->setEnabled(false);
             none->setChecked(true);
@@ -1503,6 +1671,7 @@ void dlgRoomExits::init()
     if (!pR) {
         return;
     }
+    mRoomSerial = pR->serial();
 
     roomID->setText(QString::number(mRoomID));
     if (pR->isLocked) {
@@ -1517,7 +1686,7 @@ void dlgRoomExits::init()
     mAreaID = pR->getArea();
     roomWeight->setText(QString::number(pR->getWeight()));
     QString titleText;
-    if (pR->name.trimmed().length()) {
+    if (!pR->name.trimmed().isEmpty()) {
         titleText = tr(R"(Exits for room: "%1" [*])").arg(pR->name);
     } else {
         titleText = tr("Exits for room Id: %1 [*]").arg(mRoomID);
@@ -1528,38 +1697,156 @@ void dlgRoomExits::init()
     // Because we are manipulating the settings for the exit we need to know
     // explicitly where the weight comes from, pR->getExitWeight() hides that
     // detail deliberately for normal usage
-    initExit(DIR_NORTHWEST, pR->getExit(DIR_NORTHWEST), nw, noroute_nw, stub_nw, doortype_none_nw, doortype_open_nw, doortype_closed_nw, doortype_locked_nw, weight_nw, utils::richText(tr("Set the number of the room northwest of this one.")));
+    initExit(DIR_NORTHWEST,
+             pR->getExit(DIR_NORTHWEST),
+             nw,
+             noroute_nw,
+             stub_nw,
+             doortype_none_nw,
+             doortype_open_nw,
+             doortype_closed_nw,
+             doortype_locked_nw,
+             weight_nw,
+             utils::richText(tr("Set the number of the room northwest of this one.")));
 
-    initExit(DIR_NORTH, pR->getExit(DIR_NORTH), n, noroute_n, stub_n, doortype_none_n, doortype_open_n, doortype_closed_n, doortype_locked_n, weight_n, utils::richText(tr("Set the number of the room north of this one.")));
+    initExit(DIR_NORTH,
+             pR->getExit(DIR_NORTH),
+             n,
+             noroute_n,
+             stub_n,
+             doortype_none_n,
+             doortype_open_n,
+             doortype_closed_n,
+             doortype_locked_n,
+             weight_n,
+             utils::richText(tr("Set the number of the room north of this one.")));
 
-    initExit(DIR_NORTHEAST, pR->getExit(DIR_NORTHEAST), ne, noroute_ne, stub_ne, doortype_none_ne, doortype_open_ne, doortype_closed_ne, doortype_locked_ne, weight_ne, utils::richText(tr("Set the number of the room northeast of this one.")));
+    initExit(DIR_NORTHEAST,
+             pR->getExit(DIR_NORTHEAST),
+             ne,
+             noroute_ne,
+             stub_ne,
+             doortype_none_ne,
+             doortype_open_ne,
+             doortype_closed_ne,
+             doortype_locked_ne,
+             weight_ne,
+             utils::richText(tr("Set the number of the room northeast of this one.")));
 
-    initExit(DIR_UP, pR->getExit(DIR_UP), up, noroute_up, stub_up, doortype_none_up, doortype_open_up, doortype_closed_up, doortype_locked_up, weight_up, utils::richText(tr("Set the number of the room up from this one.")));
+    initExit(DIR_UP,
+             pR->getExit(DIR_UP),
+             up,
+             noroute_up,
+             stub_up,
+             doortype_none_up,
+             doortype_open_up,
+             doortype_closed_up,
+             doortype_locked_up,
+             weight_up,
+             utils::richText(tr("Set the number of the room up from this one.")));
 
-    initExit(DIR_WEST, pR->getExit(DIR_WEST), w, noroute_w, stub_w, doortype_none_w, doortype_open_w, doortype_closed_w, doortype_locked_w, weight_w, utils::richText(tr("Set the number of the room west of this one.")));
+    initExit(DIR_WEST,
+             pR->getExit(DIR_WEST),
+             w,
+             noroute_w,
+             stub_w,
+             doortype_none_w,
+             doortype_open_w,
+             doortype_closed_w,
+             doortype_locked_w,
+             weight_w,
+             utils::richText(tr("Set the number of the room west of this one.")));
 
-    initExit(DIR_EAST, pR->getExit(DIR_EAST), e, noroute_e, stub_e, doortype_none_e, doortype_open_e, doortype_closed_e, doortype_locked_e, weight_e, utils::richText(tr("Set the number of the room east of this one.")));
+    initExit(DIR_EAST,
+             pR->getExit(DIR_EAST),
+             e,
+             noroute_e,
+             stub_e,
+             doortype_none_e,
+             doortype_open_e,
+             doortype_closed_e,
+             doortype_locked_e,
+             weight_e,
+             utils::richText(tr("Set the number of the room east of this one.")));
 
-    initExit(DIR_DOWN, pR->getExit(DIR_DOWN), down, noroute_down, stub_down, doortype_none_down, doortype_open_down, doortype_closed_down, doortype_locked_down, weight_down, utils::richText(tr("Set the number of the room down from this one.")));
+    initExit(DIR_DOWN,
+             pR->getExit(DIR_DOWN),
+             down,
+             noroute_down,
+             stub_down,
+             doortype_none_down,
+             doortype_open_down,
+             doortype_closed_down,
+             doortype_locked_down,
+             weight_down,
+             utils::richText(tr("Set the number of the room down from this one.")));
 
-    initExit(DIR_SOUTHWEST, pR->getExit(DIR_SOUTHWEST), sw, noroute_sw, stub_sw, doortype_none_sw, doortype_open_sw, doortype_closed_sw, doortype_locked_sw, weight_sw, utils::richText(tr("Set the number of the room southwest of this one.")));
+    initExit(DIR_SOUTHWEST,
+             pR->getExit(DIR_SOUTHWEST),
+             sw,
+             noroute_sw,
+             stub_sw,
+             doortype_none_sw,
+             doortype_open_sw,
+             doortype_closed_sw,
+             doortype_locked_sw,
+             weight_sw,
+             utils::richText(tr("Set the number of the room southwest of this one.")));
 
-    initExit(DIR_SOUTH, pR->getExit(DIR_SOUTH), s, noroute_s, stub_s, doortype_none_s, doortype_open_s, doortype_closed_s, doortype_locked_s, weight_s, utils::richText(tr("Set the number of the room south of this one.")));
+    initExit(DIR_SOUTH,
+             pR->getExit(DIR_SOUTH),
+             s,
+             noroute_s,
+             stub_s,
+             doortype_none_s,
+             doortype_open_s,
+             doortype_closed_s,
+             doortype_locked_s,
+             weight_s,
+             utils::richText(tr("Set the number of the room south of this one.")));
 
-    initExit(DIR_SOUTHEAST, pR->getExit(DIR_SOUTHEAST), se, noroute_se, stub_se, doortype_none_se, doortype_open_se, doortype_closed_se, doortype_locked_se, weight_se, utils::richText(tr("Set the number of the room southeast of this one.")));
+    initExit(DIR_SOUTHEAST,
+             pR->getExit(DIR_SOUTHEAST),
+             se,
+             noroute_se,
+             stub_se,
+             doortype_none_se,
+             doortype_open_se,
+             doortype_closed_se,
+             doortype_locked_se,
+             weight_se,
+             utils::richText(tr("Set the number of the room southeast of this one.")));
 
-    initExit(DIR_IN, pR->getExit(DIR_IN), in, noroute_in, stub_in, doortype_none_in, doortype_open_in, doortype_closed_in, doortype_locked_in, weight_in, utils::richText(tr("Set the number of the room in from this one.")));
+    initExit(DIR_IN,
+             pR->getExit(DIR_IN),
+             in,
+             noroute_in,
+             stub_in,
+             doortype_none_in,
+             doortype_open_in,
+             doortype_closed_in,
+             doortype_locked_in,
+             weight_in,
+             utils::richText(tr("Set the number of the room in from this one.")));
 
-    initExit(DIR_OUT, pR->getExit(DIR_OUT), out, noroute_out, stub_out, doortype_none_out, doortype_open_out, doortype_closed_out, doortype_locked_out, weight_out, utils::richText(tr("Set the number of the room out from this one.")));
+    initExit(DIR_OUT,
+             pR->getExit(DIR_OUT),
+             out,
+             noroute_out,
+             stub_out,
+             doortype_none_out,
+             doortype_open_out,
+             doortype_closed_out,
+             doortype_locked_out,
+             weight_out,
+             utils::richText(tr("Set the number of the room out from this one.")));
 
     QMapIterator<QString, int> it(pR->getSpecialExits());
     while (it.hasNext()) {
         it.next();
         const int id_to = it.value();
         const QString dir = it.key();
-        auto pSpecialExit = new TExit();
-        // It should be impossible for this not to be valid:
-        Q_ASSERT_X(pSpecialExit, "dlgRoomExits::init(...)", "failed to generate a new TExit");
+        auto pSpecialExit = std::make_unique<TExit>();
         auto pI = new QTreeWidgetItem(specialExits);
         pSpecialExit->destination = id_to;
 
@@ -1590,7 +1877,8 @@ void dlgRoomExits::init()
         pI->setData(ExitsTreeWidget::colIndex_exitWeight, Qt::EditRole, pR->hasExitWeight(dir) ? pR->getExitWeight(dir) : 0);
         pI->setTextAlignment(ExitsTreeWidget::colIndex_exitWeight, Qt::AlignLeft);
         pSpecialExit->weight = pI->data(ExitsTreeWidget::colIndex_exitWeight, Qt::EditRole).toInt();
-        pI->setToolTip(ExitsTreeWidget::colIndex_exitWeight, utils::richText(tr("Set to a positive value to override the default (Room) Weight for using this Exit route, zero value assigns the default.")));
+        //: Tooltip for exit weight column
+        pI->setToolTip(ExitsTreeWidget::colIndex_exitWeight, utils::richText(tr("Positive value overrides room weight; zero uses default.")));
 
         //ExitsTreeWidget::colIndex_doorNone-ExitsTreeWidget::colIndex_doorLocked
         //hold a buttongroup of 4, ideally QRadioButtons, to select a door type
@@ -1599,10 +1887,14 @@ void dlgRoomExits::init()
         pI->setCheckState(ExitsTreeWidget::colIndex_doorOpen, Qt::Unchecked);
         pI->setCheckState(ExitsTreeWidget::colIndex_doorClosed, Qt::Unchecked);
         pI->setCheckState(ExitsTreeWidget::colIndex_doorLocked, Qt::Unchecked);
-        pI->setToolTip(ExitsTreeWidget::colIndex_doorNone, utils::richText(tr("No door symbol is drawn on 2D Map for this exit (only functional choice currently).")));
-        pI->setToolTip(ExitsTreeWidget::colIndex_doorOpen, utils::richText(tr("Green (Open) door symbol would be drawn on a custom exit line for this exit on 2D Map (but not currently).")));
-        pI->setToolTip(ExitsTreeWidget::colIndex_doorClosed, utils::richText(tr("Orange (Closed) door symbol would be drawn on a custom exit line for this exit on 2D Map (but not currently).")));
-        pI->setToolTip(ExitsTreeWidget::colIndex_doorLocked, utils::richText(tr("Red (Locked) door symbol would be drawn on a custom exit line for this exit on 2D Map (but not currently).")));
+        //: Tooltip for no door symbol option
+        pI->setToolTip(ExitsTreeWidget::colIndex_doorNone, utils::richText(tr("No door symbol drawn on the 2D map for this exit.")));
+        //: Tooltip for open door symbol option
+        pI->setToolTip(ExitsTreeWidget::colIndex_doorOpen, utils::richText(tr("Green (open) door symbol drawn on the 2D map.")));
+        //: Tooltip for closed door symbol option
+        pI->setToolTip(ExitsTreeWidget::colIndex_doorClosed, utils::richText(tr("Orange (closed) door symbol drawn on the 2D map.")));
+        //: Tooltip for locked door symbol option
+        pI->setToolTip(ExitsTreeWidget::colIndex_doorLocked, utils::richText(tr("Red (locked) door symbol drawn on the 2D map.")));
         {
             const int specialDoor = pR->getDoor(dir);
             switch (specialDoor) {
@@ -1622,7 +1914,9 @@ void dlgRoomExits::init()
                 qWarning().nospace().noquote() << "dlgRoomExits::init() WARNING - in room: " << mRoomID << "unexpected (special exit) doors[" << dir << "] value:" << pR->doors[dir] << " found!";
             }
             pSpecialExit->door = specialDoor;
-            originalSpecialExits[dir] = pSpecialExit;
+            // Not relevant for special exits but initialise before moving into map
+            pSpecialExit->hasStub = false;
+            originalSpecialExits[dir] = std::move(pSpecialExit);
         }
 
         //ExitsTreeWidget::colIndex_command holds the script/name
@@ -1631,9 +1925,6 @@ void dlgRoomExits::init()
         //Tooltip generation for this column and a couple of earlier ones is
         //done here:
         setIconAndToolTipsOnSpecialExit(pI, true);
-
-        // Not relevant for special exits but better initialise it
-        pSpecialExit->hasStub = false;
     }
     button_save->setEnabled(false);
 
@@ -1647,6 +1938,7 @@ void dlgRoomExits::init()
     connect(button_addSpecialExit, &QAbstractButton::clicked,                      this, &dlgRoomExits::slot_addSpecialExit);
     connect(specialExits,          &QTreeWidget::itemClicked,                      this, &dlgRoomExits::slot_editSpecialExit);
     connect(specialExits,          &QTreeWidget::itemClicked,                      this, &dlgRoomExits::slot_checkModified);
+    connect(specialExits->model(), &QAbstractItemModel::rowsAboutToBeRemoved,     this, &dlgRoomExits::slot_specialExitRowsAboutToBeRemoved);
     connect(button_endEditing,     &QAbstractButton::clicked,                      this, &dlgRoomExits::slot_endEditSpecialExits);
     connect(button_endEditing,     &QAbstractButton::clicked,                      this, &dlgRoomExits::slot_checkModified);
     connect(nw,                    &QLineEdit::textEdited,                         this, &dlgRoomExits::slot_nw_textEdited);
@@ -1661,6 +1953,32 @@ void dlgRoomExits::init()
     connect(se,                    &QLineEdit::textEdited,                         this, &dlgRoomExits::slot_se_textEdited);
     connect(in,                    &QLineEdit::textEdited,                         this, &dlgRoomExits::slot_in_textEdited);
     connect(out,                   &QLineEdit::textEdited,                         this, &dlgRoomExits::slot_out_textEdited);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
+    connect(stub_nw,               &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_stub_nw_stateChanged);
+    connect(stub_n,                &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_stub_n_stateChanged);
+    connect(stub_ne,               &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_stub_ne_stateChanged);
+    connect(stub_up,               &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_stub_up_stateChanged);
+    connect(stub_w,                &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_stub_w_stateChanged);
+    connect(stub_e,                &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_stub_e_stateChanged);
+    connect(stub_down,             &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_stub_down_stateChanged);
+    connect(stub_sw,               &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_stub_sw_stateChanged);
+    connect(stub_s,                &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_stub_s_stateChanged);
+    connect(stub_se,               &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_stub_se_stateChanged);
+    connect(stub_in,               &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_stub_in_stateChanged);
+    connect(stub_out,              &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_stub_out_stateChanged);
+    connect(noroute_nw,            &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_checkModified);
+    connect(noroute_n,             &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_checkModified);
+    connect(noroute_ne,            &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_checkModified);
+    connect(noroute_up,            &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_checkModified);
+    connect(noroute_w,             &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_checkModified);
+    connect(noroute_e,             &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_checkModified);
+    connect(noroute_down,          &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_checkModified);
+    connect(noroute_sw,            &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_checkModified);
+    connect(noroute_s,             &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_checkModified);
+    connect(noroute_se,            &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_checkModified);
+    connect(noroute_in,            &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_checkModified);
+    connect(noroute_out,           &QCheckBox::checkStateChanged,                  this, &dlgRoomExits::slot_checkModified);
+#else
     connect(stub_nw,               &QCheckBox::stateChanged,                       this, &dlgRoomExits::slot_stub_nw_stateChanged);
     connect(stub_n,                &QCheckBox::stateChanged,                       this, &dlgRoomExits::slot_stub_n_stateChanged);
     connect(stub_ne,               &QCheckBox::stateChanged,                       this, &dlgRoomExits::slot_stub_ne_stateChanged);
@@ -1685,6 +2003,7 @@ void dlgRoomExits::init()
     connect(noroute_se,            &QCheckBox::stateChanged,                       this, &dlgRoomExits::slot_checkModified);
     connect(noroute_in,            &QCheckBox::stateChanged,                       this, &dlgRoomExits::slot_checkModified);
     connect(noroute_out,           &QCheckBox::stateChanged,                       this, &dlgRoomExits::slot_checkModified);
+#endif
     connect(weight_nw,             qOverload<int>(&QSpinBox::valueChanged),        this, &dlgRoomExits::slot_checkModified);
     connect(weight_n,              qOverload<int>(&QSpinBox::valueChanged),        this, &dlgRoomExits::slot_checkModified);
     connect(weight_ne,             qOverload<int>(&QSpinBox::valueChanged),        this, &dlgRoomExits::slot_checkModified);
@@ -1697,8 +2016,6 @@ void dlgRoomExits::init()
     connect(weight_se,             qOverload<int>(&QSpinBox::valueChanged),        this, &dlgRoomExits::slot_checkModified);
     connect(weight_in,             qOverload<int>(&QSpinBox::valueChanged),        this, &dlgRoomExits::slot_checkModified);
     connect(weight_out,            qOverload<int>(&QSpinBox::valueChanged),        this, &dlgRoomExits::slot_checkModified);
-#if (QT_VERSION) >= (QT_VERSION_CHECK(5, 15, 0))
-// The qOverload<int>(&QButtonGroup::buttonClicked) was deprecated in Qt 5.15 and replaced by QButtonGroup::idClicked
     connect(doortype_nw,           &QButtonGroup::idClicked,                       this, &dlgRoomExits::slot_checkModified);
     connect(doortype_n,            &QButtonGroup::idClicked,                       this, &dlgRoomExits::slot_checkModified);
     connect(doortype_ne,           &QButtonGroup::idClicked,                       this, &dlgRoomExits::slot_checkModified);
@@ -1712,27 +2029,12 @@ void dlgRoomExits::init()
     connect(doortype_in,           &QButtonGroup::idClicked,                       this, &dlgRoomExits::slot_checkModified);
     connect(doortype_down,         &QButtonGroup::idClicked,                       this, &dlgRoomExits::slot_checkModified);
     connect(doortype_out,          &QButtonGroup::idClicked,                       this, &dlgRoomExits::slot_checkModified);
-#else
-    connect(doortype_nw,           qOverload<int>(&QButtonGroup::buttonClicked),   this, &dlgRoomExits::slot_checkModified);
-    connect(doortype_n,            qOverload<int>(&QButtonGroup::buttonClicked),   this, &dlgRoomExits::slot_checkModified);
-    connect(doortype_ne,           qOverload<int>(&QButtonGroup::buttonClicked),   this, &dlgRoomExits::slot_checkModified);
-    connect(doortype_up,           qOverload<int>(&QButtonGroup::buttonClicked),   this, &dlgRoomExits::slot_checkModified);
-    connect(doortype_w,            qOverload<int>(&QButtonGroup::buttonClicked),   this, &dlgRoomExits::slot_checkModified);
-    connect(doortype_e,            qOverload<int>(&QButtonGroup::buttonClicked),   this, &dlgRoomExits::slot_checkModified);
-    connect(doortype_down,         qOverload<int>(&QButtonGroup::buttonClicked),   this, &dlgRoomExits::slot_checkModified);
-    connect(doortype_sw,           qOverload<int>(&QButtonGroup::buttonClicked),   this, &dlgRoomExits::slot_checkModified);
-    connect(doortype_s,            qOverload<int>(&QButtonGroup::buttonClicked),   this, &dlgRoomExits::slot_checkModified);
-    connect(doortype_se,           qOverload<int>(&QButtonGroup::buttonClicked),   this, &dlgRoomExits::slot_checkModified);
-    connect(doortype_in,           qOverload<int>(&QButtonGroup::buttonClicked),   this, &dlgRoomExits::slot_checkModified);
-    connect(doortype_down,         qOverload<int>(&QButtonGroup::buttonClicked),   this, &dlgRoomExits::slot_checkModified);
-    connect(doortype_out,          qOverload<int>(&QButtonGroup::buttonClicked),   this, &dlgRoomExits::slot_checkModified);
-#endif
     // clang-format on
 }
 
-TExit* dlgRoomExits::makeExitFromControls(int direction)
+std::unique_ptr<TExit> dlgRoomExits::makeExitFromControls(int direction)
 {
-    auto exit = new TExit();
+    auto exit = std::make_unique<TExit>();
     switch (direction) {
     case DIR_NORTHWEST:
         exit->destination = nw->text().toInt();
@@ -1836,111 +2138,112 @@ void dlgRoomExits::slot_checkModified()
     // exit doors
     // exit weights
 
-    TExit* originalExit = originalExits.value(DIR_NORTHWEST);
-    TExit* currentExit = makeExitFromControls(DIR_NORTHWEST);
-
-    if (originalExit && currentExit && *originalExit != *currentExit) {
-        isModified = true;
-    }
-    delete currentExit;
-
-    if (!isModified) {
-        originalExit = originalExits.value(DIR_NORTH);
-        currentExit = makeExitFromControls(DIR_NORTH);
+    {
+        auto it = originalExits.find(DIR_NORTHWEST);
+        TExit* originalExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+        auto currentExit = makeExitFromControls(DIR_NORTHWEST);
         if (originalExit && currentExit && *originalExit != *currentExit) {
             isModified = true;
         }
-        delete currentExit;
     }
 
     if (!isModified) {
-        originalExit = originalExits.value(DIR_NORTHEAST);
-        currentExit = makeExitFromControls(DIR_NORTHEAST);
+        auto it = originalExits.find(DIR_NORTH);
+        TExit* originalExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+        auto currentExit = makeExitFromControls(DIR_NORTH);
         if (originalExit && currentExit && *originalExit != *currentExit) {
             isModified = true;
         }
-        delete currentExit;
     }
 
     if (!isModified) {
-        originalExit = originalExits.value(DIR_UP);
-        currentExit = makeExitFromControls(DIR_UP);
+        auto it = originalExits.find(DIR_NORTHEAST);
+        TExit* originalExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+        auto currentExit = makeExitFromControls(DIR_NORTHEAST);
         if (originalExit && currentExit && *originalExit != *currentExit) {
             isModified = true;
         }
-        delete currentExit;
     }
 
     if (!isModified) {
-        originalExit = originalExits.value(DIR_WEST);
-        currentExit = makeExitFromControls(DIR_WEST);
+        auto it = originalExits.find(DIR_UP);
+        TExit* originalExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+        auto currentExit = makeExitFromControls(DIR_UP);
         if (originalExit && currentExit && *originalExit != *currentExit) {
             isModified = true;
         }
-        delete currentExit;
     }
 
     if (!isModified) {
-        originalExit = originalExits.value(DIR_EAST);
-        currentExit = makeExitFromControls(DIR_EAST);
+        auto it = originalExits.find(DIR_WEST);
+        TExit* originalExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+        auto currentExit = makeExitFromControls(DIR_WEST);
         if (originalExit && currentExit && *originalExit != *currentExit) {
             isModified = true;
         }
-        delete currentExit;
     }
 
     if (!isModified) {
-        originalExit = originalExits.value(DIR_DOWN);
-        currentExit = makeExitFromControls(DIR_DOWN);
+        auto it = originalExits.find(DIR_EAST);
+        TExit* originalExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+        auto currentExit = makeExitFromControls(DIR_EAST);
         if (originalExit && currentExit && *originalExit != *currentExit) {
             isModified = true;
         }
-        delete currentExit;
     }
 
     if (!isModified) {
-        originalExit = originalExits.value(DIR_SOUTHWEST);
-        currentExit = makeExitFromControls(DIR_SOUTHWEST);
+        auto it = originalExits.find(DIR_DOWN);
+        TExit* originalExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+        auto currentExit = makeExitFromControls(DIR_DOWN);
         if (originalExit && currentExit && *originalExit != *currentExit) {
             isModified = true;
         }
-        delete currentExit;
     }
 
     if (!isModified) {
-        originalExit = originalExits.value(DIR_SOUTH);
-        currentExit = makeExitFromControls(DIR_SOUTH);
+        auto it = originalExits.find(DIR_SOUTHWEST);
+        TExit* originalExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+        auto currentExit = makeExitFromControls(DIR_SOUTHWEST);
         if (originalExit && currentExit && *originalExit != *currentExit) {
             isModified = true;
         }
-        delete currentExit;
     }
 
     if (!isModified) {
-        originalExit = originalExits.value(DIR_SOUTHEAST);
-        currentExit = makeExitFromControls(DIR_SOUTHEAST);
+        auto it = originalExits.find(DIR_SOUTH);
+        TExit* originalExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+        auto currentExit = makeExitFromControls(DIR_SOUTH);
         if (originalExit && currentExit && *originalExit != *currentExit) {
             isModified = true;
         }
-        delete currentExit;
     }
 
     if (!isModified) {
-        originalExit = originalExits.value(DIR_IN);
-        currentExit = makeExitFromControls(DIR_IN);
+        auto it = originalExits.find(DIR_SOUTHEAST);
+        TExit* originalExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+        auto currentExit = makeExitFromControls(DIR_SOUTHEAST);
         if (originalExit && currentExit && *originalExit != *currentExit) {
             isModified = true;
         }
-        delete currentExit;
     }
 
     if (!isModified) {
-        originalExit = originalExits.value(DIR_OUT);
-        currentExit = makeExitFromControls(DIR_OUT);
+        auto it = originalExits.find(DIR_IN);
+        TExit* originalExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+        auto currentExit = makeExitFromControls(DIR_IN);
         if (originalExit && currentExit && *originalExit != *currentExit) {
             isModified = true;
         }
-        delete currentExit;
+    }
+
+    if (!isModified) {
+        auto it = originalExits.find(DIR_OUT);
+        TExit* originalExit = (it != originalExits.end()) ? it->second.get() : nullptr;
+        auto currentExit = makeExitFromControls(DIR_OUT);
+        if (originalExit && currentExit && *originalExit != *currentExit) {
+            isModified = true;
+        }
     }
 
     // Detecting actual changes in the special exits is hard because of the
@@ -1949,17 +2252,19 @@ void dlgRoomExits::slot_checkModified()
     // At the same time existing special exits which now have a empty/zero
     // value in the ExitsTreeWidget::colIndex_exitRoomId field will be deleted if "save"ed...
     if (!isModified) {
-        const int originalCount = originalSpecialExits.count();
+        const int originalCount = static_cast<int>(originalSpecialExits.size());
         int currentCount = 0;
         for (int i = 0; i < specialExits->topLevelItemCount(); i++) {
             QTreeWidgetItem* pI = specialExits->topLevelItem(i);
-/*            qDebug("dlgRoomExits::slot_checkModified() considering specialExit (item %i, pass 1) to:%i, command:%s",
+            if (!pI) {
+                continue;
+            }
+            /*            qDebug("dlgRoomExits::slot_checkModified() considering specialExit (item %i, pass 1) to:%i, command:%s",
  *                   i,
  *                   pI->text(ExitsTreeWidget::colIndex_exitRoomId).toInt(),
  *                   qPrintable(pI->text(ExitsTreeWidget::colIndex_command)));
  */
-            if (pI->text(ExitsTreeWidget::colIndex_command) == mSpecialExitCommandPlaceholder
-                || pI->text(ExitsTreeWidget::colIndex_exitRoomId).toInt() <= 0) {
+            if (pI->text(ExitsTreeWidget::colIndex_command) == mSpecialExitCommandPlaceholder || pI->text(ExitsTreeWidget::colIndex_exitRoomId).toInt() <= 0) {
                 continue;
             } // Ignore new or to be deleted entries
             currentCount++;
@@ -1968,45 +2273,53 @@ void dlgRoomExits::slot_checkModified()
             isModified = true;
         } else {
             if (originalCount) {
-                QMap<QString, TExit*> foundMap = originalSpecialExits;
+                // Track which original exits have been matched by key
+                std::set<QString> unmatchedKeys;
+                for (const auto& kv : originalSpecialExits) {
+                    unmatchedKeys.insert(kv.first);
+                }
                 // Now make a TExit value for each current (valid) specialExit
-                // and search for it in the foundMap; remove matches and
-                // if any non-matches or if any left in foundMap at end then
+                // and search for it in originalSpecialExits; remove matches and
+                // if any non-matches or if any left in unmatchedKeys at end then
                 // set isModified...
                 for (int i = 0; i < specialExits->topLevelItemCount(); i++) {
                     QTreeWidgetItem* pI = specialExits->topLevelItem(i);
-/*                    qDebug("dlgRoomExits::slot_checkModified() considering specialExit (item %i, pass 2) to:%i, command:%s",
+                    if (!pI) {
+                        continue;
+                    }
+                    /*                    qDebug("dlgRoomExits::slot_checkModified() considering specialExit (item %i, pass 2) to:%i, command:%s",
  *                           i,
  *                           pI->text(ExitsTreeWidget::colIndex_exitRoomId).toInt(),
  *                           qPrintable(pI->text(ExitsTreeWidget::colIndex_command)));
  */
-                    if (pI->text(ExitsTreeWidget::colIndex_command) == mSpecialExitCommandPlaceholder
-                        || pI->text(ExitsTreeWidget::colIndex_exitRoomId).toInt() <= 0) {
+                    if (pI->text(ExitsTreeWidget::colIndex_command) == mSpecialExitCommandPlaceholder || pI->text(ExitsTreeWidget::colIndex_exitRoomId).toInt() <= 0) {
                         continue; // Ignore new or to be deleted entries
                     }
                     const QString currentCmd = pI->text(ExitsTreeWidget::colIndex_command);
                     TExit currentExit;
                     currentExit.destination = pI->text(ExitsTreeWidget::colIndex_exitRoomId).toInt();
                     currentExit.hasNoRoute = pI->checkState(ExitsTreeWidget::colIndex_lockExit) == Qt::Checked;
-                    currentExit.door = pI->checkState(ExitsTreeWidget::colIndex_doorLocked) == Qt::Checked
-                            ? 3 : pI->checkState(ExitsTreeWidget::colIndex_doorClosed) == Qt::Checked
-                              ? 2 : pI->checkState(ExitsTreeWidget::colIndex_doorOpen) == Qt::Checked
-                                ? 1 : 0;
+                    currentExit.door = pI->checkState(ExitsTreeWidget::colIndex_doorLocked) == Qt::Checked   ? 3
+                                       : pI->checkState(ExitsTreeWidget::colIndex_doorClosed) == Qt::Checked ? 2
+                                       : pI->checkState(ExitsTreeWidget::colIndex_doorOpen) == Qt::Checked   ? 1
+                                                                                                             : 0;
                     currentExit.weight = pI->text(ExitsTreeWidget::colIndex_exitWeight).toInt();
                     currentExit.hasStub = false;
-                    auto exit = foundMap.value(currentCmd);
-                    if (exit
-                        && exit->destination == currentExit.destination
-                        && exit->door        == currentExit.door
-                        && exit->hasNoRoute  == currentExit.hasNoRoute
-                        && exit->weight      == currentExit.weight      ) {
-                        foundMap.remove(currentCmd);
+                    auto mapIt = originalSpecialExits.find(currentCmd);
+                    if (mapIt != originalSpecialExits.end()) {
+                        const TExit* exit = mapIt->second.get();
+                        if (exit->destination == currentExit.destination && exit->door == currentExit.door && exit->hasNoRoute == currentExit.hasNoRoute && exit->weight == currentExit.weight) {
+                            unmatchedKeys.erase(currentCmd);
+                        } else {
+                            isModified = true;
+                            break;
+                        }
                     } else {
                         isModified = true;
                         break;
                     }
                 }
-                if (!foundMap.isEmpty()) {
+                if (!unmatchedKeys.empty()) {
                     isModified = true;
                 }
             }

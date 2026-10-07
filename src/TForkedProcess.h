@@ -23,12 +23,10 @@
  ***************************************************************************/
 
 
-#include "pre_guard.h"
 #include <QProcess>
-#include "post_guard.h"
 
-#include "TLuaInterpreter.h"
-
+class TLuaInterpreter;
+struct lua_State;
 
 class TForkedProcess : public QProcess
 {
@@ -45,7 +43,7 @@ private:
     static int isProcessRunning(lua_State* L);
     static int sendMessage(lua_State* L);
 
-    TForkedProcess(TLuaInterpreter*, lua_State*);
+    TForkedProcess(TLuaInterpreter*, const QString& program, const QStringList& arguments, const int callBackReference);
 
     int callBackFunctionRef = -1;
     TLuaInterpreter* mpInterpreter = nullptr;

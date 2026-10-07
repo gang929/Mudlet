@@ -21,17 +21,19 @@ jobs:
 
     steps:
     - name: Checkout Mudlet repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         fetch-depth: 0
+        # We are just reading the logs, so we don't need the files
+        filter: blob:none
 
     - name: Install Lua 5.1.5
-      uses: leafo/gh-actions-lua@v10
+      uses: leafo/gh-actions-lua@v13
       with:
         luaVersion: "5.1.5"
 
     - name: Install Luarocks
-      uses: leafo/gh-actions-luarocks@v4
+      uses: leafo/gh-actions-luarocks@v6
 
     - name: Install Lua dependencies
       run: |
@@ -73,7 +75,7 @@ jobs:
         echo $authors
 
     - name: Upload authors as txt
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: authors.txt
         path: authors.txt

@@ -26,22 +26,22 @@
   </property>
   <layout class="QVBoxLayout" name="verticalLayout_2">
    <property name="spacing">
-    <number>0</number>
+    <number>12</number>
    </property>
    <property name="leftMargin">
-    <number>0</number>
+    <number>12</number>
    </property>
    <property name="topMargin">
-    <number>0</number>
+    <number>12</number>
    </property>
    <property name="rightMargin">
-    <number>0</number>
+    <number>12</number>
    </property>
    <property name="bottomMargin">
-    <number>0</number>
+    <number>12</number>
    </property>
    <item>
-    <widget class="QWidget" name="widget" native="true">
+    <widget class="QWidget" name="widget_top" native="true">
      <property name="sizePolicy">
       <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
        <horstretch>0</horstretch>
@@ -56,7 +56,7 @@
      </property>
      <layout class="QHBoxLayout" name="horizontalLayout">
       <property name="spacing">
-       <number>0</number>
+       <number>12</number>
       </property>
       <property name="leftMargin">
        <number>0</number>
@@ -71,7 +71,7 @@
        <number>0</number>
       </property>
       <item>
-       <widget class="QWidget" name="widget_5" native="true">
+       <widget class="QWidget" name="widget_topLeft" native="true">
         <property name="sizePolicy">
          <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
           <horstretch>0</horstretch>
@@ -86,29 +86,42 @@
         </property>
         <layout class="QVBoxLayout" name="verticalLayout_3">
          <property name="spacing">
+          <number>12</number>
+         </property>
+         <property name="leftMargin">
           <number>0</number>
          </property>
          <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
           <number>0</number>
          </property>
          <property name="bottomMargin">
           <number>0</number>
          </property>
          <item>
-          <widget class="QListWidget" name="profiles_tree_widget">
-           <property name="minimumSize">
-            <size>
-             <width>365</width>
-             <height>0</height>
-            </size>
+          <layout class="QVBoxLayout" name="verticalLayout_gamesList">
+           <property name="spacing">
+            <number>0</number>
            </property>
-           <property name="accessibleName">
-            <string>profiles list</string>
-           </property>
-           <property name="resizeMode">
-            <enum>QListView::Adjust</enum>
-           </property>
-          </widget>
+           <item>
+            <widget class="QListWidget" name="listWidget_profiles">
+             <property name="minimumSize">
+              <size>
+               <width>365</width>
+               <height>0</height>
+              </size>
+             </property>
+             <property name="accessibleName">
+              <string>profiles list</string>
+             </property>
+             <property name="resizeMode">
+              <enum>QListView::Adjust</enum>
+             </property>
+            </widget>
+           </item>
+          </layout>
          </item>
          <item>
           <widget class="QFrame" name="notificationArea">
@@ -326,7 +339,7 @@
            <property name="minimumSize">
             <size>
              <width>0</width>
-             <height>50</height>
+             <height>25</height>
             </size>
            </property>
            <property name="maximumSize">
@@ -336,6 +349,21 @@
             </size>
            </property>
            <layout class="QHBoxLayout" name="horizontalLayout_5">
+            <property name="spacing">
+             <number>8</number>
+            </property>
+            <property name="leftMargin">
+             <number>0</number>
+            </property>
+            <property name="topMargin">
+             <number>0</number>
+            </property>
+            <property name="rightMargin">
+             <number>0</number>
+            </property>
+            <property name="bottomMargin">
+             <number>0</number>
+            </property>
             <item>
              <spacer name="horizontalSpacer_4">
               <property name="orientation">
@@ -419,7 +447,7 @@
        </widget>
       </item>
       <item>
-       <widget class="QWidget" name="widget_2" native="true">
+       <widget class="QWidget" name="widget_topRight" native="true">
         <property name="sizePolicy">
          <sizepolicy hsizetype="Fixed" vsizetype="Expanding">
           <horstretch>0</horstretch>
@@ -428,7 +456,7 @@
         </property>
         <property name="minimumSize">
          <size>
-          <width>340</width>
+          <width>328</width>
           <height>0</height>
          </size>
         </property>
@@ -439,6 +467,21 @@
          </size>
         </property>
         <layout class="QVBoxLayout" name="verticalLayout">
+         <property name="spacing">
+          <number>12</number>
+         </property>
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
          <item>
           <widget class="QTextBrowser" name="welcome_message">
            <property name="enabled">
@@ -693,7 +736,7 @@
               </widget>
              </item>
              <item row="2" column="1">
-              <widget class="QComboBox" name="profile_history">
+              <widget class="WideComboBox" name="profile_history">
                <property name="sizePolicy">
                 <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
                  <horstretch>0</horstretch>
@@ -718,37 +761,7 @@
                </item>
               </widget>
              </item>
-             <item row="3" column="0">
-              <widget class="QCheckBox" name="discord_optin_checkBox">
-               <property name="enabled">
-                <bool>false</bool>
-               </property>
-               <property name="toolTip">
-                <string>Enable Discord integration (not supported by game)</string>
-               </property>
-               <property name="accessibleName">
-                <string>Discord integration</string>
-               </property>
-               <property name="accessibleDescription">
-                <string>Allow this profile to use Mudlet's Discord "Rich Presence"  features</string>
-               </property>
-               <property name="text">
-                <string/>
-               </property>
-               <property name="icon">
-                <iconset resource="../mudlet.qrc">
-                 <normaloff>:/icons/Discord-Logo+Wordmark-Color.png</normaloff>:/icons/Discord-Logo+Wordmark-Color.png
-                </iconset>
-               </property>
-               <property name="iconSize">
-                <size>
-                 <width>65</width>
-                 <height>18</height>
-                </size>
-               </property>
-              </widget>
-             </item>
-             <item row="4" column="0" colspan="2">
+             <item row="3" column="0" colspan="2">
               <widget class="QCheckBox" name="autologin_checkBox">
                <property name="sizePolicy">
                 <sizepolicy hsizetype="Maximum" vsizetype="Fixed">
@@ -794,7 +807,7 @@
           </widget>
          </item>
          <item>
-          <widget class="QGroupBox" name="informationalArea">
+          <widget class="QGroupBox" name="informationArea">
            <property name="sizePolicy">
             <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
              <horstretch>0</horstretch>
@@ -808,7 +821,7 @@
             </size>
            </property>
            <property name="title">
-            <string>Informational</string>
+            <string>Information</string>
            </property>
            <layout class="QVBoxLayout" name="vBoxLayout_4">
             <property name="leftMargin">
@@ -890,6 +903,21 @@
    <item>
     <widget class="QWidget" name="widget_bottom" native="true">
      <layout class="QHBoxLayout" name="horizontalLayout_3">
+      <property name="spacing">
+       <number>12</number>
+      </property>
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
       <item>
        <spacer name="horizontalSpacer">
         <property name="orientation">
@@ -939,8 +967,15 @@
    </item>
   </layout>
  </widget>
+ <customwidgets>
+  <customwidget>
+   <class>WideComboBox</class>
+   <extends>QComboBox</extends>
+   <header>WideComboBox.h</header>
+  </customwidget>
+ </customwidgets>
  <tabstops>
-  <tabstop>profiles_tree_widget</tabstop>
+  <tabstop>listWidget_profiles</tabstop>
   <tabstop>welcome_message</tabstop>
   <tabstop>profile_name_entry</tabstop>
   <tabstop>host_name_entry</tabstop>
@@ -950,7 +985,6 @@
   <tabstop>login_entry</tabstop>
   <tabstop>character_password_entry</tabstop>
   <tabstop>profile_history</tabstop>
-  <tabstop>discord_optin_checkBox</tabstop>
   <tabstop>autologin_checkBox</tabstop>
   <tabstop>auto_reconnect</tabstop>
   <tabstop>mud_description_textedit</tabstop>

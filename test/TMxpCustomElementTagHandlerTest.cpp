@@ -101,8 +101,8 @@ private slots:
         tagHandler.handleTag(ctx, stub, endTag->asEndTag());
 
         QCOMPARE(stub.mHrefs.size(), 2);
-        QCOMPARE(stub.mHrefs[0], "send([[examine inv##10]])");
-        QCOMPARE(stub.mHrefs[1], "send([[drop inv##10]])");
+        QCOMPARE(stub.mHrefs[0], "send([[\nexamine inv##10]])");
+        QCOMPARE(stub.mHrefs[1], "send([[\ndrop inv##10]])");
 
         QCOMPARE(stub.mHints.size(), 2);
         QCOMPARE(stub.mHints[0], "examine");
@@ -141,7 +141,7 @@ private slots:
         tagHandler.handleTag(ctx, stub, endTag->asEndTag());
 
         QCOMPARE(stub.mHrefs.size(), 1);
-        QCOMPARE(stub.mHrefs[0], "send([[follow map of the newbie jungle to P8x7]])");
+        QCOMPARE(stub.mHrefs[0], "send([[\nfollow map of the newbie jungle to P8x7]])");
 
         QCOMPARE(stub.mHints.size(), 1);
         QCOMPARE(stub.mHints[0], "go here");
@@ -157,7 +157,7 @@ private slots:
         tagHandler.handleTag(ctx, stub, endTag->asEndTag());
 
         QCOMPARE(stub.mHrefs.size(), 1);
-        QCOMPARE(stub.mHrefs[0], "send([[follow map of the south forest to P42]])");
+        QCOMPARE(stub.mHrefs[0], "send([[\nfollow map of the south forest to P42]])");
 
         QCOMPARE(stub.mHints.size(), 1);
         QCOMPARE(stub.mHints[0], "go here");
@@ -229,7 +229,7 @@ private slots:
         // Real life example from Aldebaran: (there are more sensible ones with EXPIRE which Mudlet does not yet support)
         //
         // <!EL WH '<SEND "whisper &NAME; |finger &NAME; |tell &NAME; " HINT="whisper &NAME;|finger &NAME;|tell &NAME;" PROMPT>' ATT='NAME=someone'>
-        // 
+        //
         // Used like <WH playerid>Player</WH> says: Hello!
         // However, if player is invisible, playerid is empty, like <WH >Someone</WH> says: Hello!
         //
@@ -255,9 +255,9 @@ private slots:
         tagHandler.handleTag(ctx, stub, endTag->asEndTag());
 
         QCOMPARE(stub.mHrefs.size(), 3);
-        QCOMPARE(stub.mHrefs[0], "printCmdLine([[whisper playerid ]])");
-        QCOMPARE(stub.mHrefs[1], "printCmdLine([[finger playerid ]])");
-        QCOMPARE(stub.mHrefs[2], "printCmdLine([[tell playerid ]])");
+        QCOMPARE(stub.mHrefs[0], "printCmdLine([[\nwhisper playerid ]])");
+        QCOMPARE(stub.mHrefs[1], "printCmdLine([[\nfinger playerid ]])");
+        QCOMPARE(stub.mHrefs[2], "printCmdLine([[\ntell playerid ]])");
 
         QCOMPARE(stub.mHints.size(), 3);
         QCOMPARE(stub.mHints[0], "whisper playerid");
@@ -271,14 +271,47 @@ private slots:
         tagHandler.handleTag(ctx, stub, endTag->asEndTag());
 
         QCOMPARE(stub.mHrefs.size(), 3);
-        QCOMPARE(stub.mHrefs[0], "printCmdLine([[whisper someone ]])");
-        QCOMPARE(stub.mHrefs[1], "printCmdLine([[finger someone ]])");
-        QCOMPARE(stub.mHrefs[2], "printCmdLine([[tell someone ]])");
+        QCOMPARE(stub.mHrefs[0], "printCmdLine([[\nwhisper someone ]])");
+        QCOMPARE(stub.mHrefs[1], "printCmdLine([[\nfinger someone ]])");
+        QCOMPARE(stub.mHrefs[2], "printCmdLine([[\ntell someone ]])");
 
         QCOMPARE(stub.mHints.size(), 3);
         QCOMPARE(stub.mHints[0], "whisper someone");
         QCOMPARE(stub.mHints[1], "finger someone");
         QCOMPARE(stub.mHints[2], "tell someone");
+    }
+
+    void testCustomElementAttributePassThrough() {
+        // Test that attributes from custom element tags are passed through to the definition
+        // <!ELEMENT Ex '<SEND>'>
+        // <Ex EXPIRE='Exits' HREF='north'>North</Ex>
+        // Should result in: <SEND EXPIRE='Exits' HREF='north'>North</SEND>
+        
+        TMxpStubHandlerContext ctx;
+        TMxpStubClient stub;
+        
+        // Define custom element that expands to <SEND>
+        auto defTag = parseNode("<!ELEMENT Ex '<SEND>'>");
+        TMxpElementDefinitionHandler definitionHandler;
+        definitionHandler.handleTag(ctx, stub, defTag->asStartTag());
+        
+        // Use custom element with EXPIRE and HREF attributes
+        auto startTag = parseNode("<Ex EXPIRE='Exits' HREF='north'>");
+        auto endTag = parseNode("</Ex>");
+        
+        TMxpCustomElementTagHandler customElementTagHandler;
+        TMxpTagHandler& tagHandler = customElementTagHandler;
+        
+        tagHandler.handleTag(ctx, stub, startTag->asStartTag());
+        tagHandler.handleContent("North");
+        tagHandler.handleTag(ctx, stub, endTag->asEndTag());
+        
+        // Verify the attributes were passed through correctly
+        QCOMPARE(stub.mHrefs.size(), 1);
+        QCOMPARE(stub.mHrefs[0], "send([[\nnorth]])");
+        QCOMPARE(stub.mHints.size(), 1);
+        QCOMPARE(stub.mHints[0], "north");
+        QCOMPARE(stub.mExpireName, "Exits");
     }
 };
 

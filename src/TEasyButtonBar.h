@@ -23,9 +23,7 @@
  ***************************************************************************/
 
 
-#include "pre_guard.h"
 #include <QWidget>
-#include "post_guard.h"
 
 #include <list>
 
@@ -33,6 +31,7 @@ class TFlipButton;
 class TAction;
 
 class QGridLayout;
+class QMenu;
 
 
 class TEasyButtonBar : public QWidget
@@ -43,6 +42,8 @@ public:
     Q_DISABLE_COPY(TEasyButtonBar)
     TEasyButtonBar(TAction*, QString, QWidget* pW = nullptr);
     void addButton(TFlipButton* pW);
+    void addActionButtons(TAction* pAction);
+    void resetItemCount(const int initialOffset) { mItemCount = initialOffset; }
     void setVerticalOrientation() { mVerticalOrientation = true; }
     void setHorizontalOrientation() { mVerticalOrientation = false; }
     void clear();
@@ -55,6 +56,8 @@ public slots:
     void slot_pressed(bool);
 
 private:
+    void fillMenu(TAction* pAction, QMenu* pMenu);
+
     bool mVerticalOrientation = false;
     QWidget* mpWidget = nullptr;
     bool mRecordMove = false;

@@ -1,8 +1,9 @@
 /***************************************************************************
  *   Copyright (C) 2008-2011 by Heiko Koehn - KoehnHeiko@googlemail.com    *
  *   Copyright (C) 2014 by Ahmed Charles - acharles@outlook.com            *
- *   Copyright (C) 2016, 2018, 2020 by Stephen Lyons                       *
+ *   Copyright (C) 2016, 2018, 2020, 2024-2026 by Stephen Lyons            *
  *                                               - slysven@virginmedia.com *
+ *   Copyright (C) 2025 by Lecker Kebap - Leris@mudlet.org                 *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
  *   it under the terms of the GNU General Public License as published by  *
@@ -22,19 +23,42 @@
 
 #include "HostManager.h"
 
-#include "dlgMapper.h"
-#include "mudlet.h"
+#include "Host.h"
 
-bool HostManager::deleteHost(const QString& hostname)
+#include <QDebug>
+
+HostManager::HostManager()
 {
-    // make sure this is really a new host
+    // self() callers trust there is only one; a second would repoint the accessor, then null it on
+    // destruction while the first is still in use.
+    if (smpSelf) {
+        qWarning() << "HostManager::HostManager() WARNING - a HostManager already exists, so self() keeps pointing at that one.";
+        return;
+    }
+    smpSelf = this;
+}
+
+HostManager::~HostManager()
+{
+    // Drain the pool while self() still answers: ~Host() may reach the manager it is being removed from.
+    mHostPool.clear();
+    if (smpSelf == this) {
+        smpSelf = nullptr;
+    }
+}
+
+void HostManager::deleteHost(const QString& hostname)
+{
+    // make sure this is really an existing host
     if (!mHostPool.contains(hostname)) {
         qDebug() << "HostManager::deleteHost(" << hostname.toUtf8().constData() << ") ERROR: not a member of host pool... aborting!";
-        return false;
-    } else {
-        const int ret = mHostPool.remove(hostname);
-        return ret;
+        return;
     }
+
+    // As this pulls the QSharedPointer that hostname identifies out of the pool
+    // the Host goes out of scope when execution leaves this method and thus
+    // gets destroyed:
+    mHostPool.remove(hostname);
 }
 
 bool HostManager::addHost(const QString& hostname, const QString& port, const QString& login, const QString& pass)
@@ -118,7 +142,7 @@ void HostManager::postInterHostEvent(const Host* pHost, const TEvent& event, con
     allValidHosts = afterSendingHost;
     allValidHosts.append(beforeSendingHost);
 
-    for (const int validHost : qAsConst(allValidHosts)) {
+    for (const int validHost : std::as_const(allValidHosts)) {
         hostList.at(validHost)->raiseEvent(event);
     }
 }
@@ -128,20 +152,8 @@ void HostManager::changeAllHostColour(const Host* pHost)
     if (!pHost) {
         return;
     }
-    //change all main and subconsoles color
-    const QList<QSharedPointer<Host>> hostList = mHostPool.values();
-    for (int i = 0; i < hostList.size(); i++) {
-        hostList.at(i)->mpConsole->changeColors();
-        // Mapper also needs a refresh of its colours
-        auto mapper = hostList.at(i)->mpMap->mpMapper;
-        if (mapper) {
-            mapper->setPalette(QApplication::palette());
-        }
-        QMutableMapIterator<QString, TConsole*> itSubConsole(hostList.at(i)->mpConsole->mSubConsoleMap);
-        while (itSubConsole.hasNext()) {
-            itSubConsole.next();
-            itSubConsole.value()->changeColors();
-        }
+    for (const QSharedPointer<Host>& host : mHostPool.values()) {
+        host->refreshColours();
     }
 }
 
@@ -160,12 +172,12 @@ HostManager::Iter::Iter(HostManager* manager, bool at_start)
     }
 }
 
-bool HostManager::Iter::operator== (const Iter& other)
+bool HostManager::Iter::operator==(const Iter& other) const
 {
     return it == other.it;
 }
 
-bool HostManager::Iter::operator!= (const Iter& other)
+bool HostManager::Iter::operator!=(const Iter& other) const
 {
     return it != other.it;
 }
@@ -181,3 +193,7 @@ QSharedPointer<Host> HostManager::Iter::operator*()
     return *it;
 }
 
+bool HostManager::hostLoaded(const QString& hostname) const
+{
+    return mHostPool.contains(hostname);
+}

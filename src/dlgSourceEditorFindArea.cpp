@@ -21,9 +21,8 @@
 #include "dlgSourceEditorFindArea.h"
 #include "ui_dlgPackageExporter.h"
 
-#include "pre_guard.h"
 #include <QDebug>
-#include "post_guard.h"
+#include <QKeyEvent>
 
 dlgSourceEditorFindArea::dlgSourceEditorFindArea(QWidget* pParentWidget)
 : QWidget(pParentWidget)
@@ -62,7 +61,7 @@ bool dlgSourceEditorFindArea::eventFilter(QObject* obj, QEvent* event)
             }
         }
     } else {
-        if (event->type() == QEvent::Show || event->type() == QEvent::Hide) {
+        if (event->type() == QEvent::Show || event->type() == QEvent::Hide || event->type() == QEvent::Resize) {
             emit signal_sourceEditorMovementNecessary();
         }
     }

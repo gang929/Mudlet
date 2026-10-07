@@ -4,7 +4,8 @@
 /***************************************************************************
  *   Copyright (C) 2008-2011 by Heiko Koehn - KoehnHeiko@googlemail.com    *
  *   Copyright (C) 2014 by Ahmed Charles - acharles@outlook.com            *
- *   Copyright (C) 2022-2023 by Stephen Lyons - slysven@virginmedia.com    *
+ *   Copyright (C) 2022-2023, 2026 by Stephen Lyons                        *
+ *                                               - slysven@virginmedia.com *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
  *   it under the terms of the GNU General Public License as published by  *
@@ -23,27 +24,33 @@
  ***************************************************************************/
 
 
-#include "pre_guard.h"
+#include "utils.h"
+
+#include <QCoreApplication>
+#include <QList>
+#include <QMap>
 #include <QMultiMap>
 #include <QPointer>
+#include <QSet>
 #include <QString>
-#include "post_guard.h"
 
 #include <list>
+#include <tuple>
+#include <vector>
 
 class Host;
 class TAlias;
 
-
 class AliasUnit
 {
+    Q_DECLARE_TR_FUNCTIONS(AliasUnit)
+
     friend class XMLexport;
     friend class XMLimport;
 
 public:
-    explicit AliasUnit(Host* pHost)
-    : mpHost(pHost)
-    {}
+    explicit AliasUnit(Host*);
+    ~AliasUnit();
 
     std::list<TAlias*> getAliasRootNodeList() { return mAliasRootNodeList; }
     TAlias* getAlias(int id);
@@ -59,6 +66,7 @@ public:
     void uninstall(const QString&);
     void _uninstall(TAlias* pChild, const QString& packageName);
     void reParentAlias(int childID, int oldParentID, int newParentID, int parentPosition = -1, int childPosition = -1);
+    void reParentAlias(int childID, int oldParentID, int newParentID, TreeItemInsertMode mode, int position = 0);
     bool processDataStream(const QString&);
     void stopAllTriggers();
     void reenableAllTriggers();
@@ -66,10 +74,15 @@ public:
     int getNewID();
     void markCleanup(TAlias* pT);
     void doCleanup();
+    int processingDepth() const { return mProcessingDepth; }
+    // Each nested alias expansion is a C++ stack frame; past this depth the
+    // command goes to the game unexpanded.
+    inline static const int scmMaxProcessingDepth = 50;
 
     QMultiMap<QString, TAlias*> mLookupTable;
-    std::list<TAlias*> mCleanupList;
+    QSet<TAlias*> mCleanupSet;
     QList<TAlias*> uninstallList;
+    bool hasPendingDeletes() const { return !mCleanupSet.isEmpty() || !uninstallList.isEmpty(); }
 
 
 private:
@@ -91,6 +104,13 @@ private:
     int statsItemsTotal = 0;
     int statsTempItems = 0;
     int statsActiveItems = 0;
+    // Counter for nested processing; cleanup deferred until 0
+    int mProcessingDepth = 0;
+    // Set once scmMaxProcessingDepth is reached, cleared when the expansion that started the
+    // chain returns to the outermost pass, so other aliases on that command can still expand.
+    // An alias that expands into itself twice branches at every level, so refusing only the
+    // expansions at the limit still leaves 2^50 of them to run below it.
+    bool mRunawayExpansionStopped = false;
 };
 
 #endif // MUDLET_ALIASUNIT_H

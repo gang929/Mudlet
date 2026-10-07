@@ -22,14 +22,17 @@
 
 #include "TEasyButtonBar.h"
 
+#include "EAction.h"
 #include "Host.h"
 #include "TAction.h"
 #include "TConsole.h"
 #include "TFlipButton.h"
+#include "TMainConsole.h"
 
-#include "pre_guard.h"
 #include <QGridLayout>
-#include "post_guard.h"
+#include <QIcon>
+#include <QMenu>
+#include <QScopeGuard>
 
 
 TEasyButtonBar::TEasyButtonBar(TAction* pA, QString name, QWidget* pW)
@@ -49,14 +52,12 @@ TEasyButtonBar::TEasyButtonBar(TAction* pA, QString name, QWidget* pW)
         setContentsMargins(0, 0, 0, 0);
         mpLayout->setContentsMargins(0, 0, 0, 0);
         mpLayout->setSpacing(0);
-        QSizePolicy const sizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        const QSizePolicy sizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
         mpWidget->setSizePolicy(sizePolicy);
     } else {
-        mpWidget->setMinimumHeight(mpTAction->mSizeY);
-        mpWidget->setMaximumHeight(mpTAction->mSizeY);
-        mpWidget->setMinimumWidth(mpTAction->mSizeX);
-        mpWidget->setMaximumWidth(mpTAction->mSizeX);
-        mpWidget->setGeometry(mpTAction->mPosX, mpTAction->mPosY, mpTAction->mSizeX, mpTAction->mSizeY);
+        mpWidget->setMaximumSize(mpTAction->getSize());
+        mpWidget->setMinimumSize(mpTAction->getSize());
+        mpWidget->setGeometry(mpTAction->mPosX, mpTAction->mPosY, mpTAction->getSizeX(), mpTAction->getSizeY());
     }
     setStyleSheet(mpTAction->css);
     mpWidget->setStyleSheet(mpTAction->css);
@@ -76,11 +77,11 @@ void TEasyButtonBar::addButton(TFlipButton* pB)
         }
     } else {
         qDebug() << "setting up custom sizes";
-        QSize const size = QSize(pB->mpTAction->mSizeX, pB->mpTAction->mSizeY);
+        const QSize size = pB->mpTAction->getSize();
         pB->setMaximumSize(size);
         pB->setMinimumSize(size);
         pB->setParent(mpWidget);
-        pB->setGeometry(pB->mpTAction->mPosX, pB->mpTAction->mPosY, pB->mpTAction->mSizeX, pB->mpTAction->mSizeY);
+        pB->setGeometry(pB->mpTAction->mPosX, pB->mpTAction->mPosY, pB->mpTAction->getSizeX(), pB->mpTAction->getSizeY());
     }
 
     pB->setStyleSheet(pB->mpTAction->css);
@@ -102,19 +103,13 @@ void TEasyButtonBar::addButton(TFlipButton* pB)
     if (!mpTAction->mUseCustomLayout) {
         // tool bar mButtonColumns > 0 -> autolayout
         // case == 0: use individual button placement for user defined layouts
-        int columns = mpTAction->getButtonColumns();
-        if (columns <= 0) {
-            columns = 1;
-        }
-        if (columns > 0) {
-            mItemCount++;
-            const int row = mItemCount / columns;
-            const int col = mItemCount % columns;
-            if (mVerticalOrientation) {
-                mpLayout->addWidget(pB, row, col);
-            } else {
-                mpLayout->addWidget(pB, col, row);
-            }
+        int columns = std::max(1, mpTAction->getButtonColumns());
+        const int row = ++mItemCount / columns;
+        const int col = mItemCount % columns;
+        if (mVerticalOrientation) {
+            mpLayout->addWidget(pB, row, col);
+        } else {
+            mpLayout->addWidget(pB, col, row);
         }
     } else {
         pB->move(pB->mpTAction->mPosX, pB->mpTAction->mPosY);
@@ -129,23 +124,135 @@ void TEasyButtonBar::addButton(TFlipButton* pB)
 }
 
 
+void TEasyButtonBar::addActionButtons(TAction* pAction)
+{
+    // The -1 is needed to compensate for the initial pre-increment to TEasyButtonBar::mItemCount
+    resetItemCount(pAction->getButtonFillerOffset() - 1);
+    for (auto* pTActionNode : *pAction->mpMyChildrenList) {
+        auto* pTAction = static_cast<TAction*>(pTActionNode);
+        if (!pTAction->isActive()) {
+            continue;
+        }
+        const QIcon icon(pTAction->getIcon());
+        const QString name = pTAction->getName();
+        auto pTFlipButton = new TFlipButton(pTAction, pAction->mpHost);
+        pTFlipButton->setIcon(icon);
+        pTFlipButton->setText(name);
+        pTFlipButton->setCheckable(pTAction->isPushDownButton());
+
+        if (pTAction->isPushDownButton()) {
+            pTFlipButton->setChecked(pTAction->mButtonState);
+        } else {
+            // The following was added to ensure a non-Pushdown button is never
+            // left in a checked state - Slysven
+            pTFlipButton->setChecked(false);
+        }
+
+        pTFlipButton->setFlat(pAction->getButtonFlat());
+        // This applies the CSS for THIS TAction to a CHILD's representation on the Toolbar
+        pTFlipButton->setStyleSheet(pAction->css);
+
+        //FIXME: Heiko April 2012: only run checkbox button scripts, but run them even if unchecked
+        if (pTAction->isPushDownButton() && pAction->mpHost->mIsProfileLoadingSequence) {
+            qDebug() << "addActionButtons() name=" << pTAction->getName() << " executing script";
+            pTAction->execute();
+        }
+
+
+        if (pTAction->isFolder()) {
+            auto pNewMenu = new QMenu(pTFlipButton);
+
+            // This applied the CSS for THIS TAction to a CHILD's own menu - is this right
+            // CHECK: consider using the Child's CSS instead for a menu on it
+            // - Slysven:
+            // pNewMenu->setStyleSheet( pTAction->css );
+            pNewMenu->setStyleSheet(pAction->css);
+
+            fillMenu(pTAction, pNewMenu);
+
+            // This has been moved until AFTER the child's menu has been
+            // populated, it was being done straight after pNewMenu was created,
+            // but I think we ought to insert the items into the menu before
+            // applying the menu to the button - Slysven
+            pTFlipButton->setMenu(pNewMenu);
+        }
+
+        pAction->mpHost->mpConsole->replaceActionButton(pTAction, pTFlipButton);
+
+        // Moved to be AFTER the pTAction->mIsFolder test as I think we ought to
+        // add the button to the toolbar AFTER any menu (children) items have
+        // been put on the button - Slysven
+        addButton(pTFlipButton);
+    }
+}
+
+// This seems to be the second half of TEasyButtonBar version of:
+//   TToolBar::addActionToMenu( TAction *, QMenu * )
+// the need for the split is not yet clear to me! - Slysven
+void TEasyButtonBar::fillMenu(TAction* pAction, QMenu* pMenu)
+{
+    for (auto* pTActionNode : *pAction->mpMyChildrenList) {
+        auto* pTAction = static_cast<TAction*>(pTActionNode);
+        if (!pTAction->isActive()) {
+            continue;
+        }
+        mpTAction->mpHost->mpConsole->setActionEasyButtonBar(pAction, this);
+        auto pEAction = new EAction(pAction->mpHost, QIcon(pAction->getIcon()), pTAction->getName(), pTAction->mID);
+        pEAction->setStatusTip(pTAction->getName());
+        pEAction->setCheckable(pTAction->isPushDownButton());
+        if (pTAction->isPushDownButton()) {
+            pEAction->setChecked(pTAction->mButtonState);
+        } else {
+            pEAction->setChecked(false);
+        }
+
+        mpTAction->mpHost->mpConsole->replaceActionMenuEntry(pTAction, pEAction);
+
+        //FIXME: Heiko April 2012 -> addActionButtons()
+        if (pTAction->isPushDownButton() && pAction->mpHost->mIsProfileLoadingSequence) {
+            pTAction->execute();
+        }
+
+        if (pTAction->isFolder()) {
+            // Adding a QWidget derived pointer to new QMenu() means the menu
+            // will be destroyed when the pointed to item is, we just need to
+            // find the item that it is attached to - ah ha, try the toolbar...
+            auto pNewMenu = new QMenu(this);
+            pEAction->setMenu(pNewMenu);
+
+            // CHECK: consider using the Child's CSS instead for a menu on it
+            // - Slysven:
+            // pNewMenu->setStyleSheet( pTAction->css );
+            pNewMenu->setStyleSheet(pAction->css);
+
+            fillMenu(pTAction, pNewMenu);
+        }
+
+        // Menu is PARENT'S menu pEAction, this line moved to be AFTER child builds its own menu if it is a folder
+        pMenu->addAction(pEAction);
+    }
+}
+
+
 void TEasyButtonBar::finalize()
 {
-    if (mpTAction->mUseCustomLayout) {
+    if (mpTAction->mUseCustomLayout || !mpTAction->getButtonFillerOffset()) {
         return;
     }
-    auto fillerWidget = new QWidget;
-
-    QSizePolicy const sizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    fillerWidget->setSizePolicy(sizePolicy);
-    int columns = mpTAction->getButtonColumns();
-    if (columns <= 0) {
-        columns = 1;
-    }
-    const int row = (++mItemCount) / columns;
-    const int column = mItemCount % columns;
+    auto fillerWidget = new QWidget(this);
+    QPushButton dummy;
+    fillerWidget->setMinimumSize(dummy.minimumSizeHint());
+    fillerWidget->setMaximumSize(dummy.minimumSizeHint());
     if (mpLayout) {
-        mpLayout->addWidget(fillerWidget, row, column);
+        if (mpTAction->mOrientation == 1) {
+            // The toolbar is to be filled with rows of mpTAction->getButtonColumns() wide
+            // The filler widget is to be one or more columns wide
+            mpLayout->addWidget(fillerWidget, 0, 0, mpTAction->getButtonFillerOffset(), 1);
+        } else {
+            // The toolbar is to be filled with columns of mpTAction->getButtonColumns() tall
+            // The filler widget is to be one or more rows tall
+            mpLayout->addWidget(fillerWidget, 0, 0, 1, mpTAction->getButtonFillerOffset());
+        }
     }
 }
 
@@ -153,12 +260,25 @@ void TEasyButtonBar::finalize()
 // button state to ensure the visible representation is used.
 void TEasyButtonBar::slot_pressed(const bool isChecked)
 {
-    auto * pB = dynamic_cast<TFlipButton*>(sender());
+    auto* pB = dynamic_cast<TFlipButton*>(sender());
     if (!pB) {
         return;
     }
 
     TAction* pA = pB->mpTAction;
+
+    // Hold off ActionUnit deletes for this whole slot: showMenu() below blocks in
+    // a modal event loop in which a menu item's script (or inbound game data) can
+    // uninstall pA's own package. beginProcessing() keeps that delete deferred -
+    // even against a Host catch-all doCleanup() firing at depth 0 mid-loop - so pA
+    // survives every dereference here; the scope guard then flushes once, after pA
+    // is no longer touched (see ActionUnit::uninstall()):
+    ActionUnit* pActionUnit = pA->mpHost->getActionUnit();
+    pActionUnit->beginProcessing();
+    const auto processingGuard = qScopeGuard([pActionUnit] {
+        pActionUnit->endProcessing();
+        pActionUnit->doCleanup();
+    });
 
     // NOTE: This function blocks until an item is selected from the menu, and,
     // as the action to "pop-up" the menu is the same as "buttons" use to
@@ -168,7 +288,7 @@ void TEasyButtonBar::slot_pressed(const bool isChecked)
     // entries...
     pB->showMenu();
 
-    if (pA->mIsPushDownButton) {
+    if (pA->isPushDownButton()) {
         // DO NOT MANIPULATE THE BUTTON STATE OURSELF NOW
         pA->mButtonState = isChecked;
         pA->mpHost->mpConsole->mButtonState = (pA->mButtonState ? 2 : 1);
@@ -200,17 +320,15 @@ void TEasyButtonBar::clear()
         mpWidget->setLayout(mpLayout);
         mpLayout->setContentsMargins(0, 0, 0, 0);
         mpLayout->setSpacing(0);
-        QSizePolicy const sizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+        const QSizePolicy sizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
         mpWidget->setSizePolicy(sizePolicy);
 
         mpWidget->setContentsMargins(0, 0, 0, 0);
     } else {
         mpLayout = nullptr;
-        mpWidget->setMinimumHeight(mpTAction->mSizeY);
-        mpWidget->setMaximumHeight(mpTAction->mSizeY);
-        mpWidget->setMinimumWidth(mpTAction->mSizeX);
-        mpWidget->setMaximumWidth(mpTAction->mSizeX);
-        mpWidget->setGeometry(mpTAction->mPosX, mpTAction->mPosY, mpTAction->mSizeX, mpTAction->mSizeY);
+        mpWidget->setMinimumSize(mpTAction->getSize());
+        mpWidget->setMaximumSize(mpTAction->getSize());
+        mpWidget->setGeometry(mpTAction->mPosX, mpTAction->mPosY, mpTAction->getSizeX(), mpTAction->getSizeY());
     }
     layout()->addWidget(pW);
     setStyleSheet(mpTAction->css);

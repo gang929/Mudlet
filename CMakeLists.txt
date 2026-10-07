@@ -1,6 +1,6 @@
 ############################################################################
 #    Copyright (C) 2014 by Ahmed Charles - acharles@outlook.com            #
-#    Copyright (C) 2015-2018, 2020, 2022 by Stephen Lyons                  #
+#    Copyright (C) 2015-2018, 2020, 2022, 2024-2026 by Stephen Lyons       #
 #                                                - slysven@virginmedia.com #
 #                                                                          #
 #    This program is free software; you can redistribute it and/or modify  #
@@ -33,25 +33,63 @@
 ############################################################################
 
 # Should be called before PROJECT.
-cmake_minimum_required(VERSION 3.3)
+cmake_minimum_required(VERSION 3.25.1)
 
 if(APPLE)
-  # needed for fetching Sparkle
-  cmake_minimum_required(VERSION 3.18)
-  # minimum supported version by Qt6 for our Qt5/Qt6 build compatibility
-  set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "")
-endif()
-
-if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/vcpkg/scripts/buildsystems/vcpkg.cmake)
-  # In cases where VCPkg is NOT being used we need to skip this
-  set(CMAKE_TOOLCHAIN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/vcpkg/scripts/buildsystems/vcpkg.cmake
-    CACHE STRING "Vcpkg toolchain file")
-  message(STATUS "Using Vcpkg toolchain file: ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/vcpkg/scripts/buildsystems/vcpkg.cmake .")
-else()
-  message(STATUS "Vcpkg toolchain file ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/vcpkg/scripts/buildsystems/vcpkg.cmake NOT found, proceeding without it.")
+  # minimum supported version by Qt6
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "")
 endif()
 
 project(mudlet)
+
+# All the other files that we want to see in the editor but which CMake doesn't
+# do anything with.
+# Gather non-compiled files for IDE visibility using glob patterns
+# Note: New files are picked up automatically on CMake reconfigure
+file(GLOB ROOT_FILES_LIST CONFIGURE_DEPENDS
+  .clang-tidy
+  .crowdin.yml
+  .cursorrules
+  .gitignore
+  .gitmodules
+  .imgbotconfig
+  .DirIcon
+  *.md
+  COMMITMENT
+  COMPILE
+  COPYING
+  CPPLINT.cfg
+  dangerfile.js
+  asan-suppressions.txt
+  mudlet.desktop
+  mudlet.png
+  mudlet.svg
+  icon_*.png
+)
+
+file(GLOB_RECURSE OTHER_FILES_LIST CONFIGURE_DEPENDS
+  .github/**
+  .devcontainer/**
+  .vscode/**
+  .claude/**
+  3rdparty/discord/rpc/lib/*
+  CI/**
+  docker/**
+  docs/**
+  .clang-format
+  src/.gitignore
+  src/mudlet-lua/**
+)
+
+# It is not clear that the "COMMENT" actually shows up anywhere - so include
+# a status message:
+message(STATUS "Refreshing OTHER_FILES list...")
+add_custom_target(OTHER_FILES
+  COMMENT "Refreshing OTHER_FILES list for passive file display in IDE"
+  SOURCES
+    ${ROOT_FILES_LIST}
+    ${OTHER_FILES_LIST}
+)
 
 if(CMAKE_CONFIGURATION_TYPES)
   add_custom_target(
@@ -64,25 +102,21 @@ endif()
 
 enable_testing()
 
-if(POLICY CMP0020)
-  cmake_policy(SET CMP0020 NEW)
-endif()
-
-if(POLICY CMP0057)
-  cmake_policy(SET CMP0057 NEW)
-endif()
-
 if(WIN32)
   set(APP_TARGET mudlet.exe)
 elseif(APPLE)
   set(APP_TARGET Mudlet)
+  enable_language(OBJCXX)
 else()
   set(APP_TARGET mudlet)
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+option(WITH_SENTRY "Enable crash reporting via Sentry" OFF)
+option(SENTRY_SEND_DEBUG "Send debug files to Sentry after build" OFF)
 
 find_package(Git REQUIRED)
 # Get Git SHA1 hash
@@ -93,29 +127,46 @@ execute_process(
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 
-# APP_BUILD should only be empty/null in official "release" builds, developers
-# may like to set the MUDLET_VERSION_BUILD environment variable to their user
-# and branch names to make it easier to tell different builds apart!
-#
-# Changing this pair of values affects: ctelnet.cpp, main.cpp, mudlet.cpp
-# dlgAboutDialog.cpp and TLuaInterpreter.cpp.  It will not necessarily cause
-# those files to be automatically rebuilt so you may need to 'touch' those files
-# if the variables are changed and you are not doing a full, clean, rebuild! Use
-# APP_VERSION, APP_BUILD and APP_TARGET defines in the source code if needed.
-# IMPORTANT: To insure consistency please ensure the SAME of the first two
-# values are also assigned to the "VERSION" and "BUILD" variables in the native
-# qmake project file, which is NOW called: ./src/mudlet.pro
-set(APP_VERSION 4.17.2)
-if(DEFINED ENV{MUDLET_VERSION_BUILD} AND NOT $ENV{MUDLET_VERSION_BUILD}
-                                         STREQUAL "")
-  file(WRITE ${CMAKE_SOURCE_DIR}/src/app-build.txt "$ENV{MUDLET_VERSION_BUILD}")
-  set(APP_BUILD $ENV{MUDLET_VERSION_BUILD})
+# If a CI/CB build system provides an alternative Git SHA1 to identify the build
+# use that instead - reporting which is being used:
+if(DEFINED ENV{BUILD_COMMIT} AND NOT $ENV{BUILD_COMMIT} STREQUAL "")
+    string(TOLOWER $ENV{BUILD_COMMIT} GIT_SHA1)
+    message(STATUS "Git SHA1 set from environemnt: ${GIT_SHA1}")
 else()
-  file(WRITE ${CMAKE_SOURCE_DIR}/src/app-build.txt "-dev")
-  set(APP_BUILD "-dev")
+    message(STATUS "Git SHA1 used: ${GIT_SHA1}")
 endif()
 
+# Set APP_VERSION
+set(APP_VERSION 5.0.0)
+
+# Set APP_BUILD based on environment variable MUDLET_VERSION_BUILD. An explicitly
+# empty value must be distinguished from an unset one so release builds (CI exports
+# MUDLET_VERSION_BUILD="") get a clean version with no "-dev-<sha>" suffix:
+#   unset (local dev build)         -> "-dev-<sha>"
+#   defined but empty (release)     -> "" (no suffix)
+#   defined with a value (ptb/test) -> "<value>-<sha>"
+if(DEFINED ENV{MUDLET_VERSION_BUILD})
+    if("$ENV{MUDLET_VERSION_BUILD}" STREQUAL "")
+        set(BUILD_VALUE "")
+    else()
+        set(BUILD_VALUE "$ENV{MUDLET_VERSION_BUILD}-${GIT_SHA1}")
+    endif()
+else()
+    set(BUILD_VALUE "-dev-${GIT_SHA1}")
+endif()
+
+# Write to app-build.txt and set APP_BUILD
+file(WRITE ${CMAKE_SOURCE_DIR}/src/app-build.txt "${BUILD_VALUE}")
+message(STATUS "Value written to app-build.txt file: ${BUILD_VALUE}")
+set(APP_BUILD ${BUILD_VALUE} CACHE STRING "Auto-set during CMake run. Do not alter manually." FORCE)
+
+set(LIB_MUDLET_TARGET "mudlet_core")
+
 set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake ${CMAKE_MODULE_PATH})
+
+# Static analysis support - always included, but only active when configured with
+# -DENABLE_STATIC_ANALYSIS=ON (see cmake/StaticAnalysis.cmake for details)
+include(StaticAnalysis)
 
 include(IncludeOptionalModule)
 
@@ -132,39 +183,28 @@ include_optional_module(ENVIRONMENT_VARIABLE WITH_FONTS
 include_optional_module(ENVIRONMENT_VARIABLE WITH_3DMAPPER
                         OPTION_VARIABLE USE_3DMAPPER
                         READABLE_NAME "3D mapper")
+include_optional_module(ENVIRONMENT_VARIABLE WITH_SHADER_HOT_RELOAD
+                        OPTION_VARIABLE USE_SHADER_HOT_RELOAD
+                        READABLE_NAME "shader hot-reloading"
+                        DEFAULT OFF)
+include_optional_module(ENVIRONMENT_VARIABLE WITH_MEMORY_TRACKING
+                        OPTION_VARIABLE USE_MEMORY_TRACKING
+                        READABLE_NAME "memory tracking"
+                        DEFAULT OFF)
 include_optional_module(ENVIRONMENT_VARIABLE WITH_VARIABLE_SPLASH_SCREEN
                         OPTION_VARIABLE USE_VARIABLE_SPLASH_SCREEN
                         READABLE_NAME "build-type splash screen")
-include_optional_module(ENVIRONMENT_VARIABLE WITH_OWN_QTKEYCHAIN
-                        OPTION_VARIABLE USE_OWN_QTKEYCHAIN
-                        READABLE_NAME "own QtKeychain library")
-include_optional_module(ENVIRONMENT_VARIABLE WITH_MAIN_BUILD_SYSTEM
-                        OPTION_VARIABLE USE_MAIN_BUILD_SYSTEM
-                        READABLE_NAME "original CI (setup-windows-sdk.ps1) windows build system"
-                        SUPPORTED_SYSTEMS "Windows")
-include_optional_module(ENVIRONMENT_VARIABLE WITH_QT6
-                        OPTION_VARIABLE USE_QT6
-                        READABLE_NAME "build with Qt6 (if installed)")
 
-if(USE_QT6)
-  find_package(
-          Qt6 6.2.0
-          QUIET)
-  if(NOT Qt6_FOUND)
-    message(STATUS "Qt6 >= 6.2.0 was not found. Building with Qt5.")
-  endif()
-endif()
+find_package(Qt6 6.8.2 REQUIRED)
 
-# Set Qt version for src, test, translations and communi
-set(WITH_QT6 ${Qt6_FOUND} CACHE BOOL "Whether to build with Qt6 or Qt5.")
-# Set Qt version for edbee-lib and dblsqd
-if(WITH_QT6)
-  option(BUILD_WITH_QT5 "" OFF)
-else()
-  option(BUILD_WITH_QT5 "" ON)
-endif()
-# Set Qt version for qtkeychain
-option(BUILD_WITH_QT6 "" ${WITH_QT6})
+# Find Core5Compat for third-party libraries (communi, edbee-lib) that still need it
+find_package(Qt6 COMPONENTS Core5Compat REQUIRED)
+
+find_package(Lua 5.1 EXACT)
+
+# Set Qt version for edbee-lib
+option(BUILD_WITH_QT5 "" OFF)
+option(BUILD_WITH_QT6 "" ON)
 
 include(InitGitSubmodule)
 
@@ -172,12 +212,29 @@ git_submodule_init(
   CHECK_FILE "3rdparty/edbee-lib/CMakeLists.txt" SUBMODULE_PATH
   "3rdparty/edbee-lib" READABLE_NAME "edbee-lib editor widget")
 
-if(USE_OWN_QTKEYCHAIN)
+  git_submodule_init(
+    CHECK_FILE "3rdparty/qt-tags-widget/CMakeLists.txt" SUBMODULE_PATH
+    "3rdparty/qt-tags-widget" READABLE_NAME "qt-tags-widget widget")
+
+# TODO: On macOS, we need to build qtkeychain from source because Homebrew's
+# qtkeychain package is built against Homebrew's Qt, which is incompatible with
+# the Qt installed by jurplel/install-qt-action in CI.
+# See: https://github.com/Mudlet/Mudlet/issues/8875
+if(APPLE)
+  set(USE_OWN_QTKEYCHAIN ON)
   git_submodule_init(
     CHECK_FILE "3rdparty/qtkeychain/CMakeLists.txt"
     SUBMODULE_PATH "3rdparty/qtkeychain"
     READABLE_NAME "QtKeychain")
+  # Building qtkeychain's translations runs lupdate, which rewrites the .ts
+  # files inside the submodule whenever a source is newer than them, so the
+  # submodule shows as modified after every checkout. Mudlet neither bundles
+  # nor loads those catalogues, so skip them. The normal variable overrides the
+  # option() in the subdirectory (CMP0077) and is unset afterwards so the
+  # generic name cannot leak into other 3rdparty projects.
+  set(BUILD_TRANSLATIONS OFF)
   add_subdirectory(3rdparty/qtkeychain)
+  unset(BUILD_TRANSLATIONS)
 endif()
 
 git_submodule_init(
@@ -193,53 +250,91 @@ git_submodule_init(
 #     GIT_SHALLOW TRUE)
 # FetchContent_MakeAvailable(nanobench)
 
-if(USE_UPDATER)
-  git_submodule_init(CHECK_FILE "3rdparty/dblsqd/CMakeLists.txt" SUBMODULE_PATH
-                     "3rdparty/dblsqd" READABLE_NAME "DBLSQD updater")
-endif()
 
 if(APPLE)
   if(USE_UPDATER)
-    git_submodule_init(
-      CHECK_FILE "3rdparty/sparkle-glue/CMakeLists.txt" SUBMODULE_PATH
-      "3rdparty/sparkle-glue" READABLE_NAME "Sparkle glue for updater")
-
     if(NOT EXISTS "${CMAKE_HOME_DIRECTORY}/3rdparty/cocoapods/Pods/Sparkle")
       message(
         STATUS "Sparkle is missing, fetching it..."
       )
-      file(DOWNLOAD "https://github.com/sparkle-project/Sparkle/releases/download/1.25.0/Sparkle-1.25.0.tar.xz" "${CMAKE_HOME_DIRECTORY}/3rdparty/cocoapods/Pods/Sparkle-1.25.0.tar.xz"
+      file(DOWNLOAD "https://github.com/sparkle-project/Sparkle/releases/download/2.7.1/Sparkle-2.7.1.tar.xz" "${CMAKE_HOME_DIRECTORY}/3rdparty/cocoapods/Pods/Sparkle-2.7.1.tar.xz"
         TIMEOUT 60  # seconds
         TLS_VERIFY ON
       )
-      file(ARCHIVE_EXTRACT INPUT "${CMAKE_HOME_DIRECTORY}/3rdparty/cocoapods/Pods/Sparkle-1.25.0.tar.xz"
+      file(ARCHIVE_EXTRACT INPUT "${CMAKE_HOME_DIRECTORY}/3rdparty/cocoapods/Pods/Sparkle-2.7.1.tar.xz"
         DESTINATION "${CMAKE_HOME_DIRECTORY}/3rdparty/cocoapods/Pods/Sparkle")
-      file(REMOVE "${CMAKE_HOME_DIRECTORY}/3rdparty/cocoapods/Pods/Sparkle-1.25.0.tar.xz")
+      file(REMOVE "${CMAKE_HOME_DIRECTORY}/3rdparty/cocoapods/Pods/Sparkle-2.7.1.tar.xz")
     endif()
   endif()
 endif()
 
 find_program(CCACHE_FOUND ccache)
 if(CCACHE_FOUND)
-  set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
-  set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
+  # Checkouts and worktrees only share hits once a base_dir turns their absolute
+  # paths relative, so default it to this checkout unless one is configured
+  execute_process(
+    COMMAND ${CCACHE_FOUND} --get-config base_dir
+    OUTPUT_VARIABLE ccacheBaseDir
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  if(ccacheBaseDir STREQUAL "")
+    set(MUDLET_CCACHE_ENV "CCACHE_BASEDIR=${CMAKE_SOURCE_DIR}")
+    set(CMAKE_C_COMPILER_LAUNCHER ${CMAKE_COMMAND} -E env ${MUDLET_CCACHE_ENV} ${CCACHE_FOUND})
+    set(CMAKE_CXX_COMPILER_LAUNCHER ${CMAKE_COMMAND} -E env ${MUDLET_CCACHE_ENV} ${CCACHE_FOUND})
+  else()
+    set(CMAKE_C_COMPILER_LAUNCHER ccache)
+    set(CMAKE_CXX_COMPILER_LAUNCHER ccache)
+  endif()
 endif(CCACHE_FOUND)
 
-add_subdirectory(3rdparty/edbee-lib/edbee-lib)
-add_subdirectory(3rdparty/communi)
-add_subdirectory(translations/translated)
-add_subdirectory(src)
-add_subdirectory(test)
+include(PrecompiledHeaders)
 
-if(USE_UPDATER)
-  add_subdirectory(3rdparty/dblsqd)
-
-  if(APPLE)
-    add_subdirectory(3rdparty/sparkle-glue)
+# credit to https://github.com/heavyai/heavydb/blob/72c90bc290b79dd30240da41c103a00720f6b050/CMakeLists.txt#L119
+macro(set_alternate_linker linker)
+  find_program(LINKER_EXECUTABLE ld.${USE_ALTERNATE_LINKER} ${USE_ALTERNATE_LINKER})
+  if(LINKER_EXECUTABLE)
+    if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" AND "${CMAKE_CXX_COMPILER_VERSION}" VERSION_LESS 12.1.0 AND "${USE_ALTERNATE_LINKER}" STREQUAL "mold")
+      # LINKER_EXECUTABLE will be a full path to ld.mold, so we replace the end of the path, resulting in the relative
+      # libexec/mold dir, and tell GCC to look there first for an override version of executables, in this case, ld
+      string(REPLACE "bin/ld.mold" "libexec/mold" PATH_TO_LIBEXEC_MOLD ${LINKER_EXECUTABLE})
+      add_link_options("-B${PATH_TO_LIBEXEC_MOLD}")
+    else()
+      add_link_options("-fuse-ld=${USE_ALTERNATE_LINKER}")
+    endif()
+  else()
+    message(WARNING "USE_ALTERNATE_LINKER=${USE_ALTERNATE_LINKER} was asked for but no such linker is installed - using the system one")
+    set(USE_ALTERNATE_LINKER "" CACHE STRING "Use alternate linker" FORCE)
   endif()
+endmacro()
 
+# add_link_options() only reaches directories added after it, and most of the
+# link time is in test/, so this has to come before those subdirectories
+set(USE_ALTERNATE_LINKER "" CACHE STRING "Use alternate linker. Leave empty for system default; alternatives are 'gold', 'lld', 'bfd', 'mold'")
+if(NOT "${USE_ALTERNATE_LINKER}" STREQUAL "")
+  set_alternate_linker(${USE_ALTERNATE_LINKER})
 endif()
 
-set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
-set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE -O3)
-set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_DEBUG -O0)
+add_subdirectory(3rdparty/edbee-lib/edbee-lib)
+# edbee-lib's AUTOMOC mocs_compilation.cpp hits the same GCC 16
+# -Wsfinae-incomplete false positives as mudlet_core's (qmetatype.h's
+# is_complete SFINAE instantiated from one moc file while a type defined in a
+# later moc file is incomplete). The per-source property used for mudlet_core
+# does not cross the add_subdirectory() boundary for a generated AUTOMOC file,
+# so silence the warning on the edbee-lib target itself - PRIVATE so it does
+# not propagate to mudlet_core. Scoped to GCC: the flag is GCC-only (GCC 15+)
+# and Clang/MSVC would diagnose the unknown option.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_compile_options(edbee-lib PRIVATE -Wno-sfinae-incomplete)
+endif()
+add_subdirectory(3rdparty/communi)
+# Upstream ships a standalone library, so add_subdirectory() would adopt its install() rules and
+# put its dev files into every package. EXCLUDE_FROM_ALL keeps them out (observed, not documented
+# CMake behaviour, so the packaging scripts check the staged tree); mudlet_core still links it.
+add_subdirectory(3rdparty/qt-tags-widget EXCLUDE_FROM_ALL)
+add_subdirectory(translations/translated)
+add_subdirectory(src)
+
+option(BUILD_TESTING "Build the test tree" ON)
+if(BUILD_TESTING)
+  add_subdirectory(test)
+endif()

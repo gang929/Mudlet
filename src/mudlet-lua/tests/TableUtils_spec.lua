@@ -11,6 +11,17 @@ describe("Tests TableUtils.lua functions", function()
       assert.are.equal(expected,actual)
     end)
 
+    it("should sort mixed keys by default", function()
+      local tbl = { [1] = 30, Tom = 40, Mary = 50, Joe = 24 }
+      local expected_key_order = { 1, "Joe", "Mary", "Tom" }
+
+      local i = 1
+      for k, _ in spairs(tbl) do
+        assert.are.equal(k, expected_key_order[i])
+        i = i + 1;
+      end
+    end)
+
     it("should sort based on a given function", function()
       local tbl = { Tom = 40, Mary = 50, Joe = 23 }
       local expected = "Joe has 23 thingies\nTom has 40 thingies\nMary has 50 thingies\n"
@@ -94,8 +105,8 @@ describe("Tests TableUtils.lua functions", function()
     end)
   end)
 
-  -- methods skipped here: printTable, _printTable, listPrint, listAdd, listRemove
-  -- they are undocumented and unused in our own code.
+  -- printTable, listPrint, __printTable, listAdd and listRemove are covered
+  -- near the end of this file.
 
   describe("Tests the functionality of table.size", function()
 
@@ -252,7 +263,101 @@ describe("Tests TableUtils.lua functions", function()
       local errfn = function()
         table.n_collect(tbl, func)
       end
-      assert.has_error(errfn, "table.n_collect: bad argument #2 type (function to run against each item in tbl as function expected, got string)") 
+      assert.has_error(errfn, "table.n_collect: bad argument #2 type (function to run against each item in tbl as function expected, got string)")
+    end)
+
+    it("should keep a value that is equal to an index already collected", function()
+      local actual = table.n_collect({ "a", 1 }, function() return true end)
+      table.sort(actual, function(a, b) return tostring(a) < tostring(b) end)
+      assert.are.same({ 1, "a" }, actual)
+    end)
+
+    it("should keep a value that also appears inside a nested table", function()
+      local actual = table.n_collect({ { "z" }, "z" }, function() return true end)
+      assert.are.equal(2, #actual)
+      local nested, plain
+      for _, value in ipairs(actual) do
+        if type(value) == "table" then nested = value else plain = value end
+      end
+      assert.are.same({ "z" }, nested)
+      assert.are.equal("z", plain)
+    end)
+
+    it("should still drop real duplicates", function()
+      local actual = table.n_collect({ 5, "x", 5, "x" }, function() return true end)
+      assert.are.equal(2, #actual)
+      table.sort(actual, function(a, b) return tostring(a) < tostring(b) end)
+      assert.are.same({ 5, "x" }, actual)
+    end)
+
+    local function keepAll() return true end
+
+    it("should keep the first occurrence of each value, in list order", function()
+      assert.are.same({ 3, 1, 2 }, table.n_collect({ 3, 1, 3, 2, 1, 2 }, keepAll))
+      assert.are.same({ "b", "a", "c" }, table.n_collect({ "b", "a", "b", "c", "a" }, keepAll))
+      local big = {}
+      for i = 1, 600 do big[i] = "v" .. (i % 250) end
+      local expected = {}
+      for i = 1, 250 do expected[i] = "v" .. (i % 250) end
+      assert.are.same(expected, table.n_collect(big, keepAll))
+    end)
+
+    it("should only collect values for which func returns exactly true", function()
+      local truthy = function(value) return value end
+      assert.are.same({ true }, table.n_collect({ "a", 1, true, false }, truthy))
+      local calls = {}
+      table.n_collect({ "x", "x", "y" }, function(value) calls[#calls + 1] = value; return true end)
+      assert.are.same({ "x", "x", "y" }, calls)
+    end)
+
+    it("should tell apart values of different types that print alike", function()
+      assert.are.same({ 1, "1", true, "true" }, table.n_collect({ 1, "1", true, "true", 1, "1", true, "true" }, keepAll))
+      assert.are.same({ true, false }, table.n_collect({ true, false, true, false }, keepAll))
+    end)
+
+    it("should treat numbers that compare equal as duplicates", function()
+      local negativeZero = -tonumber("0")
+      assert.are.same({ 1 }, table.n_collect({ 1, 1.0, 2 / 2 }, keepAll))
+      assert.are.equal(1, #table.n_collect({ 0, negativeZero }, keepAll))
+      assert.are.equal(1, #table.n_collect({ math.huge, 1 / 0 }, keepAll))
+    end)
+
+    it("should keep every NaN, as NaN never equals itself", function()
+      local nan = 0 / 0
+      local actual = table.n_collect({ nan, 1, nan, 1, nan }, keepAll)
+      assert.are.equal(4, #actual)
+      assert.are_not.equal(actual[1], actual[1])
+      assert.are.equal(1, actual[2])
+      assert.are_not.equal(actual[3], actual[3])
+      assert.are_not.equal(actual[4], actual[4])
+    end)
+
+    it("should compare tables, functions and userdata by identity", function()
+      local t1, t2 = { 1 }, { 1 }
+      local f1 = function() end
+      local actual = table.n_collect({ t1, t2, t1, f1, f1, "s" }, keepAll)
+      assert.are.equal(4, #actual)
+      assert.are.equal(t1, actual[1])
+      assert.are.equal(t2, actual[2])
+      assert.are.equal(f1, actual[3])
+      assert.are.equal("s", actual[4])
+    end)
+
+    it("should treat tables an __eq metamethod calls equal as duplicates", function()
+      local eqCalls = 0
+      local mt = { __eq = function(a, b) eqCalls = eqCalls + 1; return a.id == b.id end }
+      local a1 = setmetatable({ id = 1 }, mt)
+      local a2 = setmetatable({ id = 1 }, mt)
+      local b1 = setmetatable({ id = 2 }, mt)
+      local actual = table.n_collect({ a1, "x", a2, b1, 7, a1 }, keepAll)
+      assert.are.equal(4, #actual)
+      assert.are.equal(a1, actual[1])
+      assert.are.equal("x", actual[2])
+      assert.are.equal(b1, actual[3])
+      assert.are.equal(7, actual[4])
+      -- a2 against a1; b1 against a1; the second a1 is the same table, so
+      -- == settles it without asking the metamethod
+      assert.are.equal(2, eqCalls)
     end)
   end)
 
@@ -422,6 +527,35 @@ describe("Tests TableUtils.lua functions", function()
       local actual = table.n_matches(tbl, "pass.+")
       assert.same(expected, actual)
     end)
+
+    it("should keep the first match of each value, pattern by pattern in list order", function()
+      assert.are.same({ "b2", "a1", "c3" }, table.n_matches({ "b2", "a1", "b2", "c3", "a1" }, "%d"))
+      assert.are.same({ "a1", "a2", "b1" }, table.n_matches({ "b1", "a1", "a2", "b1" }, "^a", "%d"))
+      assert.are.same({ "ab" }, table.n_matches({ "ab", "ab" }, "a", "b"))
+      local big = {}
+      for i = 1, 600 do big[i] = "v" .. (i % 250) end
+      local expected = {}
+      for i = 1, 250 do expected[i] = "v" .. (i % 250) end
+      assert.are.same(expected, table.n_matches(big, "^v"))
+    end)
+
+    it("should match numbers as text and treat equal numbers as duplicates", function()
+      assert.are.same({ 12, "12", 3 }, table.n_matches({ 12, "12", 12.0, 3, "x" }, "%d"))
+    end)
+
+    it("should keep every NaN that matches, as NaN never equals itself", function()
+      local nan = 0 / 0
+      -- patterns that match however the C runtime spells NaN
+      local actual = table.n_matches({ nan, nan, "word" }, ".", "%S")
+      -- each pattern adds both NaNs again; the string is only added once
+      assert.are.equal(5, #actual)
+      local nans, strings = 0, 0
+      for _, value in ipairs(actual) do
+        if value ~= value then nans = nans + 1 elseif value == "word" then strings = strings + 1 end
+      end
+      assert.are.equal(4, nans)
+      assert.are.equal(1, strings)
+    end)
   end)
 
   describe("Tests the functionality of table.contains", function()
@@ -497,6 +631,107 @@ describe("Tests TableUtils.lua functions", function()
       assert.is_false(table.contains(tbl, "five"))
     end)
 
+    it("should stop at the first nil among the values to look for", function()
+      local tbl = {"one"}
+      assert.is_true(table.contains(tbl, "two", "one"))
+      assert.is_false(table.contains(tbl, "two", nil, "one"))
+    end)
+
+    it("should search a table reached by two routes", function()
+      local shared = {needle = "deep"}
+      local tbl = {a = {shared}, b = {shared}}
+      assert.is_true(table.contains(tbl, "deep"))
+      assert.is_true(table.contains(tbl, "needle"))
+      assert.is_false(table.contains(tbl, "absent"))
+    end)
+
+    it("should cope with a table that holds itself", function()
+      local tbl = {one = 1}
+      tbl.self = tbl
+      assert.is_true(table.contains(tbl, "one"))
+      assert.is_false(table.contains(tbl, "five"))
+    end)
+
+    it("should cope with a cycle between two tables", function()
+      local first, second = {}, {}
+      first.second = second
+      second.first = first
+      second.needle = "found me"
+      assert.is_true(table.contains(first, "found me"))
+      assert.is_false(table.contains(first, "not in here"))
+    end)
+
+    it("should cope with a Geyser object, which always holds itself", function()
+      -- a label knows its container and the container's windowList knows the
+      -- label, so this is the cycle ordinary scripts hit
+      local label = Geyser.Label:new({
+        name = "tableUtilsSpecCycleLabel", x = 0, y = 0, width = 50, height = 20,
+      })
+      finally(function() label:delete() end)
+      -- the search below is only worth anything while that is really a cycle
+      assert.are.equal(label, label.container.windowList[label.name])
+
+      assert.is_true(table.contains(label, "tableUtilsSpecCycleLabel"))
+      assert.is_false(table.contains(label, "no Geyser object holds this"))
+    end)
+
+  end)
+
+  -- table.contains is a loop over table._contains, one pass per value it was
+  -- asked about. Everything the search itself does lives in _contains, and it
+  -- is the only one of the two that reports being handed something that is not
+  -- a table: table.contains treats that report as "not found".
+  describe("Tests the functionality of table._contains", function()
+
+    it("should return true for a value in the table", function()
+      assert.is_true(table._contains({"one", "two"}, "two"))
+    end)
+
+    it("should return true for a key in the table", function()
+      assert.is_true(table._contains({one = 1, two = 2}, "two"))
+    end)
+
+    it("should find a value nested inside another table", function()
+      assert.is_true(table._contains({outer = {inner = {"needle"}}}, "needle"))
+      assert.is_true(table._contains({outer = {inner = {"needle"}}}, "inner"))
+    end)
+
+    it("should return false for something the table does not hold", function()
+      assert.is_false(table._contains({one = 1}, "two"))
+    end)
+
+    it("should return false for an empty table", function()
+      assert.is_false(table._contains({}, "anything"))
+    end)
+
+    it("should report being handed something that is not a table", function()
+      local found, message = table._contains("not a table", "anything")
+      assert.is_nil(found)
+      assert.are.equal("first parameter passed isn't a table", message)
+
+      found, message = table._contains(nil, "anything")
+      assert.is_nil(found)
+      assert.are.equal("first parameter passed isn't a table", message)
+    end)
+
+    it("should let table.contains turn that report into a plain false", function()
+      -- the caller of table.contains never sees the message, so a script that
+      -- wants to know it passed a table has to ask _contains
+      assert.is_false(table.contains("not a table", "anything"))
+    end)
+
+    it("should search for exactly one value, unlike table.contains", function()
+      -- table.contains loops over its extra arguments, _contains ignores them
+      assert.is_false(table._contains({"one"}, "two", "one"))
+      assert.is_true(table.contains({"one"}, "two", "one"))
+    end)
+
+    it("should find a false value stored in the table", function()
+      -- returning the search result rather than the value found is what makes
+      -- a stored false distinguishable from "not there"
+      assert.is_true(table._contains({flag = false}, false))
+      assert.is_false(table._contains({flag = true}, false))
+    end)
   end)
 
   describe("Tests the functionality of table.index_of", function()
@@ -521,6 +756,19 @@ describe("Tests TableUtils.lua functions", function()
         "three"
       }
       assert.equals(nil, table.index_of(tbl, 5))
+    end)
+
+    it("should only search the array part, so a hash value is not found", function()
+      -- it walks with ipairs, so there is no index it could return for a keyed
+      -- entry; table.contains is the function that finds those
+      assert.is_nil(table.index_of({name = "found me"}, "found me"))
+      assert.is_true(table.contains({name = "found me"}, "found me"))
+    end)
+
+    it("should stop at the first nil, so entries past a hole are not found", function()
+      local sparse = {"one", nil, "three"}
+      assert.equals(1, table.index_of(sparse, "one"))
+      assert.is_nil(table.index_of(sparse, "three"))
     end)
   end)
 
@@ -633,6 +881,24 @@ describe("Tests TableUtils.lua functions", function()
       local actual = table.union(tblA, tblB, tblC)
       assert.same(expected,actual)
     end)
+
+    it("should not modify a table it was given", function()
+      local first = { key = { 1, 2 } }
+      local actual = table.union(first, { key = 5 })
+      assert.same({ { 1, 2 }, 5 }, actual.key)
+      assert.same({ 1, 2 }, first.key)
+      assert.is_false(rawequal(actual.key, first.key))
+    end)
+
+    it("should collect a colliding false into a subtable", function()
+      local actual = table.union({ key = false }, { key = 7 })
+      assert.same({ false, 7 }, actual.key)
+    end)
+
+    it("should append a third colliding value to the same subtable", function()
+      local actual = table.union({ key = 1 }, { key = 2 }, { key = 3 })
+      assert.same({ 1, 2, 3 }, actual.key)
+    end)
   end)
 
   describe("Tests the functionality of table.n_union", function()
@@ -742,6 +1008,283 @@ describe("Tests TableUtils.lua functions", function()
       local expected = {a = 1, b = 4, c = 3, d = 10}
       local actual = table.update(tblA, tblB)
       assert.same(expected, actual)
+    end)
+
+    -- Tests for #8694: table.update should not error when t1 has non-table and t2 has table
+    it("should replace non-table value with table value at same key", function()
+      local tblA = {x = 1}
+      local tblB = {x = {y = 2}}
+      local expected = {x = {y = 2}}
+      local actual = table.update(tblA, tblB)
+      assert.same(expected, actual)
+    end)
+
+    it("should replace table value with non-table value at same key", function()
+      local tblA = {x = {y = 2}}
+      local tblB = {x = 1}
+      local expected = {x = 1}
+      local actual = table.update(tblA, tblB)
+      assert.same(expected, actual)
+    end)
+
+    it("should merge nested tables when both have table at same key", function()
+      local tblA = {x = {a = 1, b = 2}}
+      local tblB = {x = {b = 3, c = 4}}
+      local expected = {x = {a = 1, b = 3, c = 4}}
+      local actual = table.update(tblA, tblB)
+      assert.same(expected, actual)
+    end)
+
+    it("should handle string value being replaced by table", function()
+      local tblA = {config = "old"}
+      local tblB = {config = {setting = true}}
+      local expected = {config = {setting = true}}
+      local actual = table.update(tblA, tblB)
+      assert.same(expected, actual)
+    end)
+
+    it("should handle boolean value being replaced by table", function()
+      local tblA = {enabled = true}
+      local tblB = {enabled = {feature1 = true, feature2 = false}}
+      local expected = {enabled = {feature1 = true, feature2 = false}}
+      local actual = table.update(tblA, tblB)
+      assert.same(expected, actual)
+    end)
+
+    it("should return a new table and leave both arguments as they were", function()
+      -- the name reads like an in-place update, so callers that rely on it
+      -- returning a copy would be broken by a well meant optimisation
+      local tblA = {a = 1}
+      local tblB = {b = 2}
+      local actual = table.update(tblA, tblB)
+      assert.are_not.equal(tblA, actual)
+      assert.are_not.equal(tblB, actual)
+      assert.same({a = 1}, tblA)
+      assert.same({b = 2}, tblB)
+      actual.c = 3
+      assert.is_nil(tblA.c)
+      assert.is_nil(tblB.c)
+    end)
+
+    it("should merge nested tables into a new table rather than into tblA's", function()
+      local tblA = {nested = {a = 1}}
+      local tblB = {nested = {b = 2}}
+      local actual = table.update(tblA, tblB)
+      assert.same({a = 1, b = 2}, actual.nested)
+      assert.same({a = 1}, tblA.nested)
+      assert.are_not.equal(tblA.nested, actual.nested)
+    end)
+  end)
+
+  describe("Tests the functionality of table.deepcopy nested independence", function()
+    it("should copy nested tables so mutating the copy does not affect the original", function()
+      local original = { a = 1, nested = { b = 2, deep = { c = 3 } } }
+      local copy = table.deepcopy(original)
+      copy.nested.b = 20
+      copy.nested.deep.c = 30
+      assert.equals(2, original.nested.b)
+      assert.equals(3, original.nested.deep.c)
+      -- the nested tables are distinct references
+      assert.are_not.equal(original.nested, copy.nested)
+      assert.are_not.equal(original.nested.deep, copy.nested.deep)
+    end)
+
+    it("should preserve the metatable of the copied table", function()
+      local mt = { __index = function() return "default" end }
+      local original = setmetatable({}, mt)
+      local copy = table.deepcopy(original)
+      assert.equals(mt, getmetatable(copy))
+      assert.equals("default", copy.anything)
+    end)
+
+    it("should return non-table values unchanged", function()
+      assert.equals(5, table.deepcopy(5))
+      assert.equals("text", table.deepcopy("text"))
+    end)
+
+    it("should preserve the metatable of a nested table too", function()
+      local mt = {__index = function() return "inherited" end}
+      local original = {inner = setmetatable({}, mt)}
+      local copy = table.deepcopy(original)
+      assert.are_not.equal(original.inner, copy.inner)
+      assert.equals(mt, getmetatable(copy.inner))
+      assert.equals("inherited", copy.inner.anything)
+    end)
+
+    -- table._contains guards against this with a "seen" set; deepcopy has none
+    pending("table.deepcopy copies a table that reaches itself - it recurses until the Lua stack overflows - issue #10414")
+  end)
+
+  describe("Tests the functionality of spairs on an empty table", function()
+    it("should iterate zero times over an empty table", function()
+      local count = 0
+      for _ in spairs({}) do
+        count = count + 1
+      end
+      assert.equals(0, count)
+    end)
+  end)
+
+  describe("Tests the functionality of listAdd", function()
+    it("should append an item to the end of the list", function()
+      local list = { "one", "two" }
+      listAdd(list, "three")
+      assert.same({ "one", "two", "three" }, list)
+    end)
+
+    it("should append to an empty list", function()
+      local list = {}
+      listAdd(list, "only")
+      assert.same({ "only" }, list)
+    end)
+  end)
+
+  describe("Tests the functionality of listRemove", function()
+    it("should remove a matching item from the list", function()
+      local list = { "one", "two", "three" }
+      listRemove(list, "two")
+      assert.same({ "one", "three" }, list)
+    end)
+
+    it("should leave the list unchanged when the item is not present", function()
+      local list = { "one", "two" }
+      listRemove(list, "missing")
+      assert.same({ "one", "two" }, list)
+    end)
+
+    it("should leave an empty list empty", function()
+      local list = {}
+      listRemove(list, "x")
+      assert.same({}, list)
+    end)
+
+    it("should remove the sole element when it matches", function()
+      local list = { "x" }
+      listRemove(list, "x")
+      assert.same({}, list)
+    end)
+
+    -- #9546: removal used to happen during an ipairs loop, so deleting index i
+    -- shifted i+1 down into i, which the loop then skipped, leaving one of each
+    -- run of consecutive duplicates behind.
+    it("should remove a pair of consecutive duplicate matches", function()
+      local list = { "a", "x", "x", "b" }
+      listRemove(list, "x")
+      assert.same({ "a", "b" }, list)
+    end)
+
+    it("should remove a run of three or more consecutive duplicates", function()
+      local list = { "x", "x", "x" }
+      listRemove(list, "x")
+      assert.same({}, list)
+    end)
+
+    it("should remove every match whether the duplicates are adjacent or apart", function()
+      local list = { "x", "a", "x", "x", "b", "x" }
+      listRemove(list, "x")
+      assert.same({ "a", "b" }, list)
+    end)
+  end)
+
+  describe("Tests the contract of printTable", function()
+    -- printTable/listPrint write to the screen via echo; we spy on the real
+    -- echo (pass-through) to assert the framing lines without mocking it.
+    it("should echo a header, a line per key/value pair and a footer", function()
+      local echo = spy.on(_G, "echo")
+      finally(function() echo:revert() end)
+      printTable({ alpha = "one", beta = "two" })
+      -- header + 2 pairs + footer; header and footer are the same dashed string,
+      -- so the count is what pins that both framing lines are present
+      assert.spy(echo).was.called(4)
+      assert.spy(echo).was.called_with("-------------------------------------------------------\n")
+      assert.spy(echo).was.called_with("key=alpha value=one\n")
+      assert.spy(echo).was.called_with("key=beta value=two\n")
+    end)
+
+    it("should render a value that is neither a string nor a number", function()
+      local echo = spy.on(_G, "echo")
+      finally(function() echo:revert() end)
+      local nested = {}
+      printTable({ flag = true, nested = nested, fn = print })
+      assert.spy(echo).was.called(5)
+      assert.spy(echo).was.called_with("key=flag value=true\n")
+      assert.spy(echo).was.called_with("key=nested value=" .. tostring(nested) .. "\n")
+      assert.spy(echo).was.called_with("key=fn value=" .. tostring(print) .. "\n")
+    end)
+
+    it("should render a key that is neither a string nor a number", function()
+      local echo = spy.on(_G, "echo")
+      finally(function() echo:revert() end)
+      local key = {}
+      printTable({ [key] = "one", [true] = "two" })
+      assert.spy(echo).was.called(4)
+      assert.spy(echo).was.called_with("key=" .. tostring(key) .. " value=one\n")
+      assert.spy(echo).was.called_with("key=true value=two\n")
+    end)
+
+    it("should not raise on a table of mixed value types", function()
+      local echo = spy.on(_G, "echo")
+      finally(function() echo:revert() end)
+      assert.has_no.errors(function() printTable({ 1, "two", true, {}, print }) end)
+      assert.has_no.errors(function() printTable({}) end)
+    end)
+
+    it("should name itself when it is not given a table", function()
+      assert.has_error(function() printTable(nil) end,
+        'printTable: bad argument #1 type (table expected, got nil!)')
+      assert.has_error(function() listPrint("not a table") end,
+        'listPrint: bad argument #1 type (table expected, got string!)')
+    end)
+  end)
+
+  describe("Tests the contract of listPrint", function()
+    it("should echo a numbered line for each list entry framed by dashed lines", function()
+      local echo = spy.on(_G, "echo")
+      finally(function() echo:revert() end)
+      listPrint({ "first", "second" })
+      -- header + 2 entries + footer
+      assert.spy(echo).was.called(4)
+      assert.spy(echo).was.called_with("1. ) first\n")
+      assert.spy(echo).was.called_with("2. ) second\n")
+    end)
+
+    it("should render entries that are neither strings nor numbers", function()
+      local echo = spy.on(_G, "echo")
+      finally(function() echo:revert() end)
+      local nested = {}
+      listPrint({ true, nested })
+      assert.spy(echo).was.called(4)
+      assert.spy(echo).was.called_with("1. ) true\n")
+      assert.spy(echo).was.called_with("2. ) " .. tostring(nested) .. "\n")
+    end)
+  end)
+
+  describe("Tests the contract of __printTable", function()
+    -- __printTable is documented as printTable's helper but printTable never
+    -- calls it; it is a standalone one pair formatter reachable from scripts,
+    -- writing into the main console at the cursor
+    it("should insert a newline terminated key and value pair", function()
+      local insertText = spy.on(_G, "insertText")
+      finally(function() insertText:revert() end)
+      __printTable("alpha", "one")
+      assert.spy(insertText).was.called(1)
+      assert.spy(insertText).was.called_with("\nkey = alpha value = one")
+    end)
+
+    it("should tostring both the key and the value", function()
+      local insertText = spy.on(_G, "insertText")
+      finally(function() insertText:revert() end)
+      __printTable(3, true)
+      assert.spy(insertText).was.called_with("\nkey = 3 value = true")
+    end)
+
+    it("should land the pair in the main console buffer", function()
+      clearWindow()
+      echo("a line for the cursor to sit on\n")
+      moveCursorEnd()
+      __printTable("visible", "value")
+      local text = table.concat(getLines("main", 0, getLastLineNumber("main") + 1), "\n")
+      assert.is_truthy(text:find("key = visible value = value", 1, true))
     end)
   end)
 end)

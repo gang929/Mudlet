@@ -23,24 +23,26 @@
  *   59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.             *
  ***************************************************************************/
 
-#include "pre_guard.h"
 #include "ui_connection_profiles.h"
 #include <optional>
+#include <QRegularExpression>
 #include <QTimer>
 #include <QKeyEvent>
-#include <pugixml.hpp>
-#if defined(INCLUDE_OWN_QT5_KEYCHAIN)
-#include <../3rdparty/qtkeychain/keychain.h>
-#else
-#include <qt5keychain/keychain.h>
-#endif
-#include "post_guard.h"
 
 class QDir;
+class QTabBar;
+
+namespace pugi {
+class xml_document;
+}
 
 class dlgConnectionProfiles : public QDialog, public Ui::connection_profiles
 {
     Q_OBJECT
+
+    friend class ConnectionDialogKeychainWaitTest;
+    friend class ConnectionDialogOfflineProfileTest;
+    friend class SelfTestProfileIconTest;
 
 public:
     Q_DISABLE_COPY(dlgConnectionProfiles)
@@ -54,6 +56,16 @@ public:
     QList<QListWidgetItem*> findData(const QListWidget& listWidget, const QVariant& what, const int role = Qt::UserRole) const;
     QList<int> findProfilesBeginningWith(const QString&) const;
     static const int csmNameRole{Qt::UserRole};
+    static QChar firstInvalidProfileNameChar(const QString& name);
+    static bool profileNameUsableAsIs(const QString& name);
+    static QString profileFolderPath(const QString& profilesPath, const QString& profile);
+    static const QString scmAllowedProfileNameChars;
+    static const QRegularExpression scmUnusableProfileNameChars;
+    // files whose presence alone does not warrant confirming a profile's removal
+    static const QStringList scmConnectionDetailFiles;
+    // a testing aid rather than a game, and the one list entry that is offered
+    // without any profile data of its own
+    static const QString scmSelfTestProfile;
 
     QString btn_connect_enabled_accessDesc;
     QString btn_load_enabled_accessDesc;
@@ -72,18 +84,15 @@ public slots:
     void slot_updateSslTslPort(int state);
     void slot_updateLogin(const QString&);
     void slot_updatePassword(const QString&);
-// Not used:    void slot_updateWebsite(const QString&);
-    void slot_deleteProfileCheck(const QString&);
+    // Not used:    void slot_updateWebsite(const QString&);
     void slot_updateDescription();
 
     void slot_itemClicked(QListWidgetItem*);
     void slot_addProfile();
     void slot_deleteProfile();
-    void slot_reallyDeleteProfile();
 
     void slot_updateAutoConnect(int state);
     void slot_updateAutoReconnect(int state);
-    void slot_updateDiscordOptIn(int state);
     void slot_load();
     void slot_cancel();
     void slot_copyProfile();
@@ -93,35 +102,78 @@ public slots:
 
 protected:
     bool eventFilter(QObject*, QEvent*) override;
+    void showEvent(QShowEvent*) override;
+    void loadPasswordFromSettings(const QString& profile_name);
+    void ensurePasswordLoadedThenConnect(bool alsoConnect);
+    bool hasPendingKeychainOperation(const QString& profile_name) const;
 
 
 private:
     static bool copyFolder(const QString& sourceFolder, const QString& destFolder);
+    void dismissTutorialInvitation();
     QString getDescription(const QString& profile_name) const;
     bool validateConnect();
-    void updateDiscordStatus();
     bool validateProfile();
     void loadProfile(bool alsoConnect);
     void copyProfileSettingsOnly(const QString& oldname, const QString& newname);
     bool extractSettingsFromProfile(pugi::xml_document& newProfile, const QString& copySettingsFrom);
     void saveProfileCopy(const QDir& newProfiledir, const pugi::xml_document& newProfileXml) const;
     bool copyProfileWidget(QString& profile_name, QString& oldname, QListWidgetItem*& pItem) const;
+    struct CopiedProfileData
+    {
+        QString host;
+        QString port;
+        int sslTsl;
+        QString login;
+        QString website;
+        QString description;
+    };
+    CopiedProfileData captureProfileData() const;
+    void saveDefaultProfileCopy(const QString& profileName, const CopiedProfileData& data, const QString& oldPassword);
     bool hasCustomIcon(const QString&) const;
     void setProfileIcon() const;
     void loadCustomProfile(const QString&) const;
     void generateCustomProfile(const QString&) const;
-    void setCustomIcon(const QString&, QListWidgetItem*) const;
-    template <typename L>
-    void loadSecuredPassword(const QString& profile, L callback);
+    bool setCustomIcon(const QString&, QListWidgetItem*) const;
+    void setIconOfListedProfile(const QString& profileName, const QIcon& icon) const;
+    QString selectedProfileName() const;
     void migrateSecuredPassword(const QString& oldProfile, const QString& newProfile);
-    void writeSecurePassword(const QString& profile, const QString& pass) const;
-    void deleteSecurePassword(const QString& profile) const;
+    void writeSecurePassword(const QString& profile, const QString& pass);
+    void deleteSecurePassword(const QString& profile);
     void setupMudProfile(QListWidgetItem*, const QString& mudServer, const QString& serverDescription, const QString& iconFileName);
     void reallyDeleteProfile(const QString& profile);
+    bool profileRemovable(const QString& profile) const;
+    void updateRemoveButtonState(const QString& profile);
+    void showRemovalProblem(const QString& message);
+    void showRemovalNotice(const QString& message);
+    void showNotification(const QString& message, QLabel* pIcon);
+    void fitWelcomeMessageToContents();
+    void continueProfileSave(QListWidgetItem* pItem, const QString& newProfileName, const QString& newProfileHost, const QString& newProfilePort, const int newProfileSslTsl);
     void setItemName(QListWidgetItem*, const QString&) const;
+    void setItemTooltip(QListWidgetItem*, const QString& description, const bool iconLoaded) const;
     QIcon customIcon(const QString&, const std::optional<QColor>&) const;
     void addLetterToProfileSearch(const int);
-    inline void clearNotificationArea();
+    void clearNotificationArea();
+    void loadPasswordAsync(const QString& profileName);
+    // While a keychain read is outstanding the dialog stays up and says so, rather than hiding
+    // itself for however long the system prompt behind it goes unanswered
+    void showKeychainWait();
+    void clearKeychainWait();
+    // Runs the load that Connect or Offline queued while the keychain was busy, and reports
+    // whether there was one - the dialog is on its way out when there was
+    bool completePendingProfileLoad(const QString& profileName);
+    // Drops a queued load that nothing is going to complete, and gives the dialog its buttons back
+    void abandonPendingProfileLoad();
+    // What a keychain read answers with
+    void passwordRetrieved(const QString& profileName, bool success, const QString& password, const QString& errorMessage);
+    // What a read that had timed out answers with afterwards, while the dialog is still open - a
+    // load that ran closed it - so all it may do is fill a password field left empty.
+    void passwordArrivedLate(const QString& profileName, bool success, const QString& password, const QString& errorMessage);
+    void revealConnectionDetails();
+    bool showingOnlyMyProfiles() const;
+
+    static constexpr int scmMyGamesTab = 0;
+    static constexpr int scmAllGamesTab = 1;
 
     // split into 3 properties so each one can be checked individually
     // important for creation of a folder on disk, for example: name has
@@ -136,30 +188,48 @@ private:
     QPalette mErrorPalette;
     QPalette mReadOnlyPalette;
     QAction* mpCopyProfile = nullptr;
+    // switches the profiles list between the user's own games and the full catalog
+    QTabBar* mpTabBar = nullptr;
     QPushButton* offline_button = nullptr;
     QPushButton* connect_button = nullptr;
-    QLineEdit* delete_profile_lineedit = nullptr;
-    QPushButton* delete_button  = nullptr;
     QString mDiscordApplicationId;
     QString mDiscordInviteURL;
     QAction* mpAction_revealPassword;
     // true for the duration of the 'Copy profile' action
     bool mCopyingProfile = false;
+    // true while a profile is selected or refreshed programmatically, so that
+    // it is not mistaken for the user picking a game from the list
+    bool mProgrammaticProfileSelection = false;
+    // dialog height before it was shrunk to fit the welcome message
+    int mDialogHeightBeforeShrink = 0;
     QString mDateTimeFormat;
     QVector<QColor> mCustomIconColors;
     QTimer mSearchTextTimer;
     QString mSearchText;
+    QTimer* mPasswordSaveTimer = nullptr;
+    QPushButton* mpSkipToGamesButton = nullptr;
+    bool mTutorialDismissed = false;
+    bool mFitWelcomeMessagePending = false;
+
+    // Async connection and password handling
+    QString mPendingPasswordSaveProfile;
+    QString mPendingProfileLoad;       // Profile name waiting for password load
+    bool mPendingConnect = false;      // Whether to connect (true) or just load (false)
+    QString mKeychainOperationProfile; // Whose password a keychain read is fetching, if any
+    bool mKeychainWaitShown = false;   // Whether the dialog is showing the keychain wait
 
 
 private slots:
+    void slot_activeTabChanged(const int index);
+    void slot_skipToGamesList();
     void slot_profileContextMenu(QPoint pos);
     void slot_setCustomIcon();
     void slot_setCustomColor();
     void slot_resetCustomIcon();
     void slot_togglePasswordVisibility(const bool);
-    void slot_passwordSaved(QKeychain::Job* job);
-    void slot_passwordDeleted(QKeychain::Job* job);
     void slot_reenableAllProfileItems();
+    void slot_loadPasswordAsync();
+    void slot_passwordTextChanged();
 };
 
 

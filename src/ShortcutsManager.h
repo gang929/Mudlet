@@ -21,25 +21,29 @@
  *   59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.             *
  ***************************************************************************/
 
-#include "pre_guard.h"
+#include <map>
+#include <memory>
+
 #include <QMap>
 #include <QObject>
 #include <QString>
 #include <QShortcut>
-#include "post_guard.h"
 
 class ShortcutsManager : public QObject
 {
-
     Q_OBJECT
 
 public:
-    ShortcutsManager() = default;
+    explicit ShortcutsManager(QObject* parent = nullptr);
     ShortcutsManager(ShortcutsManager const&) = delete;
     ShortcutsManager& operator=(ShortcutsManager const&) = delete;
     ShortcutsManager(ShortcutsManager&&) = delete;
     ShortcutsManager& operator=(ShortcutsManager&&) = delete;
-    ~ShortcutsManager();
+    ~ShortcutsManager() override;
+
+    // The application's shortcuts, which each profile copies and saves; null
+    // until the application object has made them, so headless has none
+    static ShortcutsManager* self() { return smpSelf; }
 
     void registerShortcut(const QString&, const QString&, QKeySequence*);
     QStringListIterator iterator();
@@ -49,11 +53,13 @@ public:
     QString getLabel(const QString& key);
 
 private:
-    QList<QString> shortcutKeys;
-    QMap<QString, QKeySequence*> shortcuts; //shortcut key : sequence in use pointer
-    QMap<QString, QKeySequence*> defaults; //shortcut key : default sequence
-    QMap<QString, QString> translations; //shortcut key : translation for shortcut label
+    inline static ShortcutsManager* smpSelf = nullptr;
 
+    QList<QString> shortcutKeys;
+    // Non-owning: callers retain ownership of the QKeySequence* stored here.
+    QMap<QString, QKeySequence*> shortcuts;                    //shortcut key : sequence in use pointer
+    std::map<QString, std::unique_ptr<QKeySequence>> defaults; //shortcut key : default sequence (owned)
+    QMap<QString, QString> translations;                       //shortcut key : translation for shortcut label
 };
 
 #endif //MUDLET_SHORTCUTSMANAGER_H

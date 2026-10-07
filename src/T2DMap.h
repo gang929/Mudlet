@@ -4,7 +4,7 @@
 /***************************************************************************
  *   Copyright (C) 2008-2012 by Heiko Koehn - KoehnHeiko@googlemail.com    *
  *   Copyright (C) 2014 by Ahmed Charles - acharles@outlook.com            *
- *   Copyright (C) 2016, 2018-2019, 2022-2023 by Stephen Lyons             *
+ *   Copyright (C) 2016, 2018-2019, 2022-2023, 2025 by Stephen Lyons       *
  *                                               - slysven@virginmedia.com *
  *   Copyright (C) 2021-2022 by Piotr Wilczynski - delwing@gmail.com       *
  *   Copyright (C) 2022 by Lecker Kebap - Leris@mudlet.org                 *
@@ -28,29 +28,45 @@
 #include "dlgMapLabel.h"
 #include "dlgRoomProperties.h"
 
-#include "pre_guard.h"
 #include <QCache>
 #include <QColor>
 #include <QFont>
 #include <QPixmap>
 #include <QPointer>
+#include <QPointF>
 #include <QString>
 #include <QTreeWidget>
 #include <QWidget>
-#include "post_guard.h"
+
+#include <QList>
+#include <memory>
+#include <optional>
 
 class Host;
 class TArea;
 class TMap;
+class TMapLabel;
 class TRoom;
-class MapInfoProperties;
+struct MapInfoProperties;
+class CustomLineDrawContextMenuHandler;
+class CustomLineDrawHandler;
+class CustomLineEditContextMenuHandler;
+class CustomLineEditHandler;
+class CustomLineSession;
+class MiddleMousePanHandler;
+class RoomMoveActivationHandler;
+class RoomMoveDragHandler;
+class RoomContextMenuHandler;
 
 class QCheckBox;
 class QComboBox;
 class QElapsedTimer;
 class QListWidgetItem;
 class QPushButton;
+class QTimer;
 class QTreeWidgetItem;
+class QMouseEvent;
+class QMenu;
 
 
 class T2DMap : public QWidget
@@ -60,8 +76,11 @@ class T2DMap : public QWidget
 public:
     Q_DISABLE_COPY(T2DMap)
     explicit T2DMap(QWidget* parent = nullptr);
+    ~T2DMap() override;
     std::pair<bool, QString> setMapZoom(const qreal zoom, const int areaId = 0);
     void init();
+    // Public so MapRenderBenchmark need not copy the arithmetic.
+    static QRect viewportRoomBounds(float rx0, float ry0, float roomWidth, float roomHeight, float widgetWidth, float widgetHeight);
     void paintEvent(QPaintEvent*) override;
     void mousePressEvent(QMouseEvent*) override;
     void mouseDoubleClickEvent(QMouseEvent* event) override;
@@ -69,6 +88,77 @@ public:
     void wheelEvent(QWheelEvent*) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* e) override;
+
+    friend class CustomLineDrawContextMenuHandler;
+    friend class CustomLineDrawHandler;
+    friend class CustomLineEditContextMenuHandler;
+    friend class CustomLineEditHandler;
+    friend class CustomLineSession;
+    friend class LabelInteractionHandler;
+    friend class RoomMoveActivationHandler;
+    friend class RoomContextMenuHandler;
+    friend class RoomMoveDragHandler;
+    friend class SelectionRectangleHandler;
+    friend class PanInteractionHandler;
+    friend class MiddleMousePanHandler;
+
+    friend class MapMouseInteractionTest;
+
+    struct MapInteractionContext
+    {
+        QMouseEvent* event = nullptr;
+        Qt::MouseButtons buttons = Qt::NoButton;
+        Qt::MouseButton button = Qt::NoButton;
+        Qt::KeyboardModifiers modifiers = Qt::NoModifier;
+        QPoint widgetPosition;
+        QPointF widgetPositionF;
+        qreal mapX = 0.0;
+        qreal mapY = 0.0;
+        QPointF mapPoint;
+        TArea* area = nullptr;
+        const QSet<int>* multiSelectionSet = nullptr;
+        bool hasMultiSelection = false;
+        bool isMapViewOnly = false;
+        bool isMultiSelectionActive = false;
+        bool isSizingLabel = false;
+        bool isLabelHighlighted = false;
+        bool isRoomBeingMoved = false;
+        bool isMoveLabelActive = false;
+        bool isCustomLineDrawing = false;
+        bool isDialogLocked = false;
+        int customLinesRoomFrom = 0;
+        QString customLinesRoomExit;
+        int customLineSelectedRoom = 0;
+        QString customLineSelectedExit;
+        int customLineSelectedPoint = -1;
+        bool hasClickedRoom = false;
+        int clickedRoomId = 0;
+    };
+
+    class IInteractionHandler
+    {
+    public:
+        virtual ~IInteractionHandler() = default;
+        virtual bool matches(const MapInteractionContext& context) const = 0;
+        virtual bool handle(MapInteractionContext& context) = 0;
+    };
+
+    /**
+     * Register an interaction handler that can respond to map input.
+     *
+     * The handler pointer must remain valid for as long as it is registered.
+     * Handlers are evaluated in descending priority order: higher priority
+     * values run first, so they can intercept interactions before lower
+     * priority (fallback) handlers. Registering the same handler again updates
+     * its position in the priority list.
+     */
+    void registerInteractionHandler(IInteractionHandler* handler, int priority);
+    void registerContextMenu(QMenu* menu);
+    bool eventFilter(QObject* watched, QEvent* event) override;
+    void prepareSingleClickSelection(MapInteractionContext& context);
+    std::optional<int> roomIdAtWidgetPosition(const QPoint& widgetPosition, const TArea* area) const;
+    QSet<int> roomIdsAtWidgetPosition(const QPoint& widgetPosition, const TArea* area) const;
+    void populateUserContextMenus(QMenu& menu);
 
     // Was getTopLeft() which returned an index into mMultiSelectionList but that
     // has been been changed to mMultiSelectionSet which cannot be accessed via
@@ -80,28 +170,49 @@ public:
 
     void setRoomSize(double);
     void setExitSize(double);
+    void setBorderSize(double);
     void createLabel(QRectF labelRectangle);
     // Clears cache so new symbols are built at next paintEvent():
-    void flushSymbolPixmapCache() {mSymbolPixmapCache.clear();}
+    void flushSymbolPixmapCache() { mSymbolPixmapCache.clear(); }
+    // How many symbols that cache is holding - the only way from outside to
+    // tell that a flush reached this particular 2D map, of which there is one
+    // per secondary map view as well as the mapper's own:
+    qsizetype symbolPixmapCacheCount() const { return mSymbolPixmapCache.size(); }
     void addSymbolToPixmapCache(const QString, const QString, const QColor, const bool);
+    void flushTextLabelPixmapCache() { mTextLabelPixmapCache.clear(); }
+    void addTextLabelToCache(const QString& key, const TMapLabel& label, const QSize& targetSize);
+    void drawScaledLabel(QPainter& painter, const QPointF& position, TMapLabel& label, int labelKey, const QRectF& paintRect);
     void setPlayerRoomStyle(const int style);
-#if (QT_VERSION) >= (QT_VERSION_CHECK(5, 15, 0))
-    // This is NOT used as a slot in newer versions
+    static QGradientStops buildPlayerRoomGradientStops(int style, quint8 innerDiameterPercentage, const QColor& innerColor, const QColor& outerColor);
     void switchArea(const QString& newAreaName);
-#endif
+    void switchArea(int areaId);
     void clearSelection();
 
+    // Schedules a repaint through a single-shot timer, coalescing multiple
+    // rapid requests (e.g. during mouse wheel zoom or pan drag) into at most
+    // one repaint per csmRenderThrottleMs.  Use this instead of update() for
+    // continuously-firing input events; call update() directly for discrete
+    // user actions where an immediate repaint is expected.
+    void scheduleRender();
 
+    // Secondary view support (for multiple map views feature)
+    void setSecondaryView(bool isSecondary) { mIsSecondaryView = isSecondary; }
+    bool isSecondaryView() const { return mIsSecondaryView; }
 
-    // default 2D zoom level
-    inline static const qreal csmDefaultXYZoom = 20.0;
-    // minimum 2D zoom level
-    inline static const qreal csmMinXYZoom = 3.0;
+    // View state getters
+    int getAreaId() const { return mAreaID; }
+    int getCenterRoomId() const { return mRoomID; }
+    qreal getZoom() const { return xyzoom; }
+    int getZLevel() const { return mMapCenterZ; }
+
+    // Center view on a room. For secondary views, skips raising sysMapAreaChanged events.
+    std::pair<bool, QString> centerview(int roomId);
+    std::pair<bool, QString> exportAreaToImage(int areaId, const QString& filePath, std::optional<int> zLevel = std::nullopt, qreal zoom = 2.0, bool exportAllZLevels = false);
 
 
     TMap* mpMap = nullptr;
     QPointer<Host> mpHost;
-    qreal xyzoom = csmDefaultXYZoom;
+    qreal xyzoom;
     int mRX = 0;
     int mRY = 0;
     QPoint mPHighlight;
@@ -109,20 +220,18 @@ public:
     int mTargetRoomId = 0;
     bool mStartSpeedWalk = false;
 
-
-    // string list: 0 is event name, 1 is menu it is under if it is
-    QMap<QString, QStringList> mUserActions;
-
-    // unique name, List:parent name ("" if null), display name
-    QMap<QString, QStringList> mUserMenus;
-
     bool mRoomBeingMoved = false;
+    QPointF mRoomMoveLastMapPoint;
+    bool mHasRoomMoveLastMapPoint = false;
+    bool mRoomMoveViaContextMenu = false;
     // These are the on-screen width and height pixel numbers of the area for a
     // room symbol, (for the non-grid map mode case what gets filled in is
     // multiplied by rsize which is 1.0 to exactly fill space between adjacent
     // coordinates):
     float mRoomWidth = 0.0f;
     float mRoomHeight = 0.0f;
+    float mPrevRoomWidth = 0.0f;
+    float mPrevRoomHeight = 0.0f;
     float xspan = 0.0f;
     float yspan = 0.0f;
 
@@ -133,14 +242,19 @@ public:
 
     QRectF mMultiRect;
     bool mPopupMenu = false;
+    QPointer<QMenu> mActiveContextMenu;
     QSet<int> mMultiSelectionSet;
+    QSet<int> mMultiSelectionBaseSet;
+    QSet<int> mMultiSelectionAnchorSet;
     bool mNewMoveAction = false;
     QRect mMapInfoRect;
     int mFontHeight = 20;
     bool mShowRoomID = false;
+    bool mShowGrid = false;
     QMap<int, QPixmap> mPixMap;
     double rSize = 0.5;
     double eSize = 3.0;
+    double mBSize = 3.0;
     // When a Lua centerview(...) is called this assigns the room ID value to
     // this member and (switching areas if necessary) pans the map to be
     // centered on this room:
@@ -157,7 +271,13 @@ public:
     // centered on mRoomID - it seems to be needed if the room concerned
     // is being moved by the mouse as part of a selection:
     bool mShiftMode = false;
-    QComboBox* arealist_combobox = nullptr;
+    // Rooms the exit index handed paintRoomExits() last frame, -1 if unused. For tests, which would
+    // otherwise pass just as well on the every-room fallback.
+    int mLodExitIndexRoomsHandedOver = -1;
+    // Test-only: forces the every-room loop so a test can check the index path draws the same frame,
+    // i.e. never hands over too few rooms.
+    bool mLodExitIndexDisabled = false;
+    QPointer<QComboBox> arealist_combobox;
     QPointer<QDialog> mpCustomLinesDialog;
     int mCustomLinesRoomFrom = 0;
     int mCustomLinesRoomTo = 0;
@@ -175,6 +295,9 @@ public:
 
     bool mBubbleMode = false;
     bool mMapperUseAntiAlias = true;
+
+    // Toggled by dlgMapper so its overlays don't stack on the painted empty-state text.
+    bool mSuppressEmptyStateMessage = false;
 
     // Controls if the mapper is in view-only mode
     bool mMapViewOnly = true;
@@ -204,28 +327,36 @@ public slots:
     void slot_editLabel();
     void slot_setPlayerLocation();
     void slot_toggleMapViewOnly();
+    void slot_configureAreas();
     void slot_createLabel();
     void slot_customLineColor();
     void slot_shiftZup();
     void slot_shiftZdown();
-#if (QT_VERSION) < (QT_VERSION_CHECK(5, 15, 0))
-    // This is ONLY used as a slot in older versions
-    void slot_switchArea(const QString& newAreaName);
-#endif
-// Not used: void slot_toggleShiftMode();
     void slot_shiftUp();
     void slot_shiftDown();
     void slot_shiftLeft();
     void slot_shiftRight();
     void slot_showPropertiesDialog();
-    void slot_setRoomProperties(
-        bool changeName, QString newName,
-        bool changeRoomColor, int newRoomColor,
-        bool changeSymbol, QString newSymbol,
-        bool changeSymbolColor, QColor newSymbolColor,
-        bool changeWeight, int newWeight,
-        bool changeLockStatus, bool newLockStatus,
-        QSet<TRoom*> rooms);
+    void slot_setRoomProperties(bool changeName,
+                                QString newName,
+                                bool changeRoomColor,
+                                int newRoomColor,
+                                bool changeSymbol,
+                                QString newSymbol,
+                                bool changeSymbolColor,
+                                QColor newSymbolColor,
+                                bool changeWeight,
+                                int newWeight,
+                                bool changeLockStatus,
+                                std::optional<bool> newLockStatus,
+                                bool changeHiddenStatus,
+                                std::optional<bool> newHiddenStatus,
+                                bool changeBorderColor,
+                                QColor newBorderColor,
+                                bool changeBorderThickness,
+                                int newBorderThickness,
+                                QSet<int> roomIds);
+    void slot_previewBorderProperties(QSet<int> roomIds);
     void slot_setImage();
     void slot_movePosition();
     void slot_moveRoom();
@@ -244,29 +375,120 @@ public slots:
     void slot_customLineProperties();
     void slot_customLineAddPoint();
     void slot_customLineRemovePoint();
+    void slot_setSnapCustomLinePointsToGrid(bool enabled);
+    void slot_moveCustomLineLastPointToTargetRoom();
+    bool canMoveSelectedCustomLineLastPointToTargetRoom() const;
+    bool canMoveCustomLineLastPointToTargetRoom(const TRoom& room, const QString& exitKey) const;
     void slot_cancelCustomLineDialog();
     void slot_loadMap();
     void slot_newMap();
+    void slot_exportAreaToImage();
 
 private:
+    void set3DViewCenter(int areaId, int x, int y, int z);
+
+    class InteractionDispatcher
+    {
+    public:
+        void registerHandler(IInteractionHandler* handler, int priority);
+        bool dispatch(MapInteractionContext& context) const;
+
+    private:
+        struct HandlerEntry
+        {
+            int priority = 0;
+            IInteractionHandler* handler = nullptr;
+        };
+
+        QList<HandlerEntry> mHandlers;
+    };
+
+    std::unique_ptr<CustomLineSession> mCustomLineSession;
+    InteractionDispatcher mInteractionDispatcher;
+    std::unique_ptr<IInteractionHandler> mCustomLineDrawContextMenuHandler;
+    std::unique_ptr<IInteractionHandler> mCustomLineDrawInteractionHandler;
+    std::unique_ptr<IInteractionHandler> mCustomLineEditContextMenuHandler;
+    std::unique_ptr<IInteractionHandler> mCustomLineEditInteractionHandler;
+    std::unique_ptr<IInteractionHandler> mRoomContextMenuHandler;
+    std::unique_ptr<IInteractionHandler> mRoomMoveActivationHandler;
+    std::unique_ptr<IInteractionHandler> mRoomMoveDragHandler;
+    std::unique_ptr<IInteractionHandler> mSelectionRectangleInteractionHandler;
+    std::unique_ptr<IInteractionHandler> mLabelInteractionHandler;
+    std::unique_ptr<MiddleMousePanHandler> mMiddleMousePanHandler;
+    std::unique_ptr<IInteractionHandler> mPanInteractionHandler;
+
+    MapInteractionContext buildInteractionContext(QMouseEvent* event);
+
     void updateSelectionWidget();
     void resizeMultiSelectionWidget();
+    void hideSelectionWidget();
+    void pruneRoomSelectionToArea(int areaId);
     std::pair<int, int> getMousePosition();
+    std::pair<bool, QString> performImageSave(const QPixmap& pixmap, const QString& filePath, const QString& format);
+    bool isSnapCustomLinePointsToGridEnabled() const;
+    QPointF snapPointToGrid(const QPointF& point) const;
     bool checkButtonIsForGivenDirection(const QPushButton*, const QString&, const int&);
     bool sizeFontToFitTextInRect(QFont&, const QRectF&, const QString&, const quint8 percentageMargin = 10, const qreal minFontSize = 7.0);
-    void drawRoom(QPainter&, QFont&, QFont&, QPen&, TRoom*, const bool isGridMode, const bool areRoomIdsLegible, const bool showRoomNames, const int, const float, const float, const QMap<int, QPointF>&);
-    void paintMapInfo(const QElapsedTimer& renderTimer, QPainter& painter, const int displayAreaId, QColor& infoColor);
-    int paintMapInfoContributor(QPainter&, int xOffset, int yOffset, const MapInfoProperties& properties);
-    void paintRoomExits(QPainter&, QPen&, QList<int>& exitList, QList<int>& oneWayExits, const TArea*, int, float, QMap<int, QPointF>&);
+    inline void drawRoom(
+            QPainter&, QFont&, QFont&, QPen&, TRoom*, const bool isGridMode, const bool areRoomIdsLegible, const bool showRoomNames, const int, const float, const float, const bool showRoomCollision);
+    // Batch rendering for large grid mode areas - draws rooms grouped by color
+    void drawGridModeRooms(QPainter&,
+                           const TArea* pDrawnArea,
+                           const int zLevel,
+                           const int playerRoomId,
+                           const float mRX,
+                           const float mRY,
+                           const float mRoomWidth,
+                           const float mRoomHeight,
+                           const float widgetWidth,
+                           const float widgetHeight,
+                           QFont& roomVNumFont,
+                           bool& isPlayerRoomVisible,
+                           QPointF& playerRoomOnWidgetCoordinates,
+                           bool areRoomIdsLegible,
+                           QString* profileOutput = nullptr);
+    // The non-grid room loop for zooms where a room is a few pixels across.
+    void drawNonGridModeRoomsLod(QPainter&,
+                                 const TArea* pDrawnArea,
+                                 int zLevel,
+                                 int playerRoomId,
+                                 const QList<int>& viewportRooms,
+                                 float widgetWidth,
+                                 float widgetHeight,
+                                 bool& isPlayerRoomVisible,
+                                 QPointF& playerRoomOnWidgetCoordinates,
+                                 QString* profileOutput = nullptr);
+    QColor environmentColor(int environmentId) const;
+    QSize lodRoomBlobSize() const;
+    // Carries the room to save the drawing pass a second room-database probe per exit.
+    // Valid only within the paintRoomExits() room iteration that gathered it.
+    struct ExitToPaint
+    {
+        const TRoom* destination = nullptr;
+        int destinationId = 0;
+        // The destination's reverse exit doesn't lead back. Not the sole arrow test: an exit also gets
+        // an arrow when a sibling exit to the same room is one-way.
+        bool oneWay = false;
+    };
+    void paintRoomExits(QPainter&, QPen&, QList<ExitToPaint>& exitList, const TArea*, int zLevel, const QRect& roomBounds, const QList<int>& viewportRooms, float exitWidth, QMap<int, QPointF>&);
+    void resolveAreaExitClick(QPainter&, const QMap<int, QPointF>& areaExitsMap, const int speedWalkStartRoomId);
     void initiateSpeedWalk(const int speedWalkStartRoomId, const int speedWalkTargetRoomId);
     inline void drawDoor(QPainter&, const TRoom&, const QString&, const QLineF&);
     void updateMapLabel(QRectF labelRectangle, int labelId, TArea* pArea);
+    static void paintLabelHighlight(QPainter& painter, QRectF labelPaintRectangle, const QSizeF& clickSize);
 
     bool mDialogLock = false;
-    struct ClickPosition {
+    struct ClickPosition
+    {
         int x;
         int y;
     } mContextMenuClickPosition;
+
+    // Throttle repaint requests from continuous mouse events (pan drag, scroll
+    // wheel zoom) to avoid saturating the main thread at high event rates.
+    // Maximum of one repaint per csmRenderThrottleMs is allowed via scheduleRender().
+    static constexpr int csmRenderThrottleMs = 16; // ~60 fps cap
+    QTimer* mpRenderThrottleTimer = nullptr;
 
     // This holds the ID of the room highlighted in yellow when multiple
     // rooms are selected. It is either the first selected room, or the
@@ -282,22 +504,33 @@ private:
     // as we now show room names (if present) as well.
     bool mIsSelectionUsingNames = false;
     QCache<QString, QPixmap> mSymbolPixmapCache;
+    QCache<QString, QPixmap> mTextLabelPixmapCache;
     ushort mSymbolFontSize = 1;
     QFont mMapSymbolFont;
-    QPointer<QAction> mpCreateRoomAction;
     // in the players current area, how many digits does the biggest room number have?
     quint8 mMaxRoomIdDigits = 0;
+    // Cache for the above: recomputing it is a scan of every room in the area,
+    // so it is only redone when this differs from the drawn area's current
+    // TArea::getRoomsVersion(). That single comparison is enough on its own -
+    // the version comes from a counter shared by every TArea, so no two TArea
+    // instances, past or present, are ever stamped with the same value, and it
+    // both identifies which area a cached value belongs to and invalidates on
+    // a room-membership change. 0 is never handed out to a real TArea, so it
+    // doubles as this cache's own "nothing cached yet" starting value.
+    quint32 mCachedRoomIdDigitsVersion = 0;
 
     // Holds the QRadialGradient details to use for the player room:
-    QGradientStops mPlayerRoomColorGradentStops;
+    QGradientStops mPlayerRoomColorGradientStops;
 
-    dlgRoomProperties* mpDlgRoomProperties = nullptr;
-    dlgMapLabel* mpDlgMapLabel = nullptr;
+    QPointer<dlgRoomProperties> mpDlgRoomProperties;
+    QPointer<dlgMapLabel> mpDlgMapLabel;
     // Track the area last viewed so we can raise an event when it changes,
     // initialised to an invalid area that is different to the one that mAreaID
     // is initialised to - so that the xyzoom gets read for the first area that
     // is shown - because the value of these two are different:
     int mLastViewedAreaID = -2;
+
+    bool mIsSecondaryView = false;
 
 private slots:
     void slot_createRoom();
