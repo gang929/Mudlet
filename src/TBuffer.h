@@ -157,6 +157,7 @@ public:
     , mBgColor(copy.mBgColor)
     , mFlags(copy.mFlags & ~Selected)
     , mLinkIndex(copy.mLinkIndex)
+    , mRightHalf(copy.mRightHalf)
     {
     }
     // Under the rule of three, because we have a user defined copy-constructor,
@@ -173,21 +174,58 @@ public:
     TChar& operator=(TChar&&) = default;
     ~TChar() = default;
 
-    bool operator==(const TChar&);
+    bool operator==(const TChar&) const;
+    // Every setter restyles the whole character, so a split right half (see
+    // setRightHalf()) takes the same change:
     void setColors(const QColor& newForeGroundColor, const QColor& newBackGroundColor)
     {
         mFgColor = newForeGroundColor.rgba();
         mBgColor = newBackGroundColor.rgba();
+        if (Q_UNLIKELY(mRightHalf)) {
+            restyleRightHalf(&mFgColor, &mBgColor, None, None);
+        }
     }
     // Only considers the flags within TestMask - so not Echo or Found:
-    void setAllDisplayAttributes(const AttributeFlags newDisplayAttributes) { mFlags = (mFlags & ~TestMask) | (newDisplayAttributes & TestMask); }
-    void setForeground(const QColor& newColor) { mFgColor = newColor.rgba(); }
-    void setBackground(const QColor& newColor) { mBgColor = newColor.rgba(); }
+    void setAllDisplayAttributes(const AttributeFlags newDisplayAttributes)
+    {
+        mFlags = (mFlags & ~TestMask) | (newDisplayAttributes & TestMask);
+        if (Q_UNLIKELY(mRightHalf)) {
+            restyleRightHalf(nullptr, nullptr, TestMask, newDisplayAttributes);
+        }
+    }
+    // Sets or clears just the given flags, which may include non-display ones such as Found:
+    void setAttributes(const AttributeFlags attributes, const bool state)
+    {
+        mFlags = state ? (mFlags | attributes) : (mFlags & ~attributes);
+        if (Q_UNLIKELY(mRightHalf) && (attributes & TestMask)) {
+            restyleRightHalf(nullptr, nullptr, attributes & TestMask, state ? attributes : None);
+        }
+    }
+    void setForeground(const QColor& newColor)
+    {
+        mFgColor = newColor.rgba();
+        if (Q_UNLIKELY(mRightHalf)) {
+            restyleRightHalf(&mFgColor, nullptr, None, None);
+        }
+    }
+    void setBackground(const QColor& newColor)
+    {
+        mBgColor = newColor.rgba();
+        if (Q_UNLIKELY(mRightHalf)) {
+            restyleRightHalf(nullptr, &mBgColor, None, None);
+        }
+    }
     void setTextFormat(const QColor& newFgColor, const QColor& newBgColor, const AttributeFlags newDisplayAttributes)
     {
         setColors(newFgColor, newBgColor);
         setAllDisplayAttributes(newDisplayAttributes);
     }
+    // A legacy double-byte character whose two bytes arrived with different
+    // renditions paints its right half in the colours and display attributes of
+    // `right`; everything else (link, selection, search highlight) is shared:
+    void setRightHalf(const TChar& right) { setRightHalf(right.mFgColor, right.mBgColor, right.mFlags); }
+    bool hasSplitFormat() const { return mRightHalf; }
+    TChar rightHalf() const;
 
     // The same color QColor::fromRgba() gives, built inline: that one is an
     // out-of-line call, and painting asks for both colors of every cell.
@@ -303,9 +341,17 @@ private:
     QRgb mFgColor = 0;
     QRgb mBgColor = 0;
     AttributeFlags mFlags = None;
-    int mLinkIndex = 0;
+    // TLinkStore ids never exceed TLinkStore::scmMaxLinks:
+    quint16 mLinkIndex = 0;
+    // 0, or the index of this character's right-half rendition in a process-wide
+    // table that interns each distinct one - so a split costs no extra memory per
+    // character and needs no remapping when a character moves between buffers:
+    quint16 mRightHalf = 0;
     // Note: Decoration colors (underline/overline/strikeout) are stored in TLinkStore
     // for memory efficiency - they are looked up via linkIndex() at render time.
+
+    void setRightHalf(QRgb foreground, QRgb background, AttributeFlags flags);
+    void restyleRightHalf(const QRgb* foreground, const QRgb* background, AttributeFlags mask, AttributeFlags flags);
 };
 Q_DECLARE_OPERATORS_FOR_FLAGS(TChar::AttributeFlags)
 // std::vector only relocates by moving if the move cannot throw; otherwise it
@@ -339,10 +385,16 @@ public:
     // As per QDateTime::toString(). Translatable, so overwritten once at startup and fixed thereafter:
     static inline QString smTimeStampFormat = qsl("hh:mm:ss.zzz ");
 
-    // Marks continuation lines and detects paragraph starts, so must differ from any smTimeStampFormat
-    // output yet match its width: layoutLine() advances columns by smTimeStampFormat.size() whatever it
-    // paints, so another width shifts the text origin and the mouse-to-column mapping:
+    // Shown for continuation lines. Must match smTimeStampFormat's width: layoutLine() advances columns by
+    // smTimeStampFormat.size() whatever it paints, so another width shifts the text origin and the
+    // mouse-to-column mapping:
     static inline QString smBlankTimeStamp = qsl("------------ ");
+    // timeBuffer entries: arrival time in milliseconds since the epoch, or csmNoTimeStamp (timeStampText()
+    // shows nothing) or csmWrappedLineTimeStamp (a line wrapping split off the one above; shows smBlankTimeStamp)
+    static constexpr qint64 csmNoTimeStamp = -1;
+    static constexpr qint64 csmWrappedLineTimeStamp = -2;
+    static QString formatTimeStamp(qint64 msecs);
+    QString timeStampText(const int line) const { return formatTimeStamp(timeBuffer.at(line)); }
 
     explicit TBuffer(Host* pH);
     ~TBuffer();
@@ -352,12 +404,20 @@ public:
     bool insertInLine(QPoint& cursor, const QString& what, const TChar& format);
     void expandLine(int y, int count, TChar&);
     int wrapLine(int startLine, int maxWidth, int indentSize, int hangingIndentSize);
+    // At the width and indents text is appended with
+    int wrapLine(int startLine) { return wrapLine(startLine, mWrapAt, mWrapIndent, mWrapHangingIndent); }
     void log(int, int);
     QString assembleLog(int fromLine, int toLine);
     inline int skipSpacesAtBeginOfLine(const int row, const int column);
     void addLink(bool, const QString& text, QStringList& command, QStringList& hint, const TChar& format, const QVector<int>& luaReference = QVector<int>());
+    // line is the first the link can land on, by default the last line
+    int addLinkToStore(const QStringList& links, const QStringList& hints, const QVector<int>& luaReference = QVector<int>(), const QString& expireName = QString(), int line = -1);
     QString bufferToHtml(const bool showTimeStamp = false, const int row = -1, const int endColumn = -1, const int startColumn = 0, int spacePadding = 0);
     int size() { return static_cast<int>(buffer.size()); }
+    // Whether word wrapping split this line off the end of the one before it
+    bool wrapsFromPreviousLine(int lineNumber) const;
+    int wrapGapBefore(int lineNumber) const;
+    int wrapIndentWidth(int lineNumber) const;
     bool isEmpty() const { return buffer.size() == 0; }
     QString& line(int lineNumber);
     // Colors of the current trigger-pass line as committed, before any
@@ -366,6 +426,16 @@ public:
     // The one color pair shared by every character of that same line, or
     // nullptr when its colors vary or there is no snapshot for it:
     const TChar* preTriggerPassLineUniformColors(int lineNumber);
+    // Where the line a trigger pass was handed is now, after triggers earlier in the
+    // pass, or a nested pass, deleted or rewrapped lines above it or the buffer trimmed
+    // its oldest; csmDetachedTriggerPassLine once the line itself has been deleted.
+    // Any other line number is handed back as it is.
+    int triggerPassLineNow(int lineNumber) const;
+    // What color matching reads for a pass line that has been deleted: its colors as
+    // they arrived and its text as it was when it went
+    const std::vector<TChar>& detachedTriggerPassLine() const { return mPreTriggerPassLine; }
+    const QString& detachedTriggerPassLineText() const { return mDetachedTriggerPassLineText; }
+    static constexpr int csmDetachedTriggerPassLine = -2;
     int find(int line, const QString& what, int pos);
     QStringList split(int line, const QString& splitter);
     QStringList split(int line, const QRegularExpression& splitter);
@@ -393,6 +463,7 @@ public:
     // - public so that the connection teardown and Host's flush timer can
     // flush it:
     void flushPendingServerWrapJoin(const bool endsHyperlink = true);
+    bool holdsServerWrapLine() const { return !mServerWrapPendingLine.isEmpty(); }
     // How long to hold a full-width line for its continuation before deciding
     // it really was complete:
     static constexpr int csmServerWrapFlushDelayMs = 300;
@@ -404,7 +475,7 @@ public:
     // packets relies on that state surviving between calls to
     // translateToPlainText():
     void resetSequenceParserState();
-    // timeStampOverride keeps the arrival time for held-back content being replayed:
+    // timeStampOverride keeps the arrival time for held-back content being replayed; csmNoTimeStamp stamps it now:
     void append(const QString& chunk,
                 int sub_start,
                 int sub_end,
@@ -412,7 +483,7 @@ public:
                 const QColor& bg,
                 const TChar::AttributeFlags flags = TChar::None,
                 const int linkID = 0,
-                const QString& timeStampOverride = QString());
+                const qint64 timeStampOverride = csmNoTimeStamp);
     // Only the bits within TChar::TestMask are considered for formatting:
     void append(const QString& chunk, const int sub_start, const int sub_end, const TChar& format, const int linkID = 0);
     void appendFormatted(const QString& text, const std::vector<TChar>& formatting, const TLinkStore& sourceLinkStore);
@@ -423,7 +494,7 @@ public:
                     const QColor& bg,
                     TChar::AttributeFlags flags = TChar::None,
                     const int linkID = 0,
-                    const QString& timeStampOverride = QString());
+                    const qint64 timeStampOverride = csmNoTimeStamp);
     void appendEmptyLine();
     void setWrapAt(int i) { mWrapAt = i; }
     void setWrapIndent(int i) { mWrapIndent = i; }
@@ -445,7 +516,7 @@ public:
     void injectOSC8DocumentationExamples();
 
     // Resolved from the encoding name when it changes, not in the per-byte loop:
-    enum class Decoder : quint8 { Ascii, Latin1, Gbk, Gb18030, EucKr, Big5, Utf8 };
+    enum class Decoder : quint8 { Ascii, Latin1, Gbk, Gb18030, EucKr, Big5, ShiftJis, EucJp, Utf8 };
     static Decoder decoderFor(const QByteArray&);
     // It would have been nice to do this with Qt's signals and slots but that
     // is apparently incompatible with using a default constructor - sigh!
@@ -460,10 +531,13 @@ public:
     std::deque<std::vector<TChar>> buffer;
     // stores the actual content of lines
     QStringList lineBuffer;
-    // stores timestamps associated with lines
-    QStringList timeBuffer;
+    // each line's arrival time, see csmNoTimeStamp
+    QList<qint64> timeBuffer;
     // stores a boolean whenever the line is a prompt one
     QList<bool> promptBuffer;
+    // stores, for a line that word wrapping split off the one before it, how
+    // many spaces the break dropped between the two - a copy puts them back
+    QList<quint16> wrapGapBuffer;
     TLinkStore mLinkStore;
     int mLinesLimit = 10000;
     int mBatchDeleteSize = 1000;
@@ -474,13 +548,28 @@ public:
     bool mEchoingText = false;
 
 private:
+    // Reads which removed links are waiting for a sweep
+    friend class TrackedLinkTrimTest;
+    int mLinesUntilLinkSweep = 0;
+    QSet<int> mLinkIdsRemovedSinceSweep;
+    qint64 mLinesRemovedTotal = 0;
+    QHash<int, qint64> mLinkIdIssuedAtLine;
+    bool linkHoldsState(const int id) const;
+    QSet<int> collectLiveLinkIdsResettingIssueLines();
+    void dropStateOfRemovedLinks();
+    void noteRemovedLinkId(int id, qint64 lastLine);
+    void noteRemovedLinks(const std::vector<TChar>& line, qint64 lineNumber, int from = 0, int to = -1);
     THyperlinkVisibilityManager* hyperlinkVisibilityManagerOrNull();
     TChar currentFormat() const;
     inline QList<WrapInfo> getWrapInfo(const QString& lineText, bool isNewline, const int maxWidth, const int indent, const int hangingIndent);
     void shrinkBuffer();
-    void syncPreTriggerPassLine(int y);
+    void spliceInsertIntoPreTriggerPassLine(int y, int x, int count, const TChar& format);
+    void spliceEraseFromPreTriggerPassLine(int y, int x, int xEnd);
+    void wrapPreTriggerPassLine(const WrapInfo& firstSegment, int indentWidth);
+    void noteFoundLines(int first, int last);
     void materialisePreTriggerPassLine(int y);
-    int remapLinkId(const TLinkStore& sourceLinkStore, int sourceLinkId, QHash<int, int>& remappedLinkIds);
+    void triggerPassLinesRemoved(int from, int to);
+    int remapLinkId(const TLinkStore& sourceLinkStore, int sourceLinkId, QHash<int, int>& remappedLinkIds, int line = -1);
     int calculateWrapPosition(int lineNumber, int begin, int end);
     void handleNewLine();
     void translateToPlainTextInner(std::string& incoming, bool isFromServer);
@@ -490,6 +579,15 @@ private:
     bool processGBSequence(const std::string&, bool, bool, size_t, size_t&, bool&);
     bool processBig5Sequence(const std::string&, bool, size_t, size_t&, bool&);
     bool processEUC_KRSequence(const std::string&, bool, size_t, size_t&, bool&);
+    bool processJapaneseSequence(const std::string&, bool, size_t, size_t&, bool&);
+    bool processDoubleByteSequence(const std::string&, bool, size_t, size_t&, bool&);
+    static bool doubleByteLead(Decoder, quint8);
+    static bool doubleByteTrail(Decoder, quint8);
+    void styleForCurrentLink(TChar&);
+    void flushPendingLead();
+    void clearSequenceLatches();
+    void endLocalFeedSequences();
+    void appendReplacementCharacter(TChar);
     static QStringDecoder multibyteDecoderFor(Decoder, const QByteArray&);
     bool decodeMultibyteSequence(QByteArrayView, QString&);
     // Views into the string decodeSGR() was handed, so none may outlive that call.
@@ -505,6 +603,7 @@ private:
     void resetColors();
     bool commitLine(char ch, size_t& localBufferPosition, bool isFromServer = false, bool forcedLineBreak = false);
     void commitLineData(QString line, std::vector<TChar> chars, char ch);
+    bool dropSpaceAtWrap(QChar);
     bool endsAtServerWrapColumn() const;
     bool looksLikeWrappedProse(const QString& line) const;
     static bool segmentEndsSettledSentence(const QString& line);
@@ -620,6 +719,18 @@ private:
     // Parked between lines so the trigger-pass snapshot reuses its allocation:
     std::vector<TChar> mSpareTriggerPassLine;
     int mPreTriggerPassLineNumber = -1;
+    // The index the current trigger pass was handed, which mPreTriggerPassLineNumber moves on from
+    int mTriggerPassLineAsCommitted = -1;
+    QString mDetachedTriggerPassLineText;
+    struct EnclosingTriggerPass
+    {
+        int lineNumber = -1;
+        QString detachedText;
+    };
+    // The passes a trigger calling feedTriggers() has paused. A member, not saved in
+    // commitLineData()'s frame, as their lines move with deleted, rewrapped and
+    // trimmed lines just as the current one does
+    QList<EnclosingTriggerPass> mEnclosingTriggerPasses;
     // Meaningful only inside a trigger pass: false until something overwrites
     // the committed line, while the game's colors are still readable from it:
     bool mPreTriggerPassSnapshotTaken = true;
@@ -640,23 +751,28 @@ private:
     QString mServerWrapPendingSegmentStart;
     // Used to hold the unprocessed bytes that could be left at the end of a
     // packet if we detect that there should be more - will be prepended to the
-    // next chunk of data - PROVIDED it is flagged as coming from the MUD Server
-    // and is not generated locally {because both pass through
-    // translateToPlainText()}:
+    // next chunk of data from the Game Server. A local feed arrives whole, so
+    // it never carries any over (endLocalFeedSequences()):
     std::string mIncompleteSequenceBytes;
+    // The lead byte of a double-byte character that the game restyled before
+    // sending its trail byte, with the rendition that paints its left half;
+    // 0 when there is none, as no encoding uses that as a lead byte:
+    char mPendingLead = 0;
+    TChar mPendingLeadFormat;
 
-    // The parser sequence state (the mGot... latches and
-    // mIncompleteSequenceBytes) for whichever of the two data channels - Game
-    // Server stream or locally generated text - is not currently being
-    // processed; translateToPlainText() swaps it in around a local feed so
-    // that such text cannot consume or clear a latch belonging to a sequence
-    // split across Game Server packets (and vice versa):
+    // The Game Server stream's parser sequence state (the mGot... latches,
+    // mIncompleteSequenceBytes and the pending lead byte), parked here while
+    // translateToPlainText() runs a locally generated feed, which starts clean
+    // and ends whatever it left open, so that such text cannot consume or clear
+    // a latch belonging to a sequence split across Game Server packets:
     bool mLocalGotESC = false;
     bool mLocalGotEscCharset = false;
     bool mLocalGotCSI = false;
     bool mLocalGotOSC = false;
     bool mLocalGotString = false;
     std::string mLocalIncompleteSequenceBytes;
+    char mLocalPendingLead = 0;
+    TChar mLocalPendingLeadFormat;
     // Set whilst a locally generated feed is being processed, so a nested feed
     // (e.g. an MXP <HR> inside locally fed text) does not swap the state again:
     bool mProcessingLocalFeed = false;
@@ -734,6 +850,11 @@ private:
     int mCurrentFocusedLinkIndex = 0; // Which link has keyboard focus (0 = none)
     int mLastClickedLinkIndex = 0;    // Last clicked link - suppresses hover until mouse leaves
 
+    // The lines that may hold a TChar::Found mark, so clearing them does not walk the
+    // whole buffer; a conservative range, kept in step as lines are removed and rewrapped
+    int mFirstFoundLine = -1;
+    int mLastFoundLine = -1;
+
     // Flag to skip trigger processing during documentation injection
     bool mSkipTriggerProcessing = false;
 
@@ -775,6 +896,10 @@ private:
 
     // Track links that need selection styling applied after buffer commit
     QSet<int> mPendingSelectionStyling;
+    // The first line committed while such a link was open or pending, so applying
+    // its styling need not walk the whole scrollback; -1 when there is none
+    int mSelectionStylingFromLine = -1;
+    bool selectionLinkOpen() const { return mHyperlinkActive && mCurrentHyperlinkStyling.selection.hasSelectionSettings; }
 
 public:
     // Methods for link state management (used by TTextEdit event handlers)
@@ -792,7 +917,7 @@ public:
     bool isSpoilerUnrevealed(int linkIndex) const { return mLinkOriginalText.contains(linkIndex); }
     void clearGroupSelection(const QString& group, const QString& exceptValue);
     void applyPendingSelectionStyling();
-    void updateLinkCharacters(int linkIndex);
+    void updateLinkCharacters(int linkIndex, int fromLine = 0);
     int getHoveredLink() const { return mCurrentHoveredLinkIndex; }
     int getActiveLink() const { return mCurrentActiveLinkIndex; }
     int getFocusedLink() const { return mCurrentFocusedLinkIndex; }

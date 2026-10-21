@@ -24,6 +24,7 @@
 #include "EditorCommand.h"
 
 #include <QDebug>
+#include <QSet>
 #include <typeinfo>
 #include <utility>
 
@@ -133,14 +134,15 @@ void EditorUndoStack::collectAffectedItems(const QUndoCommand* cmd, QMap<EditorV
         QList<int> itemIDs = mudletCmd->affectedItemIDs();
 
         // Add to the map, avoiding duplicates and invalid IDs
+        QList<int>& affectedIDs = affectedItemsByView[viewType];
+        QSet<int> seenIDs{affectedIDs.cbegin(), affectedIDs.cend()};
         for (int id : std::as_const(itemIDs)) {
             // Skip invalid IDs (0 or negative)
-            if (id <= 0) {
+            if (id <= 0 || seenIDs.contains(id)) {
                 continue;
             }
-            if (!affectedItemsByView[viewType].contains(id)) {
-                affectedItemsByView[viewType].append(id);
-            }
+            seenIDs.insert(id);
+            affectedIDs.append(id);
         }
     }
 
@@ -162,6 +164,17 @@ void EditorUndoStack::pushCommand(QUndoCommand* cmd)
 #if defined(DEBUG_UNDO_REDO)
     qDebug() << "EditorUndoStack::pushCommand() - Stack now has" << count() << "commands, index:" << index();
 #endif
+}
+
+void EditorUndoStack::finishAddingItem(EditorViewTypes::EditorViewType viewType, int itemID)
+{
+    // Not just the top command: a toggle or a move made before the first save sits above the add,
+    // and undoing it later would bring an unfinished add back to the top
+    for (int i = index() - 1; i >= 0; --i) {
+        if (const auto* pAdd = dynamic_cast<const EditorAddItemCommand*>(command(i))) {
+            pAdd->finishAdding(viewType, itemID);
+        }
+    }
 }
 
 void EditorUndoStack::beginMacro(const QString& text)

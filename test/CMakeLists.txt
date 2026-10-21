@@ -108,17 +108,25 @@ set(UNIT_TESTS
     TEncodingHelperTest
     PasswordMigrationTest
     TMediaPathTraversalTest
+    TAudioMixerMixTest
     ProfileNameValidationTest
 )
+
+# The MCP server only lands in the Mudlet library when configured with USE_MCPSERVER, so
+# its test is gated the same way. Qt6::HttpServer reaches it through that library.
+if(USE_MCPSERVER)
+    list(APPEND UNIT_TESTS TMCPServerTest)
+    list(APPEND UNIT_TESTS TMCPBridgeTest)
+endif()
 
 mudlet_add_test_pch_provider(mudlet_unit_test_pch)
 
 foreach(test_name ${UNIT_TESTS})
     add_executable(${test_name} ${test_name}.cpp)
     mudlet_reuse_test_pch(${test_name} mudlet_unit_test_pch)
-    add_dependencies(${test_name} ${LIB_MUDLET_TARGET})
+    add_dependencies(${test_name} ${LIB_MUDLET_APP_TARGET})
     # mudlet_lsan_hooks has to be linked explicitly, see src/CMakeLists.txt
-    target_link_libraries(${test_name} PRIVATE Qt6::Test ${LIB_MUDLET_TARGET} mudlet_lsan_hooks)
+    target_link_libraries(${test_name} PRIVATE Qt6::Test ${LIB_MUDLET_APP_TARGET} mudlet_lsan_hooks)
     add_test(NAME ${test_name} COMMAND $<TARGET_FILE:${test_name}>)
     set_tests_properties(${test_name} PROPERTIES
         ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0"
@@ -130,6 +138,13 @@ endforeach()
 # limit cases in TAreaGridIndexTest, which never return once a viewport scan
 # stops terminating.
 set_tests_properties(EventLoopPumpTest TAreaGridIndexTest PROPERTIES TIMEOUT 60)
+
+if(USE_MCPSERVER)
+    # The end-to-end cases pipe JSON-RPC through a real `mudlet --mcp-bridge` process,
+    # so the test needs the application binary itself, not just the library.
+    target_compile_definitions(TMCPBridgeTest PRIVATE MUDLET_BINARY_PATH="$<TARGET_FILE:mudlet_executable>")
+    add_dependencies(TMCPBridgeTest mudlet_executable)
+endif()
 
 # TKeySequenceEditTest's focus traversal cases need an active window, which an X
 # server with no window manager never gives them, so a plain `xvfb-run ctest`
@@ -197,6 +212,23 @@ add_test(NAME IrcMessageComposerTest COMMAND $<TARGET_FILE:IrcMessageComposerTes
 set_tests_properties(IrcMessageComposerTest PROPERTIES
     ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0"
     TIMEOUT 60
+)
+
+# The application style's kept Fusion title bar icons. Built from the one source it
+# covers, which needs nothing but Qt Widgets, and Qt D-Bus where it detects screen readers.
+add_executable(MudletProxyStyleDockTitleTest
+    MudletProxyStyleDockTitleTest.cpp
+    ${CMAKE_SOURCE_DIR}/src/MudletProxyStyle.cpp
+)
+target_include_directories(MudletProxyStyleDockTitleTest PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(MudletProxyStyleDockTitleTest PRIVATE Qt6::Test Qt6::Widgets)
+if(UNIX AND NOT APPLE)
+  find_package(Qt6 COMPONENTS DBus REQUIRED)
+  target_link_libraries(MudletProxyStyleDockTitleTest PRIVATE Qt6::DBus)
+endif()
+add_test(NAME MudletProxyStyleDockTitleTest COMMAND $<TARGET_FILE:MudletProxyStyleDockTitleTest>)
+set_tests_properties(MudletProxyStyleDockTitleTest PROPERTIES
+    ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0;QT_QPA_PLATFORM=offscreen"
 )
 
 add_executable(CrashReportUploadTest
@@ -332,6 +364,14 @@ endif()
 if(NOT WIN32)
     add_test(NAME ReleaseTagVersionTest
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/ci/release-tag-version-test.sh
+    )
+endif()
+
+# GitHub refuses release notes over its size limit, and a refused release publishes
+# nothing at all
+if(NOT WIN32)
+    add_test(NAME ReleaseNotesFitTest
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/ci/release-notes-fit-test.sh
     )
 endif()
 

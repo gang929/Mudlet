@@ -32,6 +32,7 @@
 #include "MudletApp.h"
 #include "TConsole.h"
 #include "TDebug.h"
+#include "TMainConsole.h"
 #include "TTextEdit.h"
 #include "VarUnit.h"
 #include "XMLimport.h"
@@ -66,6 +67,7 @@
 #include <QFont>
 #include <QFrame>
 #include <QHBoxLayout>
+#include <QHeaderView>
 #include <QIcon>
 #include <QKeySequence>
 #include <QLabel>
@@ -75,13 +77,16 @@
 #include <QScrollBar>
 #include <QSettings>
 #include <QShortcut>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QStyle>
 #include <QTextCursor>
+#include <QTimer>
 #include <QShowEvent>
 #include <QRegularExpression>
 #include <QToolButton>
 #include <QToolBar>
+#include <QTreeWidgetItemIterator>
 #include <chrono>
 #include <sstream>
 #include <pugixml.hpp>
@@ -806,30 +811,104 @@ dlgTriggerEditor::dlgTriggerEditor(Host* pH)
     treeWidget_scripts->setRootIsDecorated(false);
     treeWidget_scripts->setContextMenuPolicy(Qt::ActionsContextMenu);
 
+    mpFolderTree = new QTreeWidget(frame_left);
+    mpFolderTree->setObjectName(qsl("treeWidget_folders"));
+    //: Accessible name of the editor's Folders view, which lists every item type grouped by folder
+    mpFolderTree->setAccessibleName(tr("Folders"));
+    mpFolderTree->setColumnCount(2);
+    mpFolderTree->header()->hide();
+    // A narrow pane cuts off the item type rather than the name
+    mpFolderTree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    mpFolderTree->setUniformRowHeights(true);
+    mpFolderTree->setContextMenuPolicy(Qt::ActionsContextMenu);
+    mpFolderTree->hide();
+    connect(mpFolderTree, &QTreeWidget::currentItemChanged, this, &dlgTriggerEditor::slot_folderTreeItemChanged);
+    connect(mpFolderTree, &QTreeWidget::itemActivated, this, [this](QTreeWidgetItem* pItem) {
+        if (!pItem) {
+            return;
+        }
+        if (pItem->data(0, FolderPartsRole).toStringList().size() == 1) {
+            slot_toggleItemOrGroupActiveFlag();
+            return;
+        }
+        if (mFolderGroupKey.isEmpty()) {
+            showFolderGroup(pItem);
+        }
+    });
+    // A merged folder stays current under the form of one of its folders, so choosing it changes no current item
+    connect(mpFolderTree, &QTreeWidget::itemClicked, this, [this](QTreeWidgetItem* pItem) {
+        if (pItem && mFolderGroupKey.isEmpty() && pItem->data(0, FolderPartsRole).toStringList().size() != 1) {
+            showFolderGroup(pItem);
+        }
+    });
+
+    mpFolderTreeRefreshTimer = new QTimer(this);
+    mpFolderTreeRefreshTimer->setSingleShot(true);
+    connect(mpFolderTreeRefreshTimer, &QTimer::timeout, this, [this]() {
+        if (mFolderViewActive) {
+            populateFolderTree();
+        }
+    });
+    for (const auto view :
+         {EditorViewType::cmTriggerView, EditorViewType::cmAliasView, EditorViewType::cmScriptView, EditorViewType::cmTimerView, EditorViewType::cmKeysView, EditorViewType::cmActionView}) {
+        QTreeWidget* pTree = treeForView(view);
+        const QAbstractItemModel* pModel = pTree->model();
+        connect(pModel, &QAbstractItemModel::rowsInserted, this, &dlgTriggerEditor::scheduleFolderTreeRefresh);
+        connect(pModel, &QAbstractItemModel::rowsRemoved, this, &dlgTriggerEditor::scheduleFolderTreeRefresh);
+        connect(pModel, &QAbstractItemModel::rowsMoved, this, &dlgTriggerEditor::scheduleFolderTreeRefresh);
+        // Every save and every Lua toggle sets an item's icon again: a rebuild here would lose a pending click
+        connect(pModel, &QAbstractItemModel::dataChanged, this, [this, view](const QModelIndex& topLeft, const QModelIndex& bottomRight) {
+            refreshFolderTreeRows(view, topLeft, bottomRight);
+        });
+        connect(pModel, &QAbstractItemModel::layoutChanged, this, &dlgTriggerEditor::scheduleFolderTreeRefresh);
+        connect(pModel, &QAbstractItemModel::modelReset, this, &dlgTriggerEditor::scheduleFolderTreeRefresh);
+        // Adding, deleting, pasting, undoing and searching all pick their item in the type tree, hidden or not
+        connect(pTree, &QTreeWidget::currentItemChanged, this, [this, view](QTreeWidgetItem* pCurrent) {
+            if (mFolderViewActive && pCurrent && pCurrent->parent()) {
+                selectFolderTreeNode(mFolderTreeNodes.value(folderTreeItemKey(view, pCurrent->data(0, IdRole).toInt())));
+            }
+        });
+    }
+
     QAction* viewTriggerAction = new QAction(QIcon(qsl(":/icons/tools-wizard.png")), tr("Triggers"), this);
     viewTriggerAction->setStatusTip(tr("Show Triggers"));
     viewTriggerAction->setToolTip(qsl("%1 (%2)").arg(tr("Show Triggers"), QKeySequence(Qt::CTRL | Qt::Key_1).toString(QKeySequence::NativeText)));
-    connect(viewTriggerAction, &QAction::triggered, this, &dlgTriggerEditor::slot_showTriggers);
+    connect(viewTriggerAction, &QAction::triggered, this, [this]() {
+        leaveFolderView();
+        slot_showTriggers();
+    });
 
     QAction* viewAliasAction = new QAction(QIcon(qsl(":/icons/system-users.png")), tr("Aliases"), this);
     viewAliasAction->setStatusTip(tr("Show Aliases"));
     viewAliasAction->setToolTip(qsl("%1 (%2)").arg(tr("Show Aliases"), QKeySequence(Qt::CTRL | Qt::Key_2).toString(QKeySequence::NativeText)));
-    connect(viewAliasAction, &QAction::triggered, this, &dlgTriggerEditor::slot_showAliases);
+    connect(viewAliasAction, &QAction::triggered, this, [this]() {
+        leaveFolderView();
+        slot_showAliases();
+    });
 
     QAction* viewScriptsAction = new QAction(QIcon(qsl(":/icons/document-properties.png")), tr("Scripts"), this);
     viewScriptsAction->setStatusTip(tr("Show Scripts"));
     viewScriptsAction->setToolTip(qsl("%1 (%2)").arg(tr("Show Scripts"), QKeySequence(Qt::CTRL | Qt::Key_3).toString(QKeySequence::NativeText)));
-    connect(viewScriptsAction, &QAction::triggered, this, &dlgTriggerEditor::slot_showScripts);
+    connect(viewScriptsAction, &QAction::triggered, this, [this]() {
+        leaveFolderView();
+        slot_showScripts();
+    });
 
     QAction* showTimersAction = new QAction(QIcon(qsl(":/icons/chronometer.png")), tr("Timers"), this);
     showTimersAction->setStatusTip(tr("Show Timers"));
     showTimersAction->setToolTip(qsl("%1 (%2)").arg(tr("Show Timers"), QKeySequence(Qt::CTRL | Qt::Key_4).toString(QKeySequence::NativeText)));
-    connect(showTimersAction, &QAction::triggered, this, &dlgTriggerEditor::slot_showTimers);
+    connect(showTimersAction, &QAction::triggered, this, [this]() {
+        leaveFolderView();
+        slot_showTimers();
+    });
 
     QAction* viewKeysAction = new QAction(QIcon(qsl(":/icons/preferences-desktop-keyboard.png")), tr("Keys"), this);
     viewKeysAction->setStatusTip(tr("Show Keybindings"));
     viewKeysAction->setToolTip(qsl("%1 (%2)").arg(tr("Show Keybindings"), QKeySequence(Qt::CTRL | Qt::Key_5).toString(QKeySequence::NativeText)));
-    connect(viewKeysAction, &QAction::triggered, this, &dlgTriggerEditor::slot_showKeys);
+    connect(viewKeysAction, &QAction::triggered, this, [this]() {
+        leaveFolderView();
+        slot_showKeys();
+    });
 
     QAction* viewVarsAction = new QAction(QIcon(qsl(":/icons/variables.png")), tr("Variables"), this);
     viewVarsAction->setStatusTip(tr("Show Variables"));
@@ -839,7 +918,17 @@ dlgTriggerEditor::dlgTriggerEditor(Host* pH)
     QAction* viewActionAction = new QAction(QIcon(qsl(":/icons/bookmarks.png")), tr("Buttons"), this);
     viewActionAction->setStatusTip(tr("Show Buttons"));
     viewActionAction->setToolTip(qsl("%1 (%2)").arg(tr("Show Buttons"), QKeySequence(Qt::CTRL | Qt::Key_7).toString(QKeySequence::NativeText)));
-    connect(viewActionAction, &QAction::triggered, this, &dlgTriggerEditor::slot_showActions);
+    connect(viewActionAction, &QAction::triggered, this, [this]() {
+        leaveFolderView();
+        slot_showActions();
+    });
+
+    //: Editor toolbar button that shows every item type together, grouped by folder
+    mpViewFoldersAction = new QAction(QIcon(qsl(":/icons/folder-blue.png")), tr("Folders"), this);
+    //: Status tip for the editor's Folders view button
+    mpViewFoldersAction->setStatusTip(tr("Show triggers, aliases, scripts, timers, keys and buttons together, grouped by folder"));
+    mpViewFoldersAction->setVisible(mpHost->folderViewInEditor());
+    connect(mpViewFoldersAction, &QAction::triggered, this, &dlgTriggerEditor::slot_showFolders);
 
 
     QAction* viewErrorsAction = new QAction(QIcon(qsl(":/icons/errors.png")), tr("Errors"), this);
@@ -914,6 +1003,7 @@ dlgTriggerEditor::dlgTriggerEditor(Host* pH)
     treeWidget_scripts->addAction(copyAction);
     treeWidget_actions->addAction(copyAction);
     treeWidget_keys->addAction(copyAction);
+    mpFolderTree->addAction(copyAction);
     connect(copyAction, &QAction::triggered, this, &dlgTriggerEditor::slot_copyXml);
 
     QAction* pasteAction = new QAction(tr("Paste"), this);
@@ -928,6 +1018,7 @@ dlgTriggerEditor::dlgTriggerEditor(Host* pH)
     treeWidget_scripts->addAction(pasteAction);
     treeWidget_actions->addAction(pasteAction);
     treeWidget_keys->addAction(pasteAction);
+    mpFolderTree->addAction(pasteAction);
     connect(pasteAction, &QAction::triggered, this, &dlgTriggerEditor::slot_pasteXml);
 
     // Add delete action to all tree widgets for right-click context menu
@@ -938,6 +1029,7 @@ dlgTriggerEditor::dlgTriggerEditor(Host* pH)
     treeWidget_actions->addAction(mDeleteItem);
     treeWidget_keys->addAction(mDeleteItem);
     treeWidget_variables->addAction(mDeleteItem);
+    mpFolderTree->addAction(mDeleteItem);
 
     // Add separators and additional actions to context menu
     QAction* separator1 = new QAction(this);
@@ -946,7 +1038,7 @@ dlgTriggerEditor::dlgTriggerEditor(Host* pH)
     separator2->setSeparator(true);
 
     // Add context menu actions to all tree widgets
-    QList<QTreeWidget*> treeWidgets = {treeWidget_triggers, treeWidget_aliases, treeWidget_timers, treeWidget_scripts, treeWidget_actions, treeWidget_keys, treeWidget_variables};
+    QList<QTreeWidget*> treeWidgets = {treeWidget_triggers, treeWidget_aliases, treeWidget_timers, treeWidget_scripts, treeWidget_actions, treeWidget_keys, treeWidget_variables, mpFolderTree};
 
     for (QTreeWidget* widget : treeWidgets) {
         widget->addAction(mAddItem);
@@ -1057,6 +1149,7 @@ dlgTriggerEditor::dlgTriggerEditor(Host* pH)
     toolBar2->addAction(viewKeysAction);
     toolBar2->addAction(viewVarsAction);
     toolBar2->addAction(viewActionAction);
+    toolBar2->addAction(mpViewFoldersAction);
 
     toolBar2->addSeparator();
 
@@ -1094,6 +1187,7 @@ dlgTriggerEditor::dlgTriggerEditor(Host* pH)
     treeWidget_scripts->addAction(mpAction_restoreEditorActionsToolbar);
     treeWidget_actions->addAction(mpAction_restoreEditorActionsToolbar);
     treeWidget_keys->addAction(mpAction_restoreEditorActionsToolbar);
+    mpFolderTree->addAction(mpAction_restoreEditorActionsToolbar);
 
     treeWidget_triggers->addAction(mpAction_restoreEditorItemsToolbar);
     treeWidget_aliases->addAction(mpAction_restoreEditorItemsToolbar);
@@ -1101,6 +1195,7 @@ dlgTriggerEditor::dlgTriggerEditor(Host* pH)
     treeWidget_scripts->addAction(mpAction_restoreEditorItemsToolbar);
     treeWidget_actions->addAction(mpAction_restoreEditorItemsToolbar);
     treeWidget_keys->addAction(mpAction_restoreEditorItemsToolbar);
+    mpFolderTree->addAction(mpAction_restoreEditorItemsToolbar);
 
     // These only have to be shown should the associated toolbar get hidden
     // and by default the starting state for those is a visible one so these
@@ -1342,6 +1437,7 @@ dlgTriggerEditor::dlgTriggerEditor(Host* pH)
     itemLayout->addWidget(treeWidget_scripts);
     itemLayout->addWidget(treeWidget_keys);
     itemLayout->addWidget(treeWidget_variables);
+    itemLayout->addWidget(mpFolderTree);
 
     searchSplitter->addWidget(itemContainer);
     searchSplitter->setStretchFactor(0, 1);
@@ -1411,6 +1507,8 @@ dlgTriggerEditor::dlgTriggerEditor(Host* pH)
     connect(mpHost, &Host::signal_editorSearchOptionsChanged, this, &dlgTriggerEditor::setSearchOptions);
     connect(mpHost, &Host::signal_editorShowBidiChanged, this, &dlgTriggerEditor::setEditorShowBidi);
     connect(mpHost, &Host::signal_showIdsInEditorChanged, this, &dlgTriggerEditor::showIDLabels);
+    connect(mpHost, &Host::signal_folderViewInEditorChanged, this, &dlgTriggerEditor::setFolderViewAvailable);
+    connect(mudlet::self(), &mudlet::signal_appearanceChanged, this, &dlgTriggerEditor::scheduleFolderTreeRefresh);
     connect(mpHost, &Host::signal_triggerToggled, this, &dlgTriggerEditor::refreshTriggerIcon);
     connect(mpHost, &Host::signal_aliasToggled, this, &dlgTriggerEditor::refreshAliasIcon);
     connect(mpHost, &Host::signal_timerToggled, this, &dlgTriggerEditor::refreshTimerIcon);
@@ -1500,6 +1598,10 @@ void dlgTriggerEditor::slot_smartUndo()
     // Stack-based undo: prioritize text editor changes, then fall back to item operations
     // This provides intuitive behavior - most recent change undoes first, regardless of focus
 
+    // A merged folder in the Folders view hides the item an undo would change
+    if (!mFolderGroupKey.isEmpty()) {
+        return;
+    }
     bool canUndoText = mpTextUndoStack && mpTextUndoStack->canUndo();
     bool canUndoItems = mpUndoStack && mpUndoStack->canUndo();
 
@@ -1545,6 +1647,9 @@ void dlgTriggerEditor::slot_smartRedo()
     // Stack-based redo: prioritize text editor changes, then fall back to item operations
     // This provides intuitive behavior - most recently undone change redoes first, regardless of focus
 
+    if (!mFolderGroupKey.isEmpty()) {
+        return;
+    }
     bool canRedoText = mpTextUndoStack && mpTextUndoStack->canRedo();
     bool canRedoItems = mpUndoStack && mpUndoStack->canRedo();
 
@@ -1601,7 +1706,7 @@ void dlgTriggerEditor::slot_updateUndoRedoButtonStates()
     // Disable undo/redo in variables view since variables can be modified via Lua API
     bool inVariablesView = (mCurrentView == EditorViewType::cmVarsView);
 
-    if (inVariablesView) {
+    if (inVariablesView || !mFolderGroupKey.isEmpty()) {
         // In variables view, disable buttons and clear tooltips
         mpUndoAction->setEnabled(false);
         mpRedoAction->setEnabled(false);
@@ -1888,7 +1993,7 @@ void dlgTriggerEditor::slot_toggleHiddenVariables(bool state)
 
 void dlgTriggerEditor::slot_viewStatsAction()
 {
-    mpHost->mpConsole->showStatistics();
+    mpHost->mainConsoleView()->showStatistics();
     mudlet::self()->raise();
     mudlet::self()->activateWindow();
     mudlet::self()->raise();
@@ -1933,6 +2038,7 @@ void dlgTriggerEditor::slot_setTreeWidgetIconSize(const int s)
     treeWidget_keys->setIconSize(newSize);
     treeWidget_actions->setIconSize(newSize);
     treeWidget_variables->setIconSize(newSize);
+    mpFolderTree->setIconSize(newSize);
 }
 
 void dlgTriggerEditor::closeEvent(QCloseEvent* event)
@@ -1955,7 +2061,7 @@ void dlgTriggerEditor::readSettings()
     if (savedPosition.isValid()) {
         move(savedPosition.toPoint());
     } else {
-        widgetutils::positionDialogOnActiveProfileScreen(this, nullptr, mpHost->mpConsole);
+        widgetutils::positionDialogOnActiveProfileScreen(this, nullptr, mpHost->mainConsoleView());
     }
 
     mAutosaveInterval = settings.value("autosaveIntervalMinutes", 2).toInt();
@@ -2050,13 +2156,31 @@ void dlgTriggerEditor::slot_itemSelectedInSearchResults(QTreeWidgetItem* pItem)
                     mpTriggersMainArea->lineEdit_trigger_name->setCursorPosition(pItem->data(0, PositionRole).toInt());
                     break;
                 case SearchResultIsPattern: {
-                    dlgTriggerPatternEdit* pTriggerPattern = mTriggerPatternEdit.at(pItem->data(0, PatternOrLineRole).toInt());
-                    mpScrollArea->ensureWidgetVisible(pTriggerPattern);
-                    if (pTriggerPattern->singleLineTextEdit_pattern->isVisible()) {
-                        // If is a colour trigger the singleLineTextEdit_pattern is not shown
-                        pTriggerPattern->singleLineTextEdit_pattern->setFocus();
-                        pTriggerPattern->singleLineTextEdit_pattern->textCursor().setPosition(pItem->data(0, PositionRole).toInt());
-                    }
+                    // Deferred: ensureWidgetVisible() reads the pattern list's geometry, which the
+                    // layout for the trigger just selected has not settled yet
+                    const int row = pItem->data(0, PatternOrLineRole).toInt();
+                    const int position = pItem->data(0, PositionRole).toInt();
+                    QTimer::singleShot(0ms, this, [this, idSearch, row, position]() {
+                        // Another item can be selected before this runs, and its rows are not the result's
+                        if (mCurrentView != EditorViewType::cmTriggerView || !mpCurrentTriggerItem || mpCurrentTriggerItem->data(0, IdRole).toInt() != idSearch || row >= mVisiblePatternCount) {
+                            return;
+                        }
+                        dlgTriggerPatternEdit* pTriggerPattern = mTriggerPatternEdit.value(row, nullptr);
+                        if (!pTriggerPattern) {
+                            return;
+                        }
+                        mpScrollArea->ensureWidgetVisible(pTriggerPattern);
+                        auto* pEdit = pTriggerPattern->singleLineTextEdit_pattern;
+                        if (!pEdit->isVisible()) {
+                            // Colour, prompt and line spacer patterns have no text to put the caret in
+                            focusPatternItem(row, Qt::OtherFocusReason);
+                            return;
+                        }
+                        pEdit->setFocus(Qt::OtherFocusReason);
+                        QTextCursor cursor = pEdit->textCursor();
+                        cursor.setPosition(position);
+                        pEdit->setTextCursor(cursor);
+                    });
                     break;
                 }
                 case SearchResultIsCommand:
@@ -2332,16 +2456,6 @@ void dlgTriggerEditor::slot_itemSelectedInSearchResults(QTreeWidgetItem* pItem)
                     mpKeysMainArea->lineEdit_key_name->setFocus(Qt::OtherFocusReason);
                     mpKeysMainArea->lineEdit_key_name->setCursorPosition(pItem->data(0, PositionRole).toInt());
                     break;
-                case SearchResultIsPattern: {
-                    dlgTriggerPatternEdit* pTriggerPattern = mTriggerPatternEdit.at(pItem->data(0, PatternOrLineRole).toInt());
-                    mpScrollArea->ensureWidgetVisible(pTriggerPattern);
-                    if (pTriggerPattern->singleLineTextEdit_pattern->isVisible()) {
-                        // If is a colour trigger the singleLineTextEdit_pattern is not shown
-                        pTriggerPattern->singleLineTextEdit_pattern->setFocus();
-                        pTriggerPattern->singleLineTextEdit_pattern->textCursor().setPosition(pItem->data(0, PositionRole).toInt());
-                    }
-                    break;
-                }
                 case SearchResultIsCommand:
                     mpKeysMainArea->lineEdit_key_command->setFocus(Qt::OtherFocusReason);
                     mpKeysMainArea->lineEdit_key_command->setCursorPosition(pItem->data(0, PositionRole).toInt());
@@ -2626,6 +2740,10 @@ void dlgTriggerEditor::highlightSearchMatches()
 void dlgTriggerEditor::emitScriptSearchMatches(
         const QString& scriptText, const QString& searchText, const QString& name, int objectId, const QString& parentLabel, EditorViewType viewType, QTreeWidgetItem*& parent)
 {
+    // Most scripts hold no match, and splitting each one into lines costs more than one look at it whole
+    if (!containsSearchMatch(scriptText, searchText)) {
+        return;
+    }
     const QStringList textList = scriptText.split(qsl("\n"));
     const int total = textList.count();
     for (int index = 0; index < total; ++index) {
@@ -3009,12 +3127,24 @@ void dlgTriggerEditor::recursiveSearchKeys(TKey* pTriggerParent, const QString& 
 }
 
 
+// Undo restores an item from its own snapshot only when no ancestor was deleted along with it
+static bool hasSelectedAncestor(const QTreeWidgetItem* pItem, const QSet<QTreeWidgetItem*>& selectedItemsSet, const QTreeWidgetItem* pBaseItem)
+{
+    for (QTreeWidgetItem* pParent = pItem->parent(); pParent && pParent != pBaseItem; pParent = pParent->parent()) {
+        if (selectedItemsSet.contains(pParent)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void dlgTriggerEditor::delete_alias()
 {
     QList<QTreeWidgetItem*> selectedItems = treeWidget_aliases->selectedItems();
     if (selectedItems.isEmpty()) {
         return;
     }
+    const QSet<QTreeWidgetItem*> selectedItemsSet{selectedItems.cbegin(), selectedItems.cend()};
 
     QStringList itemNames;
     QList<TAlias*> aliasesToDelete;
@@ -3035,7 +3165,7 @@ void dlgTriggerEditor::delete_alias()
     QList<EditorDeleteItemCommand::DeletedItemInfo> deletedItems;
 
     // Recursive lambda to capture an alias and all its descendants
-    std::function<void(TAlias*, int, int)> captureAliasAndChildren = [&](TAlias* pT, int parentID, int positionInParent) {
+    std::function<void(TAlias*, int, int, bool)> captureAliasAndChildren = [&](TAlias* pT, int parentID, int positionInParent, bool withSnapshot) {
         if (!pT) {
             return;
         }
@@ -3046,20 +3176,22 @@ void dlgTriggerEditor::delete_alias()
         info.parentID = parentID;
         info.positionInParent = positionInParent;
 
-        pugi::xml_document doc;
-        auto root = doc.append_child("AliasSnapshot");
-        XMLexport exporter(pT);
-        exporter.writeAlias(pT, root);
-        std::ostringstream oss;
-        doc.save(oss);
-        info.xmlSnapshot = QString::fromStdString(oss.str());
+        if (withSnapshot) {
+            pugi::xml_document doc;
+            auto root = doc.append_child("AliasSnapshot");
+            XMLexport exporter(pT);
+            exporter.writeAlias(pT, root);
+            std::ostringstream oss;
+            doc.save(oss);
+            info.xmlSnapshot = QString::fromStdString(oss.str());
+        }
 
         deletedItems.append(info);
 
         if (pT->mpMyChildrenList) {
             int i = 0;
             for (auto* pChild : *pT->mpMyChildrenList) {
-                captureAliasAndChildren(static_cast<TAlias*>(pChild), pT->getID(), i);
+                captureAliasAndChildren(static_cast<TAlias*>(pChild), pT->getID(), i, false);
                 ++i;
             }
         }
@@ -3112,7 +3244,7 @@ void dlgTriggerEditor::delete_alias()
                 }
             }
 
-            captureAliasAndChildren(pT, parentID, positionInParent);
+            captureAliasAndChildren(pT, parentID, positionInParent, !hasSelectedAncestor(pItem, selectedItemsSet, mpAliasBaseItem));
         }
     }
 
@@ -3128,6 +3260,10 @@ void dlgTriggerEditor::delete_alias()
 
     QTreeWidgetItem* newSelection = nullptr;
     QList<QTreeWidgetItem*> removedItems;
+    // Emptied silently so each removed row doesn't re-lay out the rest of the selection and reload
+    // the form, and so the setCurrentItem() below is a real change the view gets told about
+    QSignalBlocker selectionBlocker(treeWidget_aliases->selectionModel());
+    treeWidget_aliases->selectionModel()->clear();
     for (QTreeWidgetItem* pItem : std::as_const(selectedItems)) {
         QTreeWidgetItem* pParentItem = pItem->parent();
         const int itemId = pItem->data(0, Qt::UserRole).toInt();
@@ -3156,6 +3292,7 @@ void dlgTriggerEditor::delete_alias()
             delete pT;
         }
     }
+    selectionBlocker.unblock();
 
     if (!deletedItems.isEmpty()) {
         auto* qtCmd = new EditorDeleteItemCommand(EditorViewType::cmAliasView, deletedItems, mpHost);
@@ -3219,7 +3356,7 @@ void dlgTriggerEditor::delete_action()
     QList<EditorDeleteItemCommand::DeletedItemInfo> deletedItems;
 
     // Recursive lambda to capture an action and all its descendants
-    std::function<void(TAction*, int, int)> captureActionAndChildren = [&](TAction* pT, int parentID, int positionInParent) {
+    std::function<void(TAction*, int, int, bool)> captureActionAndChildren = [&](TAction* pT, int parentID, int positionInParent, bool withSnapshot) {
         if (!pT) {
             return;
         }
@@ -3230,21 +3367,22 @@ void dlgTriggerEditor::delete_action()
         info.parentID = parentID;
         info.positionInParent = positionInParent;
 
-        // Export action to XML snapshot
-        pugi::xml_document doc;
-        auto root = doc.append_child("ActionSnapshot");
-        XMLexport exporter(pT);
-        exporter.writeAction(pT, root);
-        std::ostringstream oss;
-        doc.save(oss);
-        info.xmlSnapshot = QString::fromStdString(oss.str());
+        if (withSnapshot) {
+            pugi::xml_document doc;
+            auto root = doc.append_child("ActionSnapshot");
+            XMLexport exporter(pT);
+            exporter.writeAction(pT, root);
+            std::ostringstream oss;
+            doc.save(oss);
+            info.xmlSnapshot = QString::fromStdString(oss.str());
+        }
 
         deletedItems.append(info);
 
         if (pT->mpMyChildrenList) {
             int i = 0;
             for (auto* pChild : *pT->mpMyChildrenList) {
-                captureActionAndChildren(static_cast<TAction*>(pChild), pT->getID(), i);
+                captureActionAndChildren(static_cast<TAction*>(pChild), pT->getID(), i, false);
                 ++i;
             }
         }
@@ -3267,7 +3405,7 @@ void dlgTriggerEditor::delete_action()
             }
 
             // Recursively capture this action and all its children
-            captureActionAndChildren(pT, parentID, positionInParent);
+            captureActionAndChildren(pT, parentID, positionInParent, !hasSelectedAncestor(pItem, selectedItemsSet, mpActionBaseItem));
         }
     }
 
@@ -3283,6 +3421,8 @@ void dlgTriggerEditor::delete_action()
 
     QTreeWidgetItem* newSelection = nullptr;
     QList<QTreeWidgetItem*> removedItems;
+    QSignalBlocker selectionBlocker(treeWidget_actions->selectionModel());
+    treeWidget_actions->selectionModel()->clear();
     for (QTreeWidgetItem* pItem : std::as_const(selectedItems)) {
         QTreeWidgetItem* pParentItem = pItem->parent();
         const int itemId = pItem->data(0, Qt::UserRole).toInt();
@@ -3316,6 +3456,7 @@ void dlgTriggerEditor::delete_action()
             delete pT;
         }
     }
+    selectionBlocker.unblock();
 
     if (!deletedItems.isEmpty()) {
         auto* qtCmd = new EditorDeleteItemCommand(EditorViewType::cmActionView, deletedItems, mpHost);
@@ -3377,6 +3518,8 @@ void dlgTriggerEditor::delete_variable()
 
     QTreeWidgetItem* newSelection = nullptr;
     QList<QTreeWidgetItem*> removedItems;
+    QSignalBlocker selectionBlocker(treeWidget_variables->selectionModel());
+    treeWidget_variables->selectionModel()->clear();
     for (QTreeWidgetItem* pItem : std::as_const(selectedItems)) {
         QTreeWidgetItem* pParentItem = pItem->parent();
         TVar* var = treeWidget_variables->variableForRow(vu, pItem);
@@ -3410,6 +3553,7 @@ void dlgTriggerEditor::delete_variable()
             delete var;
         }
     }
+    selectionBlocker.unblock();
 
     if (newSelection && !newSelection->treeWidget()) {
         newSelection = mpVarBaseItem;
@@ -3434,6 +3578,7 @@ void dlgTriggerEditor::delete_script()
     if (selectedItems.isEmpty()) {
         return;
     }
+    const QSet<QTreeWidgetItem*> selectedItemsSet{selectedItems.cbegin(), selectedItems.cend()};
 
     QStringList itemNames;
     QList<TScript*> scriptsToDelete;
@@ -3454,7 +3599,7 @@ void dlgTriggerEditor::delete_script()
     QList<EditorDeleteItemCommand::DeletedItemInfo> deletedItems;
 
     // Recursive lambda to capture a script and all its descendants
-    std::function<void(TScript*, int, int)> captureScriptAndChildren = [&](TScript* pT, int parentID, int positionInParent) {
+    std::function<void(TScript*, int, int, bool)> captureScriptAndChildren = [&](TScript* pT, int parentID, int positionInParent, bool withSnapshot) {
         if (!pT) {
             return;
         }
@@ -3465,21 +3610,22 @@ void dlgTriggerEditor::delete_script()
         info.parentID = parentID;
         info.positionInParent = positionInParent;
 
-        // Export script to XML snapshot
-        pugi::xml_document doc;
-        auto root = doc.append_child("ScriptSnapshot");
-        XMLexport exporter(pT);
-        exporter.writeScript(pT, root);
-        std::ostringstream oss;
-        doc.save(oss);
-        info.xmlSnapshot = QString::fromStdString(oss.str());
+        if (withSnapshot) {
+            pugi::xml_document doc;
+            auto root = doc.append_child("ScriptSnapshot");
+            XMLexport exporter(pT);
+            exporter.writeScript(pT, root);
+            std::ostringstream oss;
+            doc.save(oss);
+            info.xmlSnapshot = QString::fromStdString(oss.str());
+        }
 
         deletedItems.append(info);
 
         if (pT->mpMyChildrenList) {
             int i = 0;
             for (auto* pChild : *pT->mpMyChildrenList) {
-                captureScriptAndChildren(static_cast<TScript*>(pChild), pT->getID(), i);
+                captureScriptAndChildren(static_cast<TScript*>(pChild), pT->getID(), i, false);
                 ++i;
             }
         }
@@ -3503,7 +3649,7 @@ void dlgTriggerEditor::delete_script()
             }
 
             // Recursively capture this script and all its children
-            captureScriptAndChildren(pT, parentID, positionInParent);
+            captureScriptAndChildren(pT, parentID, positionInParent, !hasSelectedAncestor(pItem, selectedItemsSet, mpScriptsBaseItem));
         }
     }
 
@@ -3519,6 +3665,8 @@ void dlgTriggerEditor::delete_script()
 
     QTreeWidgetItem* newSelection = nullptr;
     QList<QTreeWidgetItem*> removedItems;
+    QSignalBlocker selectionBlocker(treeWidget_scripts->selectionModel());
+    treeWidget_scripts->selectionModel()->clear();
     for (QTreeWidgetItem* pItem : std::as_const(selectedItems)) {
         QTreeWidgetItem* pParentItem = pItem->parent();
         const int itemId = pItem->data(0, Qt::UserRole).toInt();
@@ -3547,6 +3695,7 @@ void dlgTriggerEditor::delete_script()
             delete pT;
         }
     }
+    selectionBlocker.unblock();
 
     if (!deletedItems.isEmpty()) {
         auto* qtCmd = new EditorDeleteItemCommand(EditorViewType::cmScriptView, deletedItems, mpHost);
@@ -3576,6 +3725,7 @@ void dlgTriggerEditor::delete_key()
     if (selectedItems.isEmpty()) {
         return;
     }
+    const QSet<QTreeWidgetItem*> selectedItemsSet{selectedItems.cbegin(), selectedItems.cend()};
 
     QStringList itemNames;
     QList<TKey*> keysToDelete;
@@ -3596,7 +3746,7 @@ void dlgTriggerEditor::delete_key()
     QList<EditorDeleteItemCommand::DeletedItemInfo> deletedItems;
 
     // Recursive lambda to capture a key and all its descendants
-    std::function<void(TKey*, int, int)> captureKeyAndChildren = [&](TKey* pT, int parentID, int positionInParent) {
+    std::function<void(TKey*, int, int, bool)> captureKeyAndChildren = [&](TKey* pT, int parentID, int positionInParent, bool withSnapshot) {
         if (!pT) {
             return;
         }
@@ -3607,21 +3757,22 @@ void dlgTriggerEditor::delete_key()
         info.parentID = parentID;
         info.positionInParent = positionInParent;
 
-        // Export key to XML snapshot
-        pugi::xml_document doc;
-        auto root = doc.append_child("KeySnapshot");
-        XMLexport exporter(pT);
-        exporter.writeKey(pT, root);
-        std::ostringstream oss;
-        doc.save(oss);
-        info.xmlSnapshot = QString::fromStdString(oss.str());
+        if (withSnapshot) {
+            pugi::xml_document doc;
+            auto root = doc.append_child("KeySnapshot");
+            XMLexport exporter(pT);
+            exporter.writeKey(pT, root);
+            std::ostringstream oss;
+            doc.save(oss);
+            info.xmlSnapshot = QString::fromStdString(oss.str());
+        }
 
         deletedItems.append(info);
 
         if (pT->mpMyChildrenList) {
             int i = 0;
             for (auto* pChild : *pT->mpMyChildrenList) {
-                captureKeyAndChildren(static_cast<TKey*>(pChild), pT->getID(), i);
+                captureKeyAndChildren(static_cast<TKey*>(pChild), pT->getID(), i, false);
                 ++i;
             }
         }
@@ -3645,7 +3796,7 @@ void dlgTriggerEditor::delete_key()
             }
 
             // Recursively capture this key and all its children
-            captureKeyAndChildren(pT, parentID, positionInParent);
+            captureKeyAndChildren(pT, parentID, positionInParent, !hasSelectedAncestor(pItem, selectedItemsSet, mpKeyBaseItem));
         }
     }
 
@@ -3661,6 +3812,8 @@ void dlgTriggerEditor::delete_key()
 
     QTreeWidgetItem* newSelection = nullptr;
     QList<QTreeWidgetItem*> removedItems;
+    QSignalBlocker selectionBlocker(treeWidget_keys->selectionModel());
+    treeWidget_keys->selectionModel()->clear();
     for (QTreeWidgetItem* pItem : std::as_const(selectedItems)) {
         QTreeWidgetItem* pParentItem = pItem->parent();
         const int itemId = pItem->data(0, Qt::UserRole).toInt();
@@ -3689,6 +3842,7 @@ void dlgTriggerEditor::delete_key()
             delete pT;
         }
     }
+    selectionBlocker.unblock();
 
     if (!deletedItems.isEmpty()) {
         auto* qtCmd = new EditorDeleteItemCommand(EditorViewType::cmKeysView, deletedItems, mpHost);
@@ -3718,6 +3872,7 @@ void dlgTriggerEditor::delete_trigger()
     if (selectedItems.isEmpty()) {
         return;
     }
+    const QSet<QTreeWidgetItem*> selectedItemsSet{selectedItems.cbegin(), selectedItems.cend()};
 
     QStringList itemNames;
     QList<TTrigger*> triggersToDelete;
@@ -3738,7 +3893,7 @@ void dlgTriggerEditor::delete_trigger()
     QList<EditorDeleteItemCommand::DeletedItemInfo> deletedItems;
 
     // Recursive lambda to capture a trigger and all its descendants
-    std::function<void(TTrigger*, int, int)> captureTriggerAndChildren = [&](TTrigger* pT, int parentID, int positionInParent) {
+    std::function<void(TTrigger*, int, int, bool)> captureTriggerAndChildren = [&](TTrigger* pT, int parentID, int positionInParent, bool withSnapshot) {
         if (!pT) {
             return;
         }
@@ -3749,21 +3904,22 @@ void dlgTriggerEditor::delete_trigger()
         info.parentID = parentID;
         info.positionInParent = positionInParent;
 
-        // Export trigger to XML snapshot
-        pugi::xml_document doc;
-        auto root = doc.append_child("TriggerSnapshot");
-        XMLexport exporter(pT);
-        exporter.writeTrigger(pT, root);
-        std::ostringstream oss;
-        doc.save(oss);
-        info.xmlSnapshot = QString::fromStdString(oss.str());
+        if (withSnapshot) {
+            pugi::xml_document doc;
+            auto root = doc.append_child("TriggerSnapshot");
+            XMLexport exporter(pT);
+            exporter.writeTrigger(pT, root);
+            std::ostringstream oss;
+            doc.save(oss);
+            info.xmlSnapshot = QString::fromStdString(oss.str());
+        }
 
         deletedItems.append(info);
 
         if (pT->mpMyChildrenList) {
             int i = 0;
             for (auto* pChild : *pT->mpMyChildrenList) {
-                captureTriggerAndChildren(static_cast<TTrigger*>(pChild), pT->getID(), i);
+                captureTriggerAndChildren(static_cast<TTrigger*>(pChild), pT->getID(), i, false);
                 ++i;
             }
         }
@@ -3792,7 +3948,7 @@ void dlgTriggerEditor::delete_trigger()
             }
 
             // Recursively capture this trigger and all its children
-            captureTriggerAndChildren(pT, parentID, positionInParent);
+            captureTriggerAndChildren(pT, parentID, positionInParent, !hasSelectedAncestor(pItem, selectedItemsSet, mpTriggerBaseItem));
         }
     }
 
@@ -3808,6 +3964,8 @@ void dlgTriggerEditor::delete_trigger()
 
     QTreeWidgetItem* newSelection = nullptr;
     QList<QTreeWidgetItem*> removedItems;
+    QSignalBlocker selectionBlocker(treeWidget_triggers->selectionModel());
+    treeWidget_triggers->selectionModel()->clear();
     for (QTreeWidgetItem* pItem : std::as_const(selectedItems)) {
         QTreeWidgetItem* pParentItem = pItem->parent();
         const int itemId = pItem->data(0, Qt::UserRole).toInt();
@@ -3836,6 +3994,7 @@ void dlgTriggerEditor::delete_trigger()
             delete pT;
         }
     }
+    selectionBlocker.unblock();
 
     if (!deletedItems.isEmpty()) {
         auto* qtCmd = new EditorDeleteItemCommand(EditorViewType::cmTriggerView, deletedItems, mpHost);
@@ -3865,6 +4024,7 @@ void dlgTriggerEditor::delete_timer()
     if (selectedItems.isEmpty()) {
         return;
     }
+    const QSet<QTreeWidgetItem*> selectedItemsSet{selectedItems.cbegin(), selectedItems.cend()};
 
     QStringList itemNames;
     QList<TTimer*> timersToDelete;
@@ -3885,7 +4045,7 @@ void dlgTriggerEditor::delete_timer()
     QList<EditorDeleteItemCommand::DeletedItemInfo> deletedItems;
 
     // Recursive lambda to capture a timer and all its descendants
-    std::function<void(TTimer*, int, int)> captureTimerAndChildren = [&](TTimer* pT, int parentID, int positionInParent) {
+    std::function<void(TTimer*, int, int, bool)> captureTimerAndChildren = [&](TTimer* pT, int parentID, int positionInParent, bool withSnapshot) {
         if (!pT) {
             return;
         }
@@ -3896,21 +4056,22 @@ void dlgTriggerEditor::delete_timer()
         info.parentID = parentID;
         info.positionInParent = positionInParent;
 
-        // Export timer to XML snapshot
-        pugi::xml_document doc;
-        auto root = doc.append_child("TimerSnapshot");
-        XMLexport exporter(pT);
-        exporter.writeTimer(pT, root);
-        std::ostringstream oss;
-        doc.save(oss);
-        info.xmlSnapshot = QString::fromStdString(oss.str());
+        if (withSnapshot) {
+            pugi::xml_document doc;
+            auto root = doc.append_child("TimerSnapshot");
+            XMLexport exporter(pT);
+            exporter.writeTimer(pT, root);
+            std::ostringstream oss;
+            doc.save(oss);
+            info.xmlSnapshot = QString::fromStdString(oss.str());
+        }
 
         deletedItems.append(info);
 
         if (pT->mpMyChildrenList) {
             int i = 0;
             for (auto* pChild : *pT->mpMyChildrenList) {
-                captureTimerAndChildren(static_cast<TTimer*>(pChild), pT->getID(), i);
+                captureTimerAndChildren(static_cast<TTimer*>(pChild), pT->getID(), i, false);
                 ++i;
             }
         }
@@ -3934,7 +4095,7 @@ void dlgTriggerEditor::delete_timer()
             }
 
             // Recursively capture this timer and all its children
-            captureTimerAndChildren(pT, parentID, positionInParent);
+            captureTimerAndChildren(pT, parentID, positionInParent, !hasSelectedAncestor(pItem, selectedItemsSet, mpTimerBaseItem));
         }
     }
 
@@ -3950,6 +4111,8 @@ void dlgTriggerEditor::delete_timer()
 
     QTreeWidgetItem* newSelection = nullptr;
     QList<QTreeWidgetItem*> removedItems;
+    QSignalBlocker selectionBlocker(treeWidget_timers->selectionModel());
+    treeWidget_timers->selectionModel()->clear();
     for (QTreeWidgetItem* pItem : std::as_const(selectedItems)) {
         QTreeWidgetItem* pParentItem = pItem->parent();
         const int itemId = pItem->data(0, Qt::UserRole).toInt();
@@ -3978,6 +4141,7 @@ void dlgTriggerEditor::delete_timer()
             delete pT;
         }
     }
+    selectionBlocker.unblock();
 
     if (!deletedItems.isEmpty()) {
         auto* qtCmd = new EditorDeleteItemCommand(EditorViewType::cmTimerView, deletedItems, mpHost);
@@ -4764,8 +4928,8 @@ void dlgTriggerEditor::activeToggle_action()
     // Capture new state after toggle
     bool newState = pT->isActive();
 
-    if (mpHost->mpConsole) {
-        mpHost->mpConsole->setActionToolBarVisible(pT, pT->isActive());
+    if (mpHost->mainConsoleView()) {
+        mpHost->mainConsoleView()->setActionToolBarVisible(pT, pT->isActive());
     }
 
     const bool itemActive = pT->isActive();
@@ -5176,8 +5340,7 @@ void dlgTriggerEditor::addTrigger(bool isFolder)
     auto* qtCmd = new EditorAddItemCommand(EditorViewType::cmTriggerView, pNewTrigger->getID(), parentID, positionInParent, isFolder, name, mpHost);
     mpUndoStack->pushCommand(qtCmd);
 
-    // Note: Subsequent modify commands will automatically merge with this Add command
-    // via EditorAddItemCommand::mergeWith(), grouping them into one undo operation.
+    // Later edits can merge into this command, see EditorAddItemCommand::mergeWith()
 }
 
 
@@ -5266,8 +5429,7 @@ void dlgTriggerEditor::addTimer(bool isFolder)
     auto* qtCmd = new EditorAddItemCommand(EditorViewType::cmTimerView, pNewTimer->getID(), parentID, positionInParent, isFolder, name, mpHost);
     mpUndoStack->pushCommand(qtCmd);
 
-    // Note: Subsequent modify commands will automatically merge with this Add command
-    // via EditorAddItemCommand::mergeWith(), grouping them into one undo operation.
+    // Later edits can merge into this command, see EditorAddItemCommand::mergeWith()
 }
 
 void dlgTriggerEditor::addVar(bool isFolder)
@@ -5307,7 +5469,7 @@ void dlgTriggerEditor::addVar(bool isFolder)
         }
     }
 
-    auto newVar = new TVar();
+    auto newVar = std::make_unique<TVar>();
     if (pParentItem) {
         //we're nested under something, or going to be.  This HAS to be a table
         TVar* parent = treeWidget_variables->variableForRow(vu, pParentItem);
@@ -5329,7 +5491,7 @@ void dlgTriggerEditor::addVar(bool isFolder)
     } else {
         newVar->setValueType(LUA_TNONE);
     }
-    treeWidget_variables->setNewVariableForRow(vu, pNewItem, newVar);
+    treeWidget_variables->setNewVariableForRow(vu, pNewItem, std::move(newVar));
     pNewItem->setFlags(pNewItem->flags() & ~(Qt::ItemIsDragEnabled | Qt::ItemIsDropEnabled));
 
     // Finalize selection
@@ -5423,8 +5585,7 @@ void dlgTriggerEditor::addKey(bool isFolder)
     auto* qtCmd = new EditorAddItemCommand(EditorViewType::cmKeysView, pNewKey->getID(), parentID, positionInParent, isFolder, name, mpHost);
     mpUndoStack->pushCommand(qtCmd);
 
-    // Note: Subsequent modify commands will automatically merge with this Add command
-    // via EditorAddItemCommand::mergeWith(), grouping them into one undo operation.
+    // Later edits can merge into this command, see EditorAddItemCommand::mergeWith()
 }
 
 
@@ -5519,8 +5680,7 @@ void dlgTriggerEditor::addAlias(bool isFolder)
     auto* qtCmd = new EditorAddItemCommand(EditorViewType::cmAliasView, pNewAlias->getID(), parentID, positionInParent, isFolder, name, mpHost);
     mpUndoStack->pushCommand(qtCmd);
 
-    // Note: Subsequent modify commands will automatically merge with this Add command
-    // via EditorAddItemCommand::mergeWith(), grouping them into one undo operation.
+    // Later edits can merge into this command, see EditorAddItemCommand::mergeWith()
 }
 
 void dlgTriggerEditor::addAction(bool isFolder)
@@ -5620,8 +5780,7 @@ void dlgTriggerEditor::addAction(bool isFolder)
     auto* qtCmd = new EditorAddItemCommand(EditorViewType::cmActionView, pNewAction->getID(), parentID, positionInParent, isFolder, name, mpHost);
     mpUndoStack->pushCommand(qtCmd);
 
-    // Note: Subsequent modify commands will automatically merge with this Add command
-    // via EditorAddItemCommand::mergeWith(), grouping them into one undo operation.
+    // Later edits can merge into this command, see EditorAddItemCommand::mergeWith()
 }
 
 
@@ -5708,8 +5867,7 @@ void dlgTriggerEditor::addScript(bool isFolder)
     auto* qtCmd = new EditorAddItemCommand(EditorViewType::cmScriptView, pNewScript->getID(), parentID, positionInParent, isFolder, name, mpHost);
     mpUndoStack->pushCommand(qtCmd);
 
-    // Note: Subsequent modify commands will automatically merge with this Add command
-    // via EditorAddItemCommand::mergeWith(), grouping them into one undo operation.
+    // Later edits can merge into this command, see EditorAddItemCommand::mergeWith()
 }
 
 void dlgTriggerEditor::selectTriggerByID(int id)
@@ -5993,7 +6151,7 @@ void dlgTriggerEditor::saveTrigger()
     TTrigger* pT = mpHost->getTriggerUnit()->getTrigger(triggerID);
     if (pT) {
         // Capture OLD state before modifications (for undo)
-        QString oldStateXML = exportTriggerToXML(pT);
+        QString oldStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
 
         pT->setName(name);
         pT->setCommand(command);
@@ -6142,7 +6300,7 @@ void dlgTriggerEditor::saveTrigger()
         pItem->setData(0, Qt::AccessibleDescriptionRole, itemDescription);
 
         // Capture NEW state after modifications (for redo)
-        QString newStateXML = exportTriggerToXML(pT);
+        QString newStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
 
         // Only push undo command if something actually changed
         if (oldStateXML != newStateXML) {
@@ -6154,6 +6312,7 @@ void dlgTriggerEditor::saveTrigger()
                 mpTextUndoStack->clear();
             }
         }
+        mpUndoStack->finishAddingItem(EditorViewType::cmTriggerView, triggerID);
     }
 }
 
@@ -6178,7 +6337,7 @@ void dlgTriggerEditor::saveTimer()
     TTimer* pT = mpHost->getTimerUnit()->getTimer(timerID);
     if (pT) {
         // Capture OLD state before modifications (for undo)
-        QString oldStateXML = exportTimerToXML(pT);
+        QString oldStateXML = exportTimerToXML(pT, SnapshotScope::ItemOnly);
 
         pT->setName(name);
         const QString command = mpTimersMainArea->lineEdit_timer_command->text();
@@ -6283,7 +6442,7 @@ void dlgTriggerEditor::saveTimer()
         pItem->setData(0, Qt::AccessibleDescriptionRole, itemDescription);
 
         // Capture NEW state after modifications (for redo)
-        QString newStateXML = exportTimerToXML(pT);
+        QString newStateXML = exportTimerToXML(pT, SnapshotScope::ItemOnly);
 
         // Only push undo command if something actually changed
         if (oldStateXML != newStateXML) {
@@ -6295,6 +6454,7 @@ void dlgTriggerEditor::saveTimer()
                 mpTextUndoStack->clear();
             }
         }
+        mpUndoStack->finishAddingItem(EditorViewType::cmTimerView, timerID);
     }
 }
 
@@ -6334,7 +6494,7 @@ void dlgTriggerEditor::saveAlias()
     TAlias* pT = mpHost->getAliasUnit()->getAlias(triggerID);
     if (pT) {
         // Capture OLD state before modifications (for undo)
-        QString oldStateXML = exportAliasToXML(pT);
+        QString oldStateXML = exportAliasToXML(pT, SnapshotScope::ItemOnly);
 
         pT->setName(name);
         pT->setCommand(substitution);
@@ -6398,7 +6558,7 @@ void dlgTriggerEditor::saveAlias()
         pItem->setData(0, Qt::AccessibleDescriptionRole, itemDescription);
 
         // Capture NEW state after modifications (for redo)
-        QString newStateXML = exportAliasToXML(pT);
+        QString newStateXML = exportAliasToXML(pT, SnapshotScope::ItemOnly);
 
         // Only push undo command if something actually changed
         if (oldStateXML != newStateXML) {
@@ -6410,6 +6570,7 @@ void dlgTriggerEditor::saveAlias()
                 mpTextUndoStack->clear();
             }
         }
+        mpUndoStack->finishAddingItem(EditorViewType::cmAliasView, triggerID);
     }
 }
 
@@ -6594,7 +6755,7 @@ void dlgTriggerEditor::refreshAliasIconsIn(QTreeWidgetItem* pParent, bool ancest
             --remaining;
         }
         const bool dirty = ancestorDirty || pending;
-        const bool touchNotification = pending ? ((pItem == mpCurrentAliasItem) && (mCurrentView == EditorViewType::cmAliasView)) : ancestorTouchNotification;
+        const bool touchNotification = pending ? ((pItem == mpCurrentAliasItem) && (mCurrentView == EditorViewType::cmAliasView) && mFolderGroupKey.isEmpty()) : ancestorTouchNotification;
         if (dirty) {
             if (TAlias* pT = mpHost->getAliasUnit()->getAlias(id)) {
                 paintAliasItem(pItem, pT, touchNotification);
@@ -6660,7 +6821,7 @@ void dlgTriggerEditor::saveAction()
     TAction* pA = mpHost->getActionUnit()->getAction(actionID);
     if (pA) {
         // Capture OLD state before modifications (for undo)
-        QString oldStateXML = exportActionToXML(pA);
+        QString oldStateXML = exportActionToXML(pA, SnapshotScope::ItemOnly);
 
         // Check if data has been changed before it gets updated.
         bool actionDataChanged = false;
@@ -6763,7 +6924,7 @@ void dlgTriggerEditor::saveAction()
             pA->setDataChanged();
         }
 
-        if (auto* pConsole = mpHost->mpConsole.data()) {
+        if (auto* pConsole = mpHost->mainConsoleView()) {
             // if the action has a TToolBar instance with a script error, hide that toolbar.
             if (!pA->state()) {
                 pConsole->setActionToolBarVisible(pA, false);
@@ -6778,7 +6939,7 @@ void dlgTriggerEditor::saveAction()
         }
 
         // Capture NEW state after modifications (for redo)
-        QString newStateXML = exportActionToXML(pA);
+        QString newStateXML = exportActionToXML(pA, SnapshotScope::ItemOnly);
 
         // Only push undo command if something actually changed
         if (oldStateXML != newStateXML) {
@@ -6790,6 +6951,7 @@ void dlgTriggerEditor::saveAction()
                 mpTextUndoStack->clear();
             }
         }
+        mpUndoStack->finishAddingItem(EditorViewType::cmActionView, actionID);
     }
 
     mpHost->getActionUnit()->updateAllToolbars();
@@ -6858,7 +7020,7 @@ void dlgTriggerEditor::saveScript()
     }
 
     // Capture OLD state before modifications (for undo)
-    QString oldStateXML = exportScriptToXML(pT);
+    QString oldStateXML = exportScriptToXML(pT, SnapshotScope::ItemOnly);
 
     pT->setName(name);
     pT->setEventHandlerList(handlerList);
@@ -6964,7 +7126,7 @@ void dlgTriggerEditor::saveScript()
     pItem->setData(0, Qt::AccessibleDescriptionRole, itemDescription);
 
     // Capture NEW state after modifications (for redo)
-    QString newStateXML = exportScriptToXML(pT);
+    QString newStateXML = exportScriptToXML(pT, SnapshotScope::ItemOnly);
 
     // Only push undo command if something actually changed
     if (oldStateXML != newStateXML) {
@@ -6976,6 +7138,7 @@ void dlgTriggerEditor::saveScript()
             mpTextUndoStack->clear();
         }
     }
+    mpUndoStack->finishAddingItem(EditorViewType::cmScriptView, scriptID);
 
     // If pT's own body uninstalled its package during the compile above, the delete
     // was deferred (see TScript::compileScript / ScriptUnit::uninstall). We are now
@@ -7061,6 +7224,20 @@ void dlgTriggerEditor::showKeyTakenWarning(QTreeWidgetItem* pItem, const QString
         description = description.isEmpty() ? descKeyTaken : description + suffix;
     }
     pItem->setData(0, Qt::AccessibleDescriptionRole, description);
+}
+
+// Only after an explicit save: saveKey() also runs on leaving the keys view, where the warning
+// would stay over the next view and keep its intro from showing
+void dlgTriggerEditor::rewarnAboutCurrentKey()
+{
+    if (!mpCurrentKeyItem) {
+        return;
+    }
+    const TKey* pT = mpHost->getKeyUnit()->getKey(mpCurrentKeyItem->data(0, Qt::UserRole).toInt());
+    // A failed compile's error is what the banner should keep showing
+    if (pT && pT->state()) {
+        showKeyTakenWarning(mpCurrentKeyItem, takenKeyWarning(pT), false);
+    }
 }
 
 int dlgTriggerEditor::canRecast(QTreeWidgetItem* pItem, int newNameType, int newValueType)
@@ -7194,10 +7371,11 @@ void dlgTriggerEditor::saveVar()
             }
             variable->setName(newName, uiNameType);
             variable->setValue(newValue, uiValueType);
+            // Before createVar(): the Lua it runs can rebuild the tree, which would delete it
+            treeWidget_variables->forgetNewVariableForRow(pItem);
             luaInterface->createVar(variable);
             varUnit->addVariable(variable);
             treeWidget_variables->setVariableForRow(varUnit, pItem, variable);
-            treeWidget_variables->forgetNewVariableForRow(pItem);
             // Attach to its real parent TVar (set in addVar) so the XML writer,
             // which iterates from the base, nests it inside the parent table
             // rather than at root level.
@@ -7276,6 +7454,7 @@ void dlgTriggerEditor::saveVar()
             var = treeWidget_variables->newVariableForRow(varUnit, pItem);
             var->setName(newName, uiNameType);
             var->setValue(newValue, uiValueType);
+            treeWidget_variables->forgetNewVariableForRow(pItem);
             luaInterface->createVar(var);
             varUnit->addVariable(var);
             treeWidget_variables->setVariableForRow(varUnit, pItem, var);
@@ -7361,10 +7540,80 @@ void dlgTriggerEditor::saveVar()
         break;
     }
     pItem->setIcon(0, icon);
+    moveVariableRowToSortedPlace(pItem, variable);
     mChangingVar = false;
     slot_variableSelected(pItem);
     if (renameRefused) {
         showVariableRenameRefused(variable);
+    }
+}
+
+// A full rebuild sorts the rows, so a row named in place has to go where that
+// sort would put it
+void dlgTriggerEditor::moveVariableRowToSortedPlace(QTreeWidgetItem* pItem, TVar* pVariable)
+{
+    QTreeWidgetItem* pParentItem = pItem->parent();
+    if (!pParentItem || !pVariable) {
+        return;
+    }
+    VarUnit* varUnit = mpHost->getLuaInterface()->getVarUnit();
+    auto siblingVariable = [&](const int index) -> TVar* {
+        QTreeWidgetItem* pSiblingItem = pParentItem->child(index);
+        TVar* pSibling = treeWidget_variables->variableForRow(varUnit, pSiblingItem);
+        return pSibling ? pSibling : treeWidget_variables->newVariableForRow(varUnit, pSiblingItem);
+    };
+    const int from = pParentItem->indexOfChild(pItem);
+    // Every row switch saves the row left behind, so one already in order stays put without
+    // a walk over its siblings, and is not moved past a sibling that sorts alike ("1", "01")
+    TVar* pPrevious = from > 0 ? siblingVariable(from - 1) : nullptr;
+    TVar* pNext = from + 1 < pParentItem->childCount() ? siblingVariable(from + 1) : nullptr;
+    if ((!pPrevious || !TVarLessThan(pVariable, pPrevious)) && (!pNext || !TVarLessThan(pNext, pVariable))) {
+        return;
+    }
+    int to = pParentItem->childCount() - 1;
+    for (int i = 0; i < pParentItem->childCount(); ++i) {
+        if (i == from) {
+            continue;
+        }
+        TVar* pSibling = siblingVariable(i);
+        if (pSibling && TVarLessThan(pVariable, pSibling)) {
+            to = i > from ? i - 1 : i;
+            break;
+        }
+    }
+    if (to == from) {
+        return;
+    }
+
+    // The view forgets the expanded and selected state of every row taken out
+    // of it, and moves the current row off one it loses
+    QTreeWidgetItem* pCurrentItem = treeWidget_variables->currentItem();
+    const QList<QTreeWidgetItem*> selectedItems = treeWidget_variables->selectedItems();
+    QList<QTreeWidgetItem*> expandedItems;
+    QList<QTreeWidgetItem*> pendingItems{pItem};
+    while (!pendingItems.isEmpty()) {
+        QTreeWidgetItem* pEntry = pendingItems.takeLast();
+        if (pEntry->isExpanded()) {
+            expandedItems.append(pEntry);
+        }
+        for (int i = 0; i < pEntry->childCount(); ++i) {
+            pendingItems.append(pEntry->child(i));
+        }
+    }
+    // Taking the row out and putting the selection back both emit
+    // itemSelectionChanged, whose slot would refill the form in the middle of this save
+    const QSignalBlocker blocker(treeWidget_variables);
+    pParentItem->takeChild(from);
+    pParentItem->insertChild(to, pItem);
+    for (QTreeWidgetItem* pExpandedItem : std::as_const(expandedItems)) {
+        pExpandedItem->setExpanded(true);
+    }
+    if (pCurrentItem && treeWidget_variables->currentItem() != pCurrentItem) {
+        treeWidget_variables->setCurrentItem(pCurrentItem, 0, QItemSelectionModel::NoUpdate);
+    }
+    treeWidget_variables->clearSelection();
+    for (QTreeWidgetItem* pSelectedItem : selectedItems) {
+        pSelectedItem->setSelected(true);
     }
 }
 
@@ -7393,7 +7642,7 @@ void dlgTriggerEditor::saveKey()
     TKey* pT = mpHost->getKeyUnit()->getKey(triggerID);
     if (pT) {
         // Capture OLD state before modifications (for undo)
-        QString oldStateXML = exportKeyToXML(pT);
+        QString oldStateXML = exportKeyToXML(pT, SnapshotScope::ItemOnly);
 
         const QString old_name = pT->getName();
         pItem->setText(0, name);
@@ -7504,7 +7753,7 @@ void dlgTriggerEditor::saveKey()
         pItem->setData(0, Qt::AccessibleDescriptionRole, itemDescription);
 
         // Capture NEW state after modifications (for redo)
-        QString newStateXML = exportKeyToXML(pT);
+        QString newStateXML = exportKeyToXML(pT, SnapshotScope::ItemOnly);
 
         // Only push undo command if something actually changed
         if (oldStateXML != newStateXML) {
@@ -7516,6 +7765,7 @@ void dlgTriggerEditor::saveKey()
                 mpTextUndoStack->clear();
             }
         }
+        mpUndoStack->finishAddingItem(EditorViewType::cmKeysView, triggerID);
     }
 }
 
@@ -9170,7 +9420,7 @@ void dlgTriggerEditor::refreshKeyIconsIn(QTreeWidgetItem* pParent, bool ancestor
             --remaining;
         }
         const bool dirty = ancestorDirty || pending;
-        const bool touchNotification = pending ? ((pItem == mpCurrentKeyItem) && (mCurrentView == EditorViewType::cmKeysView)) : ancestorTouchNotification;
+        const bool touchNotification = pending ? ((pItem == mpCurrentKeyItem) && (mCurrentView == EditorViewType::cmKeysView) && mFolderGroupKey.isEmpty()) : ancestorTouchNotification;
         if (dirty) {
             if (TKey* pT = mpHost->getKeyUnit()->getKey(id)) {
                 paintKeyItem(pItem, pT, touchNotification);
@@ -9500,7 +9750,7 @@ void dlgTriggerEditor::refreshScriptIconsIn(QTreeWidgetItem* pParent, bool ances
             --remaining;
         }
         const bool dirty = ancestorDirty || pending;
-        const bool touchNotification = pending ? ((pItem == mpCurrentScriptItem) && (mCurrentView == EditorViewType::cmScriptView)) : ancestorTouchNotification;
+        const bool touchNotification = pending ? ((pItem == mpCurrentScriptItem) && (mCurrentView == EditorViewType::cmScriptView) && mFolderGroupKey.isEmpty()) : ancestorTouchNotification;
         if (dirty) {
             if (TScript* pT = mpHost->getScriptUnit()->getScript(id)) {
                 paintScriptItem(pItem, pT, touchNotification);
@@ -9684,7 +9934,7 @@ void dlgTriggerEditor::refreshTimerIconsIn(QTreeWidgetItem* pParent, bool ancest
             --remaining;
         }
         const bool dirty = ancestorDirty || pending;
-        const bool touchNotification = pending ? ((pItem == mpCurrentTimerItem) && (mCurrentView == EditorViewType::cmTimerView)) : ancestorTouchNotification;
+        const bool touchNotification = pending ? ((pItem == mpCurrentTimerItem) && (mCurrentView == EditorViewType::cmTimerView) && mFolderGroupKey.isEmpty()) : ancestorTouchNotification;
         if (dirty) {
             if (TTimer* pT = mpHost->getTimerUnit()->getTimer(id)) {
                 paintTimerItem(pItem, pT, touchNotification);
@@ -9878,7 +10128,7 @@ void dlgTriggerEditor::refreshTriggerIconsIn(QTreeWidgetItem* pParent, bool ance
             --remaining;
         }
         const bool dirty = ancestorDirty || pending;
-        const bool touchNotification = pending ? ((pItem == mpCurrentTriggerItem) && (mCurrentView == EditorViewType::cmTriggerView)) : ancestorTouchNotification;
+        const bool touchNotification = pending ? ((pItem == mpCurrentTriggerItem) && (mCurrentView == EditorViewType::cmTriggerView) && mFolderGroupKey.isEmpty()) : ancestorTouchNotification;
         if (dirty) {
             if (TTrigger* pT = mpHost->getTriggerUnit()->getTrigger(id)) {
                 paintTriggerItem(pItem, pT, touchNotification);
@@ -10366,6 +10616,10 @@ void dlgTriggerEditor::expand_child_timers(TTimer* pTimerParent, QTreeWidgetItem
 
 void dlgTriggerEditor::saveOpenChanges()
 {
+    // The item behind a merged folder was saved when the folder was chosen, and its errors must stay hidden
+    if (!mFolderGroupKey.isEmpty()) {
+        return;
+    }
     switch (mCurrentView) {
     case EditorViewType::cmTriggerView:
         if (mpCurrentTriggerItem) {
@@ -10462,11 +10716,13 @@ void dlgTriggerEditor::timerEvent(QTimerEvent* event)
 
 void dlgTriggerEditor::autoSave()
 {
-    mpHost->saveProfile(QString(), qsl("autosave"));
+    mpHost->saveProfileReportingFailure(qsl("autosave"));
 }
 
 void dlgTriggerEditor::rebuildStaleTrees()
 {
+    // fillout_form() forgets the view, and the Folders view hides every type tree resolveCurrentView() could recover it from
+    const EditorViewType folderViewType = mFolderViewActive ? mCurrentView : EditorViewType::cmUnknownView;
     treeWidget_triggers->clear();
     treeWidget_aliases->clear();
     treeWidget_timers->clear();
@@ -10476,6 +10732,9 @@ void dlgTriggerEditor::rebuildStaleTrees()
     treeWidget_variables->clear();
     fillout_form();
     mNeedUpdateData = false;
+    if (folderViewType != EditorViewType::cmUnknownView) {
+        mCurrentView = folderViewType;
+    }
     resolveCurrentView();
 }
 
@@ -10538,7 +10797,7 @@ void dlgTriggerEditor::showEvent(QShowEvent* event)
     QMainWindow::showEvent(event);
 
     mHasBeenShown = true;
-    widgetutils::keepDialogOnAScreen(this, mpHost->mpConsole);
+    widgetutils::keepDialogOnAScreen(this, mpHost->mainConsoleView());
 
     // A Lua toggle that arrived while this editor was hidden stays queued
     // rather than being dropped (see flushPendingTriggerIconRefresh()) -
@@ -10614,23 +10873,30 @@ void dlgTriggerEditor::changeView(EditorViewType view)
         hideSystemMessageArea();
     }
 
+    if (view == EditorViewType::cmVarsView) {
+        leaveFolderView();
+    }
+    hideFolderGroup();
+    const bool showTypeTree = !mFolderViewActive;
+    mpFolderTree->setVisible(mFolderViewActive);
+
     mpActionsMainArea->setVisible(view == EditorViewType::cmActionView);
-    treeWidget_actions->setVisible(view == EditorViewType::cmActionView);
+    treeWidget_actions->setVisible(showTypeTree && view == EditorViewType::cmActionView);
 
     mpAliasMainArea->setVisible(view == EditorViewType::cmAliasView);
-    treeWidget_aliases->setVisible(view == EditorViewType::cmAliasView);
+    treeWidget_aliases->setVisible(showTypeTree && view == EditorViewType::cmAliasView);
 
     mpKeysMainArea->setVisible(view == EditorViewType::cmKeysView);
-    treeWidget_keys->setVisible(view == EditorViewType::cmKeysView);
+    treeWidget_keys->setVisible(showTypeTree && view == EditorViewType::cmKeysView);
 
     mpScriptsMainArea->setVisible(view == EditorViewType::cmScriptView);
-    treeWidget_scripts->setVisible(view == EditorViewType::cmScriptView);
+    treeWidget_scripts->setVisible(showTypeTree && view == EditorViewType::cmScriptView);
 
     mpTimersMainArea->setVisible(view == EditorViewType::cmTimerView);
-    treeWidget_timers->setVisible(view == EditorViewType::cmTimerView);
+    treeWidget_timers->setVisible(showTypeTree && view == EditorViewType::cmTimerView);
 
     mpTriggersMainArea->setVisible(view == EditorViewType::cmTriggerView);
-    treeWidget_triggers->setVisible(view == EditorViewType::cmTriggerView);
+    treeWidget_triggers->setVisible(showTypeTree && view == EditorViewType::cmTriggerView);
 
     const bool enablePatternShortcuts = view == EditorViewType::cmTriggerView;
 
@@ -10772,7 +11038,7 @@ void dlgTriggerEditor::slot_showTimers()
         splitter_right->setSizes(sizes);
         mTimerEditorSplitterState = splitter_right->saveState();
     }
-    treeWidget_timers->setFocus();
+    focusItemTree(treeWidget_timers);
 }
 
 void dlgTriggerEditor::showCurrentTriggerItem()
@@ -10814,7 +11080,7 @@ void dlgTriggerEditor::slot_showTriggers()
         splitter_right->setSizes(sizes);
         mTriggerEditorSplitterState = splitter_right->saveState();
     }
-    treeWidget_triggers->setFocus();
+    focusItemTree(treeWidget_triggers);
 }
 
 void dlgTriggerEditor::slot_showScripts()
@@ -10837,7 +11103,7 @@ void dlgTriggerEditor::slot_showScripts()
         splitter_right->setSizes(sizes);
         mScriptEditorSplitterState = splitter_right->saveState();
     }
-    treeWidget_scripts->setFocus();
+    focusItemTree(treeWidget_scripts);
 }
 
 void dlgTriggerEditor::slot_showKeys()
@@ -10860,7 +11126,7 @@ void dlgTriggerEditor::slot_showKeys()
         splitter_right->setSizes(sizes);
         mKeyEditorSplitterState = splitter_right->saveState();
     }
-    treeWidget_keys->setFocus();
+    focusItemTree(treeWidget_keys);
 }
 
 void dlgTriggerEditor::slot_showVariables()
@@ -10931,7 +11197,7 @@ void dlgTriggerEditor::slot_showAliases()
         splitter_right->setSizes(sizes);
         mAliasEditorSplitterState = splitter_right->saveState();
     }
-    treeWidget_aliases->setFocus();
+    focusItemTree(treeWidget_aliases);
 }
 
 void dlgTriggerEditor::showError(const QString& text)
@@ -11147,11 +11413,15 @@ void dlgTriggerEditor::slot_showActions()
         splitter_right->setSizes(sizes);
         mActionEditorSplitterState = splitter_right->saveState();
     }
-    treeWidget_actions->setFocus();
+    focusItemTree(treeWidget_actions);
 }
 
 void dlgTriggerEditor::slot_saveEdits()
 {
+    // The item behind a merged folder was saved when the folder was chosen, and its errors must stay hidden
+    if (!mFolderGroupKey.isEmpty()) {
+        return;
+    }
     switch (resolveCurrentView()) {
     case EditorViewType::cmTriggerView:
         saveTrigger();
@@ -11170,6 +11440,7 @@ void dlgTriggerEditor::slot_saveEdits()
         break;
     case EditorViewType::cmKeysView:
         saveKey();
+        rewarnAboutCurrentKey();
         break;
     case EditorViewType::cmVarsView:
         saveVar();
@@ -11435,6 +11706,7 @@ void dlgTriggerEditor::slot_saveSelectedItem()
         break;
     case EditorViewType::cmKeysView:
         saveKey();
+        rewarnAboutCurrentKey();
         break;
     case EditorViewType::cmVarsView:
         saveVar();
@@ -11542,13 +11814,18 @@ void dlgTriggerEditor::slot_toggleCentralDebugConsole()
 
 void dlgTriggerEditor::slot_nextSection()
 {
+    // Hidden widgets still take focus, and typing there would edit the item a merged folder hides
+    if (!mFolderGroupKey.isEmpty()) {
+        mpFolderTree->setFocus();
+        return;
+    }
     switch (mCurrentView) {
     case EditorViewType::cmTriggerView:
         if (qsl("edbee::TextEditorComponent").compare(QApplication::focusWidget()->metaObject()->className()) == 0) {
-            treeWidget_triggers->setFocus();
+            sectionTree(treeWidget_triggers)->setFocus();
             return;
         }
-        if (treeWidget_triggers->hasFocus()) {
+        if (sectionTree(treeWidget_triggers)->hasFocus()) {
             mpTriggersMainArea->lineEdit_trigger_name->setFocus();
             return;
         }
@@ -11571,10 +11848,10 @@ void dlgTriggerEditor::slot_nextSection()
         break;
     case EditorViewType::cmTimerView:
         if (qsl("edbee::TextEditorComponent").compare(QApplication::focusWidget()->metaObject()->className()) == 0) {
-            treeWidget_timers->setFocus();
+            sectionTree(treeWidget_timers)->setFocus();
             return;
         }
-        if (treeWidget_timers->hasFocus()) {
+        if (sectionTree(treeWidget_timers)->hasFocus()) {
             mpTimersMainArea->lineEdit_timer_name->setFocus();
             return;
         }
@@ -11587,10 +11864,10 @@ void dlgTriggerEditor::slot_nextSection()
         break;
     case EditorViewType::cmAliasView:
         if (QString("edbee::TextEditorComponent").compare(QApplication::focusWidget()->metaObject()->className()) == 0) {
-            treeWidget_aliases->setFocus();
+            sectionTree(treeWidget_aliases)->setFocus();
             return;
         }
-        if (treeWidget_aliases->hasFocus()) {
+        if (sectionTree(treeWidget_aliases)->hasFocus()) {
             mpAliasMainArea->lineEdit_alias_name->setFocus();
             return;
         }
@@ -11603,10 +11880,10 @@ void dlgTriggerEditor::slot_nextSection()
         break;
     case EditorViewType::cmScriptView:
         if (qsl("edbee::TextEditorComponent").compare(QApplication::focusWidget()->metaObject()->className()) == 0) {
-            treeWidget_scripts->setFocus();
+            sectionTree(treeWidget_scripts)->setFocus();
             return;
         }
-        if (treeWidget_scripts->hasFocus()) {
+        if (sectionTree(treeWidget_scripts)->hasFocus()) {
             mpScriptsMainArea->lineEdit_script_name->setFocus();
             return;
         }
@@ -11619,10 +11896,10 @@ void dlgTriggerEditor::slot_nextSection()
         break;
     case EditorViewType::cmActionView:
         if (qsl("edbee::TextEditorComponent").compare(QApplication::focusWidget()->metaObject()->className()) == 0) {
-            treeWidget_actions->setFocus();
+            sectionTree(treeWidget_actions)->setFocus();
             return;
         }
-        if (treeWidget_actions->hasFocus()) {
+        if (sectionTree(treeWidget_actions)->hasFocus()) {
             mpActionsMainArea->lineEdit_action_name->setFocus();
             return;
         }
@@ -11635,10 +11912,10 @@ void dlgTriggerEditor::slot_nextSection()
         break;
     case EditorViewType::cmKeysView:
         if (qsl("edbee::TextEditorComponent").compare(QApplication::focusWidget()->metaObject()->className()) == 0) {
-            treeWidget_keys->setFocus();
+            sectionTree(treeWidget_keys)->setFocus();
             return;
         }
-        if (treeWidget_keys->hasFocus()) {
+        if (sectionTree(treeWidget_keys)->hasFocus()) {
             mpKeysMainArea->lineEdit_key_name->setFocus();
             return;
         }
@@ -11672,13 +11949,17 @@ void dlgTriggerEditor::slot_nextSection()
 
 void dlgTriggerEditor::slot_previousSection()
 {
+    if (!mFolderGroupKey.isEmpty()) {
+        mpFolderTree->setFocus();
+        return;
+    }
     switch (mCurrentView) {
     case EditorViewType::cmTriggerView:
         if (QString("edbee::TextEditorComponent").compare(QApplication::focusWidget()->metaObject()->className()) == 0) {
             mTriggerPatternEdit[0]->singleLineTextEdit_pattern->setFocus();
             return;
         }
-        if (treeWidget_triggers->hasFocus()) {
+        if (sectionTree(treeWidget_triggers)->hasFocus()) {
             mpSourceEditorEdbee->setFocus();
             return;
         }
@@ -11690,7 +11971,7 @@ void dlgTriggerEditor::slot_previousSection()
         }
         for (auto child : mpTriggersMainArea->findChildren<QWidget*>()) {
             if (child->hasFocus()) {
-                treeWidget_triggers->setFocus();
+                sectionTree(treeWidget_triggers)->setFocus();
                 return;
             }
         }
@@ -11700,13 +11981,13 @@ void dlgTriggerEditor::slot_previousSection()
             mpTimersMainArea->lineEdit_timer_name->setFocus();
             return;
         }
-        if (treeWidget_timers->hasFocus()) {
+        if (sectionTree(treeWidget_timers)->hasFocus()) {
             mpSourceEditorEdbee->setFocus();
             return;
         }
         for (auto child : mpTimersMainArea->findChildren<QWidget*>()) {
             if (child->hasFocus()) {
-                treeWidget_timers->setFocus();
+                sectionTree(treeWidget_timers)->setFocus();
                 return;
             }
         }
@@ -11716,13 +11997,13 @@ void dlgTriggerEditor::slot_previousSection()
             mpAliasMainArea->lineEdit_alias_name->setFocus();
             return;
         }
-        if (treeWidget_aliases->hasFocus()) {
+        if (sectionTree(treeWidget_aliases)->hasFocus()) {
             mpSourceEditorEdbee->setFocus();
             return;
         }
         for (auto child : mpAliasMainArea->findChildren<QWidget*>()) {
             if (child->hasFocus()) {
-                treeWidget_aliases->setFocus();
+                sectionTree(treeWidget_aliases)->setFocus();
                 return;
             }
         }
@@ -11732,13 +12013,13 @@ void dlgTriggerEditor::slot_previousSection()
             mpScriptsMainArea->lineEdit_script_name->setFocus();
             return;
         }
-        if (treeWidget_scripts->hasFocus()) {
+        if (sectionTree(treeWidget_scripts)->hasFocus()) {
             mpSourceEditorEdbee->setFocus();
             return;
         }
         for (auto child : mpScriptsMainArea->findChildren<QWidget*>()) {
             if (child->hasFocus()) {
-                treeWidget_scripts->setFocus();
+                sectionTree(treeWidget_scripts)->setFocus();
                 return;
             }
         }
@@ -11748,13 +12029,13 @@ void dlgTriggerEditor::slot_previousSection()
             mpActionsMainArea->lineEdit_action_name->setFocus();
             return;
         }
-        if (treeWidget_actions->hasFocus()) {
+        if (sectionTree(treeWidget_actions)->hasFocus()) {
             mpSourceEditorEdbee->setFocus();
             return;
         }
         for (auto child : mpActionsMainArea->findChildren<QWidget*>()) {
             if (child->hasFocus()) {
-                treeWidget_actions->setFocus();
+                sectionTree(treeWidget_actions)->setFocus();
                 return;
             }
         }
@@ -11764,13 +12045,13 @@ void dlgTriggerEditor::slot_previousSection()
             mpKeysMainArea->lineEdit_key_name->setFocus();
             return;
         }
-        if (treeWidget_keys->hasFocus()) {
+        if (sectionTree(treeWidget_keys)->hasFocus()) {
             mpSourceEditorEdbee->setFocus();
             return;
         }
         for (auto child : mpKeysMainArea->findChildren<QWidget*>()) {
             if (child->hasFocus()) {
-                treeWidget_keys->setFocus();
+                sectionTree(treeWidget_keys)->setFocus();
                 return;
             }
         }
@@ -11799,7 +12080,7 @@ void dlgTriggerEditor::slot_previousSection()
 void dlgTriggerEditor::slot_activateMainWindow()
 {
     mudlet::self()->activateWindow();
-    mpHost->mpConsole->setFocus();
+    mpHost->mainConsoleView()->setFocus();
 }
 
 void dlgTriggerEditor::exportTrigger(const QString& fileName)
@@ -11950,11 +12231,6 @@ void dlgTriggerEditor::exportKey(const QString& fileName)
 void dlgTriggerEditor::exportTriggerToClipboard()
 {
     QList<QTreeWidgetItem*> selectedItems = treeWidget_triggers->selectedItems();
-    if (selectedItems.isEmpty()) {
-        QMessageBox::warning(this, tr("Export Package:"), tr("You have to choose an item for export first. Please select a tree item and then click on export again."));
-        return;
-    }
-
     QStringList triggerNames;
     QList<TTrigger*> triggersToExport;
 
@@ -11968,7 +12244,6 @@ void dlgTriggerEditor::exportTriggerToClipboard()
     }
 
     if (triggersToExport.isEmpty()) {
-        QMessageBox::warning(this, tr("Export Package:"), tr("No valid triggers found to export."));
         return;
     }
 
@@ -12014,11 +12289,6 @@ void dlgTriggerEditor::exportMultipleTriggersToClipboard(const QList<TTrigger*>&
 void dlgTriggerEditor::exportTimerToClipboard()
 {
     QList<QTreeWidgetItem*> selectedItems = treeWidget_timers->selectedItems();
-    if (selectedItems.isEmpty()) {
-        QMessageBox::warning(this, tr("Export Package:"), tr("You have to choose an item for export first. Please select a tree item and then click on export again."));
-        return;
-    }
-
     QStringList timerNames;
     QList<TTimer*> timersToExport;
 
@@ -12032,7 +12302,6 @@ void dlgTriggerEditor::exportTimerToClipboard()
     }
 
     if (timersToExport.isEmpty()) {
-        QMessageBox::warning(this, tr("Export Package:"), tr("No valid timers found to export."));
         return;
     }
 
@@ -12070,11 +12339,6 @@ void dlgTriggerEditor::exportMultipleTimersToClipboard(const QList<TTimer*>& tim
 void dlgTriggerEditor::exportAliasToClipboard()
 {
     QList<QTreeWidgetItem*> selectedItems = treeWidget_aliases->selectedItems();
-    if (selectedItems.isEmpty()) {
-        QMessageBox::warning(this, tr("Export Package:"), tr("You have to choose an item for export first. Please select a tree item and then click on export again."));
-        return;
-    }
-
     QStringList aliasNames;
     QList<TAlias*> aliasesToExport;
 
@@ -12088,7 +12352,6 @@ void dlgTriggerEditor::exportAliasToClipboard()
     }
 
     if (aliasesToExport.isEmpty()) {
-        QMessageBox::warning(this, tr("Export Package:"), tr("No valid aliases found to export."));
         return;
     }
 
@@ -12126,11 +12389,6 @@ void dlgTriggerEditor::exportMultipleAliasesToClipboard(const QList<TAlias*>& al
 void dlgTriggerEditor::exportActionToClipboard()
 {
     QList<QTreeWidgetItem*> selectedItems = treeWidget_actions->selectedItems();
-    if (selectedItems.isEmpty()) {
-        QMessageBox::warning(this, tr("Export Package:"), tr("You have to choose an item for export first. Please select a tree item and then click on export again."));
-        return;
-    }
-
     QStringList actionNames;
     QList<TAction*> actionsToExport;
 
@@ -12144,7 +12402,6 @@ void dlgTriggerEditor::exportActionToClipboard()
     }
 
     if (actionsToExport.isEmpty()) {
-        QMessageBox::warning(this, tr("Export Package:"), tr("No valid actions found to export."));
         return;
     }
 
@@ -12182,11 +12439,6 @@ void dlgTriggerEditor::exportMultipleActionsToClipboard(const QList<TAction*>& a
 void dlgTriggerEditor::exportScriptToClipboard()
 {
     QList<QTreeWidgetItem*> selectedItems = treeWidget_scripts->selectedItems();
-    if (selectedItems.isEmpty()) {
-        QMessageBox::warning(this, tr("Export Package:"), tr("You have to choose an item for export first. Please select a tree item and then click on export again."));
-        return;
-    }
-
     QStringList scriptNames;
     QList<TScript*> scriptsToExport;
 
@@ -12200,7 +12452,6 @@ void dlgTriggerEditor::exportScriptToClipboard()
     }
 
     if (scriptsToExport.isEmpty()) {
-        QMessageBox::warning(this, tr("Export Package:"), tr("No valid scripts found to export."));
         return;
     }
 
@@ -12238,11 +12489,6 @@ void dlgTriggerEditor::exportMultipleScriptsToClipboard(const QList<TScript*>& s
 void dlgTriggerEditor::exportKeyToClipboard()
 {
     QList<QTreeWidgetItem*> selectedItems = treeWidget_keys->selectedItems();
-    if (selectedItems.isEmpty()) {
-        QMessageBox::warning(this, tr("Export Package:"), tr("You have to choose an item for export first. Please select a tree item and then click on export again."));
-        return;
-    }
-
     QStringList keyNames;
     QList<TKey*> keysToExport;
 
@@ -12256,7 +12502,6 @@ void dlgTriggerEditor::exportKeyToClipboard()
     }
 
     if (keysToExport.isEmpty()) {
-        QMessageBox::warning(this, tr("Export Package:"), tr("No valid keys found to export."));
         return;
     }
 
@@ -12403,6 +12648,8 @@ void dlgTriggerEditor::slot_createModule()
     packageExporter->show();
 }
 
+// With no valid item selected the *ToClipboard() callees return without a word, so a stray
+// Ctrl+C raises no modal box; the Export action keeps its warning, as it was asked for a file
 void dlgTriggerEditor::slot_copyXml()
 {
     switch (resolveCurrentView()) {
@@ -13094,30 +13341,33 @@ void dlgTriggerEditor::slot_pasteXml()
 
 void dlgTriggerEditor::slot_import()
 {
-    switch (mCurrentView) {
-    case EditorViewType::cmTriggerView:
-        saveTrigger();
-        break;
-    case EditorViewType::cmTimerView:
-        saveTimer();
-        break;
-    case EditorViewType::cmAliasView:
-        saveAlias();
-        break;
-    case EditorViewType::cmScriptView:
-        saveScript();
-        break;
-    case EditorViewType::cmActionView:
-        saveAction();
-        break;
-    case EditorViewType::cmKeysView:
-        saveKey();
-        break;
-    case EditorViewType::cmVarsView:
-        qWarning().nospace().noquote() << "dlgTriggerEditor::slot_import() WARNING - switch(EditorViewType) not expected to be called for \"EditorViewType::cmVarsView!\"";
-        break;
-    case EditorViewType::cmUnknownView:
-        qWarning().nospace().noquote() << "dlgTriggerEditor::slot_import() WARNING - switch(EditorViewType) not expected to be called for \"EditorViewType::cmUnknownView!\"";
+    // The item behind a merged folder was saved when the folder was chosen, and its errors must stay hidden
+    if (mFolderGroupKey.isEmpty()) {
+        switch (mCurrentView) {
+        case EditorViewType::cmTriggerView:
+            saveTrigger();
+            break;
+        case EditorViewType::cmTimerView:
+            saveTimer();
+            break;
+        case EditorViewType::cmAliasView:
+            saveAlias();
+            break;
+        case EditorViewType::cmScriptView:
+            saveScript();
+            break;
+        case EditorViewType::cmActionView:
+            saveAction();
+            break;
+        case EditorViewType::cmKeysView:
+            saveKey();
+            break;
+        case EditorViewType::cmVarsView:
+            qWarning().nospace().noquote() << "dlgTriggerEditor::slot_import() WARNING - switch(EditorViewType) not expected to be called for \"EditorViewType::cmVarsView!\"";
+            break;
+        case EditorViewType::cmUnknownView:
+            qWarning().nospace().noquote() << "dlgTriggerEditor::slot_import() WARNING - switch(EditorViewType) not expected to be called for \"EditorViewType::cmUnknownView!\"";
+        }
     }
 
     QSettings& settings = *MudletApp::getQSettings();
@@ -13255,7 +13505,11 @@ void dlgTriggerEditor::slot_profileSaveAction()
 
     auto [ok, filename, error] = mpHost->saveProfile(QString(), QString(), true);
 
-    if (!ok && !error.isEmpty()) {
+    if (ok) {
+        // Most application-wide settings reach Mudlet.ini only at quit, so an
+        // unclean exit would lose the ones this save is meant to keep
+        mudlet::self()->writeSettings();
+    } else if (!error.isEmpty()) {
         QMessageBox::critical(this, tr("Couldn't save profile"), tr("Sorry, couldn't save your profile - got the following error: %1").arg(error));
     }
 }
@@ -13281,8 +13535,16 @@ void dlgTriggerEditor::slot_profileSaveAsAction()
     }
     slot_saveEdits();
 
-    mpHost->saveProfileAs(fileName);
+    auto [ok, filename, error] = mpHost->saveProfileAs(fileName);
+    if (ok) {
+        mudlet::self()->writeSettings();
+    }
     mSavingAs = false;
+    if (!ok && !error.isEmpty()) {
+        //: %1 is the reason the profile could not be saved, such as an error from the operating system
+        const QString message = tr("Sorry, couldn't save your profile - got the following error: %1").arg(error);
+        QMessageBox::critical(this, tr("Couldn't save profile"), message);
+    }
 }
 
 bool dlgTriggerEditor::eventFilter(QObject* watched, QEvent* event)
@@ -13421,10 +13683,10 @@ void dlgTriggerEditor::keyGrabCallback(const Qt::Key key, const Qt::KeyboardModi
                 return;
             }
 
-            QString oldStateXML = exportKeyToXML(pT);
+            QString oldStateXML = exportKeyToXML(pT, SnapshotScope::ItemOnly);
             pT->setKeyCode(key);
             pT->setKeyModifiers(modifier);
-            QString newStateXML = exportKeyToXML(pT);
+            QString newStateXML = exportKeyToXML(pT, SnapshotScope::ItemOnly);
 
             showKeyTakenWarning(pItem, takenKeyWarning(pT), true);
 
@@ -13948,8 +14210,11 @@ int dlgTriggerEditor::findSearchMatch(const QString& haystack, const QString& ne
         if (!(mSearchOptions & enums::EditorSearchOptionCaseSensitive)) {
             options |= QRegularExpression::CaseInsensitiveOption;
         }
-        QRegularExpression regex(qsl("\\b%1\\b").arg(QRegularExpression::escape(needle)), options);
-        QRegularExpressionMatch match = regex.match(haystack, from);
+        if (needle != mWholeWordSearchNeedle || options != mWholeWordSearchRegex.patternOptions()) {
+            mWholeWordSearchRegex = QRegularExpression(qsl("\\b%1\\b").arg(QRegularExpression::escape(needle)), options);
+            mWholeWordSearchNeedle = needle;
+        }
+        const QRegularExpressionMatch match = mWholeWordSearchRegex.match(haystack, from);
         if (match.hasMatch()) {
             return match.capturedStart();
         }
@@ -15369,10 +15634,10 @@ void dlgTriggerEditor::slot_saveProperty_TriggerName()
         return;
     }
 
-    QString oldStateXML = exportTriggerToXML(pT);
+    QString oldStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
     pT->setName(newName);
     mpCurrentTriggerItem->setText(0, newName);
-    QString newStateXML = exportTriggerToXML(pT);
+    QString newStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
 
     pushTriggerPropertyCommand(mpUndoStack, mpHost, triggerID, newName, qsl("name"), oldStateXML, newStateXML);
 }
@@ -15395,9 +15660,9 @@ void dlgTriggerEditor::slot_saveProperty_TriggerCommand()
         return;
     }
 
-    QString oldStateXML = exportTriggerToXML(pT);
+    QString oldStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
     pT->setCommand(newCommand);
-    QString newStateXML = exportTriggerToXML(pT);
+    QString newStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
 
     pushTriggerPropertyCommand(mpUndoStack, mpHost, triggerID, pT->getName(), qsl("command"), oldStateXML, newStateXML);
 }
@@ -15420,9 +15685,9 @@ void dlgTriggerEditor::slot_saveProperty_TriggerStayOpen()
         return;
     }
 
-    QString oldStateXML = exportTriggerToXML(pT);
+    QString oldStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
     pT->mStayOpen = newValue;
-    QString newStateXML = exportTriggerToXML(pT);
+    QString newStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
 
     pushTriggerPropertyCommand(mpUndoStack, mpHost, triggerID, pT->getName(), qsl("stayOpen"), oldStateXML, newStateXML);
 }
@@ -15447,14 +15712,14 @@ void dlgTriggerEditor::slot_saveProperty_TriggerLineMargin()
         return;
     }
 
-    QString oldStateXML = exportTriggerToXML(pT);
+    QString oldStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
     if (newValue >= 0) {
         pT->setConditionLineDelta(newValue);
         pT->setIsMultiline(true);
     } else {
         pT->setIsMultiline(false);
     }
-    QString newStateXML = exportTriggerToXML(pT);
+    QString newStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
 
     pushTriggerPropertyCommand(mpUndoStack, mpHost, triggerID, pT->getName(), qsl("lineMargin"), oldStateXML, newStateXML);
 }
@@ -15477,9 +15742,9 @@ void dlgTriggerEditor::slot_saveProperty_TriggerFilterTrigger()
         return;
     }
 
-    QString oldStateXML = exportTriggerToXML(pT);
+    QString oldStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
     pT->mFilterTrigger = newValue;
-    QString newStateXML = exportTriggerToXML(pT);
+    QString newStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
 
     pushTriggerPropertyCommand(mpUndoStack, mpHost, triggerID, pT->getName(), qsl("filterTrigger"), oldStateXML, newStateXML);
 }
@@ -15502,9 +15767,9 @@ void dlgTriggerEditor::slot_saveProperty_TriggerPerlSlashG()
         return;
     }
 
-    QString oldStateXML = exportTriggerToXML(pT);
+    QString oldStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
     pT->mPerlSlashGOption = newValue;
-    QString newStateXML = exportTriggerToXML(pT);
+    QString newStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
 
     pushTriggerPropertyCommand(mpUndoStack, mpHost, triggerID, pT->getName(), qsl("perlSlashG"), oldStateXML, newStateXML);
 }
@@ -15527,9 +15792,9 @@ void dlgTriggerEditor::slot_saveProperty_TriggerSoundEnabled()
         return;
     }
 
-    QString oldStateXML = exportTriggerToXML(pT);
+    QString oldStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
     pT->mSoundTrigger = newValue;
-    QString newStateXML = exportTriggerToXML(pT);
+    QString newStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
 
     pushTriggerPropertyCommand(mpUndoStack, mpHost, triggerID, pT->getName(), qsl("soundEnabled"), oldStateXML, newStateXML);
 }
@@ -15552,9 +15817,9 @@ void dlgTriggerEditor::slot_saveProperty_TriggerSoundFile()
         return;
     }
 
-    QString oldStateXML = exportTriggerToXML(pT);
+    QString oldStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
     pT->setSound(newValue);
-    QString newStateXML = exportTriggerToXML(pT);
+    QString newStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
 
     pushTriggerPropertyCommand(mpUndoStack, mpHost, triggerID, pT->getName(), qsl("soundFile"), oldStateXML, newStateXML);
 }
@@ -15577,9 +15842,9 @@ void dlgTriggerEditor::slot_saveProperty_TriggerColorizer()
         return;
     }
 
-    QString oldStateXML = exportTriggerToXML(pT);
+    QString oldStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
     pT->setIsColorizerTrigger(newValue);
-    QString newStateXML = exportTriggerToXML(pT);
+    QString newStateXML = exportTriggerToXML(pT, SnapshotScope::ItemOnly);
 
     pushTriggerPropertyCommand(mpUndoStack, mpHost, triggerID, pT->getName(), qsl("colorizer"), oldStateXML, newStateXML);
 }
@@ -15653,10 +15918,10 @@ void dlgTriggerEditor::slot_saveProperty_AliasName()
         return;
     }
 
-    QString oldStateXML = exportAliasToXML(pT);
+    QString oldStateXML = exportAliasToXML(pT, SnapshotScope::ItemOnly);
     pT->setName(newName);
     mpCurrentAliasItem->setText(0, newName);
-    QString newStateXML = exportAliasToXML(pT);
+    QString newStateXML = exportAliasToXML(pT, SnapshotScope::ItemOnly);
 
     pushAliasPropertyCommand(mpUndoStack, mpHost, aliasID, newName, qsl("name"), oldStateXML, newStateXML);
 }
@@ -15687,9 +15952,9 @@ void dlgTriggerEditor::slot_saveProperty_AliasPattern()
         return;
     }
 
-    QString oldStateXML = exportAliasToXML(pT);
+    QString oldStateXML = exportAliasToXML(pT, SnapshotScope::ItemOnly);
     pT->setRegexCode(newPattern);
-    QString newStateXML = exportAliasToXML(pT);
+    QString newStateXML = exportAliasToXML(pT, SnapshotScope::ItemOnly);
 
     pushAliasPropertyCommand(mpUndoStack, mpHost, aliasID, pT->getName(), qsl("pattern"), oldStateXML, newStateXML);
 
@@ -15723,9 +15988,9 @@ void dlgTriggerEditor::slot_saveProperty_AliasCommand()
         return;
     }
 
-    QString oldStateXML = exportAliasToXML(pT);
+    QString oldStateXML = exportAliasToXML(pT, SnapshotScope::ItemOnly);
     pT->setCommand(newCommand);
-    QString newStateXML = exportAliasToXML(pT);
+    QString newStateXML = exportAliasToXML(pT, SnapshotScope::ItemOnly);
 
     pushAliasPropertyCommand(mpUndoStack, mpHost, aliasID, pT->getName(), qsl("command"), oldStateXML, newStateXML);
 
@@ -15768,10 +16033,10 @@ void dlgTriggerEditor::slot_saveProperty_TimerName()
         return;
     }
 
-    QString oldStateXML = exportTimerToXML(pT);
+    QString oldStateXML = exportTimerToXML(pT, SnapshotScope::ItemOnly);
     pT->setName(newName);
     mpCurrentTimerItem->setText(0, newName);
-    QString newStateXML = exportTimerToXML(pT);
+    QString newStateXML = exportTimerToXML(pT, SnapshotScope::ItemOnly);
 
     pushTimerPropertyCommand(mpUndoStack, mpHost, timerID, newName, qsl("name"), oldStateXML, newStateXML);
 }
@@ -15794,9 +16059,9 @@ void dlgTriggerEditor::slot_saveProperty_TimerCommand()
         return;
     }
 
-    QString oldStateXML = exportTimerToXML(pT);
+    QString oldStateXML = exportTimerToXML(pT, SnapshotScope::ItemOnly);
     pT->setCommand(newCommand);
-    QString newStateXML = exportTimerToXML(pT);
+    QString newStateXML = exportTimerToXML(pT, SnapshotScope::ItemOnly);
 
     pushTimerPropertyCommand(mpUndoStack, mpHost, timerID, pT->getName(), qsl("command"), oldStateXML, newStateXML);
 }
@@ -15822,9 +16087,9 @@ void dlgTriggerEditor::slot_saveProperty_TimerTime()
         return;
     }
 
-    QString oldStateXML = exportTimerToXML(pT);
+    QString oldStateXML = exportTimerToXML(pT, SnapshotScope::ItemOnly);
     pT->setTime(newTime);
-    QString newStateXML = exportTimerToXML(pT);
+    QString newStateXML = exportTimerToXML(pT, SnapshotScope::ItemOnly);
 
     pushTimerPropertyCommand(mpUndoStack, mpHost, timerID, pT->getName(), qsl("time"), oldStateXML, newStateXML);
 }
@@ -15865,10 +16130,10 @@ void dlgTriggerEditor::slot_saveProperty_ScriptName()
         return;
     }
 
-    QString oldStateXML = exportScriptToXML(pT);
+    QString oldStateXML = exportScriptToXML(pT, SnapshotScope::ItemOnly);
     pT->setName(newName);
     mpCurrentScriptItem->setText(0, newName);
-    QString newStateXML = exportScriptToXML(pT);
+    QString newStateXML = exportScriptToXML(pT, SnapshotScope::ItemOnly);
 
     pushScriptPropertyCommand(mpUndoStack, mpHost, scriptID, newName, qsl("name"), oldStateXML, newStateXML);
 }
@@ -15895,9 +16160,9 @@ void dlgTriggerEditor::slot_saveProperty_ScriptEventHandlers()
         return;
     }
 
-    QString oldStateXML = exportScriptToXML(pT);
+    QString oldStateXML = exportScriptToXML(pT, SnapshotScope::ItemOnly);
     pT->setEventHandlerList(newHandlers);
-    QString newStateXML = exportScriptToXML(pT);
+    QString newStateXML = exportScriptToXML(pT, SnapshotScope::ItemOnly);
 
     pushScriptPropertyCommand(mpUndoStack, mpHost, scriptID, pT->getName(), qsl("eventHandlers"), oldStateXML, newStateXML);
 }
@@ -15937,10 +16202,10 @@ void dlgTriggerEditor::slot_saveProperty_KeyName()
         return;
     }
 
-    QString oldStateXML = exportKeyToXML(pT);
+    QString oldStateXML = exportKeyToXML(pT, SnapshotScope::ItemOnly);
     pT->setName(newName);
     mpCurrentKeyItem->setText(0, newName);
-    QString newStateXML = exportKeyToXML(pT);
+    QString newStateXML = exportKeyToXML(pT, SnapshotScope::ItemOnly);
 
     pushKeyPropertyCommand(mpUndoStack, mpHost, keyID, newName, qsl("name"), oldStateXML, newStateXML);
 }
@@ -15963,9 +16228,9 @@ void dlgTriggerEditor::slot_saveProperty_KeyCommand()
         return;
     }
 
-    QString oldStateXML = exportKeyToXML(pT);
+    QString oldStateXML = exportKeyToXML(pT, SnapshotScope::ItemOnly);
     pT->setCommand(newCommand);
-    QString newStateXML = exportKeyToXML(pT);
+    QString newStateXML = exportKeyToXML(pT, SnapshotScope::ItemOnly);
 
     pushKeyPropertyCommand(mpUndoStack, mpHost, keyID, pT->getName(), qsl("command"), oldStateXML, newStateXML);
 }
@@ -16006,10 +16271,10 @@ void dlgTriggerEditor::slot_saveProperty_ActionName()
         return;
     }
 
-    QString oldStateXML = exportActionToXML(pT);
+    QString oldStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
     pT->setName(newName);
     mpCurrentActionItem->setText(0, newName);
-    QString newStateXML = exportActionToXML(pT);
+    QString newStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
 
     pushActionPropertyCommand(mpUndoStack, mpHost, actionID, newName, qsl("name"), oldStateXML, newStateXML);
 }
@@ -16032,9 +16297,9 @@ void dlgTriggerEditor::slot_saveProperty_ActionCommandDown()
         return;
     }
 
-    QString oldStateXML = exportActionToXML(pT);
+    QString oldStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
     pT->setCommandButtonDown(newCommand);
-    QString newStateXML = exportActionToXML(pT);
+    QString newStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
 
     pushActionPropertyCommand(mpUndoStack, mpHost, actionID, pT->getName(), qsl("commandDown"), oldStateXML, newStateXML);
 }
@@ -16057,9 +16322,9 @@ void dlgTriggerEditor::slot_saveProperty_ActionCommandUp()
         return;
     }
 
-    QString oldStateXML = exportActionToXML(pT);
+    QString oldStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
     pT->setCommandButtonUp(newCommand);
-    QString newStateXML = exportActionToXML(pT);
+    QString newStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
 
     pushActionPropertyCommand(mpUndoStack, mpHost, actionID, pT->getName(), qsl("commandUp"), oldStateXML, newStateXML);
 }
@@ -16082,9 +16347,9 @@ void dlgTriggerEditor::slot_saveProperty_ActionIsPushDown()
         return;
     }
 
-    QString oldStateXML = exportActionToXML(pT);
+    QString oldStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
     pT->setIsPushDownButton(newValue);
-    QString newStateXML = exportActionToXML(pT);
+    QString newStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
 
     pushActionPropertyCommand(mpUndoStack, mpHost, actionID, pT->getName(), qsl("isPushDown"), oldStateXML, newStateXML);
 }
@@ -16107,9 +16372,9 @@ void dlgTriggerEditor::slot_saveProperty_ActionBarColumns()
         return;
     }
 
-    QString oldStateXML = exportActionToXML(pT);
+    QString oldStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
     pT->setButtonColumns(newValue);
-    QString newStateXML = exportActionToXML(pT);
+    QString newStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
 
     pushActionPropertyCommand(mpUndoStack, mpHost, actionID, pT->getName(), qsl("buttonColumn"), oldStateXML, newStateXML);
 }
@@ -16132,9 +16397,9 @@ void dlgTriggerEditor::slot_saveProperty_ActionBarFillerOffset()
         return;
     }
 
-    QString oldStateXML = exportActionToXML(pT);
+    QString oldStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
     pT->setButtonFillerOffset(newValue);
-    QString newStateXML = exportActionToXML(pT);
+    QString newStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
 
     pushActionPropertyCommand(mpUndoStack, mpHost, actionID, pT->getName(), qsl("buttonFillerOffset"), oldStateXML, newStateXML);
 }
@@ -16158,9 +16423,9 @@ void dlgTriggerEditor::slot_saveProperty_ActionBarOrientation()
         return;
     }
 
-    QString oldStateXML = exportActionToXML(pT);
+    QString oldStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
     pT->mOrientation = newValue;
-    QString newStateXML = exportActionToXML(pT);
+    QString newStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
 
     pushActionPropertyCommand(mpUndoStack, mpHost, actionID, pT->getName(), qsl("orientation"), oldStateXML, newStateXML);
 }
@@ -16184,9 +16449,9 @@ void dlgTriggerEditor::slot_saveProperty_ActionBarLocation()
         return;
     }
 
-    QString oldStateXML = exportActionToXML(pT);
+    QString oldStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
     pT->mLocation = newValue;
-    QString newStateXML = exportActionToXML(pT);
+    QString newStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
 
     pushActionPropertyCommand(mpUndoStack, mpHost, actionID, pT->getName(), qsl("barLocation"), oldStateXML, newStateXML);
 }
@@ -16209,9 +16474,9 @@ void dlgTriggerEditor::slot_saveProperty_ActionButtonRotation()
         return;
     }
 
-    QString oldStateXML = exportActionToXML(pT);
+    QString oldStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
     pT->setButtonRotation(newValue);
-    QString newStateXML = exportActionToXML(pT);
+    QString newStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
 
     pushActionPropertyCommand(mpUndoStack, mpHost, actionID, pT->getName(), qsl("buttonRotation"), oldStateXML, newStateXML);
 }
@@ -16234,9 +16499,575 @@ void dlgTriggerEditor::slot_saveProperty_ActionCSS()
         return;
     }
 
-    QString oldStateXML = exportActionToXML(pT);
+    QString oldStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
     pT->css = newCSS;
-    QString newStateXML = exportActionToXML(pT);
+    QString newStateXML = exportActionToXML(pT, SnapshotScope::ItemOnly);
 
     pushActionPropertyCommand(mpUndoStack, mpHost, actionID, pT->getName(), qsl("css"), oldStateXML, newStateXML);
+}
+
+QTreeWidget* dlgTriggerEditor::treeForView(const EditorViewType view) const
+{
+    switch (view) {
+    case EditorViewType::cmTriggerView:
+        return treeWidget_triggers;
+    case EditorViewType::cmAliasView:
+        return treeWidget_aliases;
+    case EditorViewType::cmScriptView:
+        return treeWidget_scripts;
+    case EditorViewType::cmTimerView:
+        return treeWidget_timers;
+    case EditorViewType::cmKeysView:
+        return treeWidget_keys;
+    case EditorViewType::cmActionView:
+        return treeWidget_actions;
+    case EditorViewType::cmVarsView:
+        return treeWidget_variables;
+    case EditorViewType::cmUnknownView:
+        break;
+    }
+    return nullptr;
+}
+
+QByteArray* dlgTriggerEditor::splitterStateForView(const EditorViewType view)
+{
+    switch (view) {
+    case EditorViewType::cmTriggerView:
+        return &mTriggerEditorSplitterState;
+    case EditorViewType::cmAliasView:
+        return &mAliasEditorSplitterState;
+    case EditorViewType::cmScriptView:
+        return &mScriptEditorSplitterState;
+    case EditorViewType::cmTimerView:
+        return &mTimerEditorSplitterState;
+    case EditorViewType::cmKeysView:
+        return &mKeyEditorSplitterState;
+    case EditorViewType::cmActionView:
+        return &mActionEditorSplitterState;
+    case EditorViewType::cmVarsView:
+        return &mVarEditorSplitterState;
+    case EditorViewType::cmUnknownView:
+        break;
+    }
+    return nullptr;
+}
+
+void dlgTriggerEditor::selectItemInView(const EditorViewType view, QTreeWidgetItem* pItem)
+{
+    switch (view) {
+    case EditorViewType::cmTriggerView:
+        slot_triggerSelected(pItem);
+        break;
+    case EditorViewType::cmAliasView:
+        slot_aliasSelected(pItem);
+        break;
+    case EditorViewType::cmScriptView:
+        slot_scriptsSelected(pItem);
+        break;
+    case EditorViewType::cmTimerView:
+        slot_timerSelected(pItem);
+        break;
+    case EditorViewType::cmKeysView:
+        slot_keySelected(pItem);
+        break;
+    case EditorViewType::cmActionView:
+        slot_actionSelected(pItem);
+        break;
+    case EditorViewType::cmVarsView:
+    case EditorViewType::cmUnknownView:
+        break;
+    }
+}
+
+bool dlgTriggerEditor::folderItem(const EditorViewType view, const int id)
+{
+    switch (view) {
+    case EditorViewType::cmTriggerView: {
+        auto* pTrigger = mpHost->getTriggerUnit()->getTrigger(id);
+        return pTrigger && pTrigger->isFolder();
+    }
+    case EditorViewType::cmAliasView: {
+        auto* pAlias = mpHost->getAliasUnit()->getAlias(id);
+        return pAlias && pAlias->isFolder();
+    }
+    case EditorViewType::cmScriptView: {
+        auto* pScript = mpHost->getScriptUnit()->getScript(id);
+        return pScript && pScript->isFolder();
+    }
+    case EditorViewType::cmTimerView: {
+        auto* pTimer = mpHost->getTimerUnit()->getTimer(id);
+        return pTimer && pTimer->isFolder();
+    }
+    case EditorViewType::cmKeysView: {
+        auto* pKey = mpHost->getKeyUnit()->getKey(id);
+        return pKey && pKey->isFolder();
+    }
+    case EditorViewType::cmActionView: {
+        auto* pAction = mpHost->getActionUnit()->getAction(id);
+        return pAction && pAction->isFolder();
+    }
+    case EditorViewType::cmVarsView:
+    case EditorViewType::cmUnknownView:
+        break;
+    }
+    return false;
+}
+
+QTreeWidgetItem* dlgTriggerEditor::findItemById(QTreeWidget* pTree, const int id)
+{
+    QTreeWidgetItem* pRoot = pTree ? pTree->topLevelItem(0) : nullptr;
+    QTreeWidgetItem* pItem = findItemByID(pRoot, id);
+    return pItem == pRoot ? nullptr : pItem;
+}
+
+QString dlgTriggerEditor::folderTreeItemKey(const EditorViewType view, const int id)
+{
+    return qsl("%1:%2").arg(static_cast<int>(view)).arg(id);
+}
+
+QString dlgTriggerEditor::folderTreeTypeName(const EditorViewType view, const bool plural)
+{
+    switch (view) {
+    case EditorViewType::cmTriggerView:
+        if (plural) {
+            //: Item types listed beside a folder in the editor's Folders view, such as "Triggers, Aliases"
+            return tr("Triggers");
+        }
+        //: Item type shown beside an entry in the editor's Folders view
+        return tr("Trigger");
+    case EditorViewType::cmAliasView:
+        if (plural) {
+            //: Item types listed beside a folder in the editor's Folders view, such as "Triggers, Aliases"
+            return tr("Aliases");
+        }
+        //: Item type shown beside an entry in the editor's Folders view
+        return tr("Alias");
+    case EditorViewType::cmScriptView:
+        if (plural) {
+            //: Item types listed beside a folder in the editor's Folders view, such as "Triggers, Aliases"
+            return tr("Scripts");
+        }
+        //: Item type shown beside an entry in the editor's Folders view
+        return tr("Script");
+    case EditorViewType::cmTimerView:
+        if (plural) {
+            //: Item types listed beside a folder in the editor's Folders view, such as "Triggers, Aliases"
+            return tr("Timers");
+        }
+        //: Item type shown beside an entry in the editor's Folders view
+        return tr("Timer");
+    case EditorViewType::cmKeysView:
+        if (plural) {
+            //: Item types listed beside a folder in the editor's Folders view, such as "Triggers, Aliases"
+            return tr("Keys");
+        }
+        //: Item type shown beside an entry in the editor's Folders view
+        return tr("Key");
+    case EditorViewType::cmActionView:
+        if (plural) {
+            //: Item types listed beside a folder in the editor's Folders view, such as "Triggers, Aliases"
+            return tr("Buttons");
+        }
+        //: Item type shown beside an entry in the editor's Folders view
+        return tr("Button");
+    case EditorViewType::cmVarsView:
+    case EditorViewType::cmUnknownView:
+        break;
+    }
+    return {};
+}
+
+void dlgTriggerEditor::addFolderTreeNode(QTreeWidgetItem* pSource, const EditorViewType view, QTreeWidgetItem* pParent, QTreeWidgetItem* pLooseItems, QHash<QString, int>& folderCounts)
+{
+    const int id = pSource->data(0, IdRole).toInt();
+    const QString itemKey = folderTreeItemKey(view, id);
+    const QColor typeColor = palette().color(QPalette::PlaceholderText);
+    QTreeWidgetItem* pNode = nullptr;
+    if (folderItem(view, id)) {
+        // The k-th same-named folder of one type merges with the k-th of each other type, never with its own siblings
+        const QString baseKey = (pParent ? pParent->data(0, FolderKeyRole).toString() : QString()) + QChar(0x1F) + pSource->text(0);
+        const QString countKey = baseKey + QChar(0x1E) + QString::number(static_cast<int>(view));
+        const int occurrence = folderCounts.value(countKey);
+        folderCounts.insert(countKey, occurrence + 1);
+        const QString key = baseKey + QChar(0x1E) + QString::number(occurrence);
+        pNode = mFolderTreeNodes.value(key);
+        if (!pNode) {
+            pNode = new QTreeWidgetItem();
+            pNode->setText(0, pSource->text(0));
+            pNode->setIcon(0, pSource->icon(0));
+            pNode->setForeground(1, typeColor);
+            pNode->setData(0, FolderKeyRole, key);
+            mFolderTreeNodes.insert(key, pNode);
+            if (pParent) {
+                pParent->addChild(pNode);
+            } else {
+                mpFolderTree->addTopLevelItem(pNode);
+            }
+        }
+        QStringList parts = pNode->data(0, FolderPartsRole).toStringList();
+        parts.append(itemKey);
+        pNode->setData(0, FolderPartsRole, parts);
+        const QString typeName = folderTreeTypeName(view, true);
+        QStringList typeNames = pNode->text(1).isEmpty() ? QStringList() : pNode->text(1).split(qsl(", "));
+        if (!typeNames.contains(typeName)) {
+            typeNames.append(typeName);
+            pNode->setText(1, typeNames.join(qsl(", ")));
+            //: Screen reader description of a folder in the editor's Folders view, %1 is a list of item types such as "Triggers, Aliases"
+            pNode->setData(0, Qt::AccessibleDescriptionRole, tr("Folder of %1").arg(pNode->text(1)));
+        }
+    } else {
+        pNode = new QTreeWidgetItem();
+        pNode->setText(0, pSource->text(0));
+        pNode->setIcon(0, pSource->icon(0));
+        pNode->setText(1, folderTreeTypeName(view, false));
+        pNode->setForeground(1, typeColor);
+        pNode->setData(0, FolderKeyRole, itemKey);
+        pNode->setData(0, FolderPartsRole, QStringList{itemKey});
+        pNode->setData(0, Qt::AccessibleDescriptionRole, pSource->data(0, Qt::AccessibleDescriptionRole));
+        (pParent ? pParent : pLooseItems)->addChild(pNode);
+    }
+    mFolderTreeNodes.insert(itemKey, pNode);
+
+    for (int i = 0, total = pSource->childCount(); i < total; ++i) {
+        addFolderTreeNode(pSource->child(i), view, pNode, pLooseItems, folderCounts);
+    }
+}
+
+void dlgTriggerEditor::populateFolderTree()
+{
+    QSet<QString> expandedKeys;
+    for (QTreeWidgetItemIterator it(mpFolderTree); *it; ++it) {
+        if ((*it)->isExpanded()) {
+            expandedKeys.insert((*it)->data(0, FolderKeyRole).toString());
+        }
+    }
+    QString previousKey;
+    if (const QTreeWidgetItem* pCurrent = mpFolderTree->currentItem()) {
+        previousKey = pCurrent->data(0, FolderKeyRole).toString();
+        // Under one folder's form a merged folder stands for that folder, which a rebuild must open again
+        if (mFolderGroupKey.isEmpty()) {
+            const QString viewPrefix = qsl("%1:").arg(static_cast<int>(mCurrentView));
+            for (const QString& part : pCurrent->data(0, FolderPartsRole).toStringList()) {
+                if (part.startsWith(viewPrefix)) {
+                    previousKey = part;
+                }
+            }
+        }
+    }
+    const int scrollPosition = mpFolderTree->verticalScrollBar()->value();
+
+    {
+        const QSignalBlocker blocker(mpFolderTree);
+        mpFolderTree->setUpdatesEnabled(false);
+        mpFolderTree->clear();
+        mFolderTreeNodes.clear();
+
+        // Kept out of the tree until the end so it always comes last
+        auto* pLooseItems = new QTreeWidgetItem();
+        //: Group at the bottom of the editor's Folders view holding the items that are not inside any folder
+        pLooseItems->setText(0, tr("Not in a folder"));
+        pLooseItems->setIcon(0, QIcon(qsl(":/icons/folder-grey.png")));
+        pLooseItems->setData(0, FolderKeyRole, qsl("loose"));
+
+        QHash<QString, int> folderCounts;
+        for (const auto view :
+             {EditorViewType::cmTriggerView, EditorViewType::cmAliasView, EditorViewType::cmScriptView, EditorViewType::cmTimerView, EditorViewType::cmKeysView, EditorViewType::cmActionView}) {
+            QTreeWidgetItem* pRoot = treeForView(view)->topLevelItem(0);
+            if (!pRoot) {
+                continue;
+            }
+            for (int i = 0, total = pRoot->childCount(); i < total; ++i) {
+                addFolderTreeNode(pRoot->child(i), view, nullptr, pLooseItems, folderCounts);
+            }
+        }
+        if (pLooseItems->childCount()) {
+            mpFolderTree->addTopLevelItem(pLooseItems);
+            mFolderTreeNodes.insert(qsl("loose"), pLooseItems);
+        } else {
+            delete pLooseItems;
+        }
+
+        for (QTreeWidgetItemIterator it(mpFolderTree); *it; ++it) {
+            if (expandedKeys.contains((*it)->data(0, FolderKeyRole).toString())) {
+                (*it)->setExpanded(true);
+            }
+        }
+        mFolderTreeStale = false;
+        mpFolderTree->setUpdatesEnabled(true);
+    }
+    mpFolderTree->verticalScrollBar()->setValue(scrollPosition);
+    syncFolderTreeSelection(previousKey);
+}
+
+void dlgTriggerEditor::refreshFolderTreeRows(const EditorViewType view, const QModelIndex& topLeft, const QModelIndex& bottomRight)
+{
+    if (!mFolderViewActive) {
+        mFolderTreeStale = true;
+        return;
+    }
+    if (mFolderTreeStale || !topLeft.parent().isValid()) {
+        return;
+    }
+    for (int row = topLeft.row(); row <= bottomRight.row(); ++row) {
+        const QModelIndex index = topLeft.siblingAtRow(row);
+        const QString itemKey = folderTreeItemKey(view, index.data(IdRole).toInt());
+        QTreeWidgetItem* pNode = mFolderTreeNodes.value(itemKey);
+        // A renamed folder may now merge with, or split from, another
+        if (!pNode || pNode->text(0) != index.data(Qt::DisplayRole).toString()) {
+            scheduleFolderTreeRefresh();
+            return;
+        }
+        if (pNode->data(0, FolderPartsRole).toStringList().constFirst() == itemKey) {
+            pNode->setIcon(0, index.data(Qt::DecorationRole).value<QIcon>());
+        }
+        if (pNode->data(0, FolderKeyRole).toString() == itemKey) {
+            pNode->setData(0, Qt::AccessibleDescriptionRole, index.data(Qt::AccessibleDescriptionRole));
+        }
+    }
+}
+
+void dlgTriggerEditor::scheduleFolderTreeRefresh()
+{
+    mFolderTreeStale = true;
+    if (mFolderViewActive) {
+        mpFolderTreeRefreshTimer->start();
+    }
+}
+
+void dlgTriggerEditor::focusItemTree(QTreeWidget* pTypeTree)
+{
+    if (!mFolderViewActive) {
+        pTypeTree->setFocus();
+        return;
+    }
+    syncFolderTreeSelection({});
+    mpFolderTree->setFocus();
+}
+
+QTreeWidget* dlgTriggerEditor::sectionTree(QTreeWidget* pTypeTree) const
+{
+    return mFolderViewActive ? mpFolderTree : pTypeTree;
+}
+
+void dlgTriggerEditor::showView(const EditorViewType view)
+{
+    switch (view) {
+    case EditorViewType::cmAliasView:
+        slot_showAliases();
+        return;
+    case EditorViewType::cmScriptView:
+        slot_showScripts();
+        return;
+    case EditorViewType::cmTimerView:
+        slot_showTimers();
+        return;
+    case EditorViewType::cmKeysView:
+        slot_showKeys();
+        return;
+    case EditorViewType::cmActionView:
+        slot_showActions();
+        return;
+    case EditorViewType::cmTriggerView:
+    case EditorViewType::cmVarsView:
+    case EditorViewType::cmUnknownView:
+        slot_showTriggers();
+        return;
+    }
+}
+
+void dlgTriggerEditor::selectFolderTreeNode(QTreeWidgetItem* pNode)
+{
+    if (!pNode || pNode == mpFolderTree->currentItem()) {
+        return;
+    }
+    {
+        const QSignalBlocker blocker(mpFolderTree);
+        mpFolderTree->setCurrentItem(pNode);
+    }
+    mpFolderTree->scrollToItem(pNode);
+}
+
+void dlgTriggerEditor::syncFolderTreeSelection(const QString& fallbackKey)
+{
+    collapseHiddenSelections();
+    if (!mFolderGroupKey.isEmpty()) {
+        QTreeWidgetItem* pGroupNode = mFolderTreeNodes.value(mFolderGroupKey);
+        if (pGroupNode && pGroupNode->data(0, FolderPartsRole).toStringList().size() == 1) {
+            selectFolderTreeNode(pGroupNode);
+            slot_folderTreeItemChanged(pGroupNode);
+            return;
+        }
+        if (pGroupNode) {
+            selectFolderTreeNode(pGroupNode);
+            showFolderGroup(pGroupNode);
+            return;
+        }
+        showView(mCurrentView);
+        return;
+    }
+
+    QTreeWidget* pTree = treeForView(mCurrentView);
+    QTreeWidgetItem* pCurrent = pTree ? pTree->currentItem() : nullptr;
+    if (pCurrent && pCurrent->parent()) {
+        if (QTreeWidgetItem* pNode = mFolderTreeNodes.value(folderTreeItemKey(mCurrentView, pCurrent->data(0, IdRole).toInt()))) {
+            selectFolderTreeNode(pNode);
+            return;
+        }
+    }
+
+    if (QTreeWidgetItem* pFallback = mFolderTreeNodes.value(fallbackKey)) {
+        if (pFallback->data(0, FolderPartsRole).toStringList().size() > 1 && pFallback->data(0, FolderKeyRole).toString() != fallbackKey) {
+            selectFolderTreeNode(pFallback);
+            const QStringList viewAndId = fallbackKey.split(QLatin1Char(':'));
+            openItemFromFolderTree(static_cast<EditorViewType>(viewAndId.constFirst().toInt()), viewAndId.constLast().toInt());
+            return;
+        }
+        mpFolderTree->setCurrentItem(pFallback);
+        return;
+    }
+    const QSignalBlocker blocker(mpFolderTree);
+    mpFolderTree->setCurrentItem(nullptr);
+}
+
+void dlgTriggerEditor::slot_folderTreeItemChanged(QTreeWidgetItem* pItem)
+{
+    if (!pItem) {
+        return;
+    }
+    const QStringList parts = pItem->data(0, FolderPartsRole).toStringList();
+    if (parts.size() != 1) {
+        showFolderGroup(pItem);
+        return;
+    }
+    const QStringList viewAndId = parts.constFirst().split(QLatin1Char(':'));
+    openItemFromFolderTree(static_cast<EditorViewType>(viewAndId.constFirst().toInt()), viewAndId.constLast().toInt());
+}
+
+void dlgTriggerEditor::openItemFromFolderTree(const EditorViewType view, const int id)
+{
+    if (mNeedUpdateData) {
+        saveOpenChanges();
+        rebuildStaleTrees();
+    }
+    QTreeWidget* pTree = treeForView(view);
+    QTreeWidgetItem* pItem = findItemById(pTree, id);
+    if (!pItem) {
+        scheduleFolderTreeRefresh();
+        return;
+    }
+
+    const bool viewChanged = mCurrentView != view;
+    changeView(view);
+    {
+        const QSignalBlocker blocker(pTree);
+        // Without ClearAndSelect a held Ctrl or Shift would add to the hidden tree's selection, which Delete and Copy act on
+        pTree->setCurrentItem(pItem, 0, QItemSelectionModel::ClearAndSelect);
+    }
+    pTree->scrollToItem(pItem);
+    selectItemInView(view, pItem);
+    if (QByteArray* pSplitterState = splitterStateForView(view); viewChanged && pSplitterState && !pSplitterState->isEmpty()) {
+        splitter_right->restoreState(*pSplitterState);
+    }
+}
+
+void dlgTriggerEditor::showFolderGroup(QTreeWidgetItem* pNode)
+{
+    // Moving between merged folders leaves nothing new to save
+    if (mFolderGroupKey.isEmpty()) {
+        saveOpenChanges();
+        clearEditorNotification();
+    }
+    mFolderGroupKey = pNode->data(0, FolderKeyRole).toString();
+
+    mpTriggersMainArea->hide();
+    mpAliasMainArea->hide();
+    mpScriptsMainArea->hide();
+    mpTimersMainArea->hide();
+    mpKeysMainArea->hide();
+    mpActionsMainArea->hide();
+    mpVarsMainArea->hide();
+    mpSourceEditorArea->hide();
+
+    // The item the type tree still has selected is hidden, so nothing may act on it
+    for (QAction* pAction : mpFolderTree->actions()) {
+        if (pAction != mpAction_restoreEditorActionsToolbar && pAction != mpAction_restoreEditorItemsToolbar) {
+            pAction->setEnabled(false);
+        }
+    }
+    mSaveItem->setEnabled(false);
+    mpAction_toggleActive->setEnabled(false);
+    mpExportAction->setEnabled(false);
+    mpCreateModuleAction->setEnabled(false);
+    slot_updateUndoRedoButtonStates();
+}
+
+void dlgTriggerEditor::hideFolderGroup()
+{
+    if (mFolderGroupKey.isEmpty()) {
+        return;
+    }
+    mFolderGroupKey.clear();
+    mpSourceEditorArea->show();
+    for (QAction* pAction : mpFolderTree->actions()) {
+        pAction->setEnabled(true);
+    }
+    mSaveItem->setEnabled(true);
+    const bool itemView = mCurrentView != EditorViewType::cmVarsView && mCurrentView != EditorViewType::cmUnknownView;
+    mpAction_toggleActive->setEnabled(itemView);
+    mpExportAction->setEnabled(itemView);
+    mpCreateModuleAction->setEnabled(true);
+    slot_updateUndoRedoButtonStates();
+}
+
+void dlgTriggerEditor::leaveFolderView()
+{
+    if (!mFolderViewActive) {
+        return;
+    }
+    mFolderViewActive = false;
+    mpFolderTreeRefreshTimer->stop();
+    mpFolderTree->hide();
+    // On return the type trees decide what to highlight, not this stale row
+    const QSignalBlocker blocker(mpFolderTree);
+    mpFolderTree->setCurrentItem(nullptr);
+}
+
+void dlgTriggerEditor::slot_showFolders()
+{
+    if (!mpHost->folderViewInEditor()) {
+        return;
+    }
+    if (mNeedUpdateData) {
+        saveOpenChanges();
+        rebuildStaleTrees();
+    }
+    mFolderViewActive = true;
+    if (mFolderTreeStale) {
+        populateFolderTree();
+    }
+    collapseHiddenSelections();
+    showView(mCurrentView);
+}
+
+void dlgTriggerEditor::collapseHiddenSelections()
+{
+    // The Folders view shows one item at a time, so a selection made in a type tree, or by an add with Ctrl held, must not linger for Delete or Copy
+    for (const auto view :
+         {EditorViewType::cmTriggerView, EditorViewType::cmAliasView, EditorViewType::cmScriptView, EditorViewType::cmTimerView, EditorViewType::cmKeysView, EditorViewType::cmActionView}) {
+        QTreeWidget* pTree = treeForView(view);
+        if (pTree->selectedItems().size() > 1) {
+            const QSignalBlocker blocker(pTree);
+            pTree->setCurrentItem(pTree->currentItem(), 0, QItemSelectionModel::ClearAndSelect);
+        }
+    }
+}
+
+void dlgTriggerEditor::setFolderViewAvailable(const bool available)
+{
+    mpViewFoldersAction->setVisible(available);
+    if (available || !mFolderViewActive) {
+        return;
+    }
+    leaveFolderView();
+    showView(mCurrentView);
 }

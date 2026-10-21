@@ -67,6 +67,8 @@ public:
     ~TTextEdit();
     void paintEvent(QPaintEvent*) override;
     void contextMenuEvent(QContextMenuEvent* event) override;
+    // The console's own menu, without anything for a link at that position
+    void showContextMenu(const QPoint& globalPosition);
     void drawForeground(QPainter&, const QRect&);
     void showNewLines();
     void forceUpdate();
@@ -82,6 +84,7 @@ public:
     void scrollDown(int lines);
     void wheelEvent(QWheelEvent* e) override;
     void resizeEvent(QResizeEvent* event) override;
+    void changeEvent(QEvent* event) override;
     void mousePressEvent(QMouseEvent*) override;
     void mouseReleaseEvent(QMouseEvent*) override;
     void mouseMoveEvent(QMouseEvent*) override;
@@ -107,6 +110,8 @@ public:
     void searchSelectionOnline();
     int getColumnCount() const;
     int getRowCount() const;
+    // Upper pane only: its grid is what Host::windowGridSize() answers for the console.
+    void reportGridSize();
     void toggleTimeStamps(const bool);
 
 #if defined(DEBUG_CODEPOINT_PROBLEMS)
@@ -115,14 +120,17 @@ public:
 
     void initializeCaret();
     void setCaretPosition(int line, int column);
+    // Onto the first or the last link, where Tab leaving the script buttons lands; nowhere new with no links
+    void moveCaretToLink(bool first);
     void updateCaret();
     void showLinkContextMenu();
     void announceLinkFocus(int linkIndex);
     void applyHyperlinkSelectionGroupState(int linkIndex, QString& uri, const Mudlet::HyperlinkStyling::SelectionSettings& selection, const char* callerContext);
 
     QColor mBgColor;
-    // position of cursor, in characters, across the entire buffer
-    int mCursorY = 0;
+    // position of cursor, in characters, across the entire buffer. The upper
+    // pane's lives in its console's model, where getScroll() reads it.
+    int& mCursorY;
     int mCursorX = 0;
 
     // Position of "caret", the cursor used for accessibility purposes.
@@ -134,9 +142,11 @@ public:
     int mOldCaretColumn = 0;
 
     friend class CopyAsImageTest;
+    friend class SplitCharacterFormatTest;
     friend class FramePacingTest;
     friend class FrontendRefreshSeamTest;
     friend class MainConsoleSelectionTest;
+    friend class TextEditAccessibleInterfaceTest;
     friend class OpaqueConsolePaintTest;
     friend class ScrollLostOnPartialRepaintTest;
     friend class TTextEditBlinkTest;
@@ -224,6 +234,9 @@ private:
     inline void replaceControlCharacterWith_Picture(const uint, QStringView, const int, QStringView&, int&) const;
     inline void replaceControlCharacterWith_OEMFont(const uint, QStringView, const int, QStringView&, int&) const;
     int offsetForPosition(int line, int column) const;
+    int selectionLinesTrimmed() const;
+    int accessibleSelectionLength() const;
+    std::pair<int, int> accessibleSelection() const;
     bool hasBufferLine(int lineNumber) const;
     static int overflowRowsUsed(const QImage& image, const int fromRow, const QColor& background);
     TChar timeStampCharStyle() const;
@@ -243,6 +256,10 @@ private:
         // not be modified. A null pointer marks a background-only run, such as
         // the caret block on an empty line.
         const TChar* style = nullptr;
+        // Set on the two runs a double-width glyph with a split rendition
+        // (TChar::hasSplitFormat()) is laid out as: each paints only its cell.
+        QRect halfRect;
+        bool rightHalf = false;
         bool fillsBackground = false;
     };
     using LineLayout = std::vector<GraphemeRun>;
@@ -257,13 +274,17 @@ private:
     int paintForegrounds(QPainter&, TGlyphCache&, const LineLayout&, const QRect& clip = QRect()) const;
     void drawCustomDecorations(QPainter&, const QColor&, const QRect&, const TChar&) const;
     int layoutGrapheme(LineLayout& layout, const QPoint& cursor, QStringView grapheme, const int column, const int line, const TChar& charStyle) const;
-    int paintGraphemeForeground(QPainter&, TGlyphCache&, const GraphemeRun&) const;
+    void resolveRunColors(GraphemeRun&, const TChar&, bool caretIsHere) const;
+    int paintGraphemeForeground(QPainter&, TGlyphCache&, const GraphemeRun&, const TChar&) const;
 
     // Reused between paints to keep their capacity rather than reallocating a
     // line's worth of graphemes on every repaint.
     mutable LineLayout mPreviousLineLayout;
     mutable LineLayout mCurrentLineLayout;
     mutable LineLayout mOverflowLineLayout;
+    // Owns the timestamp text the layouts' graphemes view; formatTimeStamp()
+    // keeps only its latest result, and the line text itself lives in TBuffer.
+    mutable std::vector<QString> mLaidOutTimeStamps;
     std::unique_ptr<TGlyphCache> mpGlyphCache;
     int mFontHeight;
     int mFontWidth;
@@ -277,6 +298,7 @@ private:
     // or reset on creation and is used to adjust the behaviour depending on
     // which one this instance is:
     const bool mIsLowerPane;
+    int mLowerPaneCursorY = 0;
     // last line offset rendered
     int mLastRenderedOffset = 0;
     bool mMouseTracking = false;
@@ -292,6 +314,10 @@ private:
     QPoint mPA;
     // bottom-right point of the selection
     QPoint mPB;
+    // Equal to mPB while the selection includes the newline after mPB's line: an
+    // accessibility range ending there leaves mPB where a whole-line selection without
+    // the newline does. Meaningful only while it equals mPB; unHighlight() resets it to (-1, -1).
+    QPoint mPBTakingNewline{-1, -1};
     TBuffer* mpBuffer;
     // Needs to be a QPointer as is used in a couple of lambda functions:
     QPointer<TConsole> mpConsole;

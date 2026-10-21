@@ -1,5 +1,8 @@
+#ifndef MUDLET_TACCESSIBLELABEL_H
+#define MUDLET_TACCESSIBLELABEL_H
+
 /***************************************************************************
- *   Copyright (C) 2020 by Piotr Wilczynski - delwing@gmail.com            *
+ *   Copyright (C) 2026 by Michael Conley - sousesider@gmail.com           *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
  *   it under the terms of the GNU General Public License as published by  *
@@ -17,20 +20,27 @@
  *   59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.             *
  ***************************************************************************/
 
-#ifndef MUDLET_ALTFOCUSMENUBARDISABLE_H
-#define MUDLET_ALTFOCUSMENUBARDISABLE_H
+#include <QAccessibleWidget>
 
-#include <QProxyStyle>
-#include <QStyleFactory>
+class TLabel;
 
-class AltFocusMenuBarDisable : public QProxyStyle
+// A script's label as assistive technology sees it: a button as TLabelModel decides, else a graphic, an
+// animation or static text by what it shows, and named as TLabelModel decides.
+class TAccessibleLabel : public QAccessibleWidget
 {
-    Q_OBJECT
-
 public:
-    AltFocusMenuBarDisable();
-    explicit AltFocusMenuBarDisable(const QString &style);
-    int styleHint(StyleHint styleHint, const QStyleOption *opt, const QWidget *widget, QStyleHintReturn *returnData) const;
+    explicit TAccessibleLabel(QWidget* widget);
+
+    QAccessible::Role role() const override;
+    QString text(QAccessible::Text t) const override;
+    QStringList actionNames() const override;
+    void doAction(const QString& actionName) override;
+
+    static QAccessibleInterface* labelFactory(const QString& classname, QObject* object);
+
+private:
+    TLabel* label() const;
+    bool actsAsButton() const;
 };
 
-#endif
+#endif // MUDLET_TACCESSIBLELABEL_H

@@ -24,11 +24,14 @@
 
 
 #include "LuaInterface.h"
+#include "MapStyle.h"
 #include "CredentialManager.h"
+#include "Host.h"
 #include "SecureStringUtils.h"
 #include "TAction.h"
 #include "TAlias.h"
 #include "TKey.h"
+#include "TLuaInterpreter.h"
 #include "TMap.h"
 #include "TRoomDB.h"
 #include "TRoom.h"
@@ -37,7 +40,7 @@
 #include "TTrigger.h"
 #include "TVar.h"
 #include "VarUnit.h"
-#include "mudlet.h"
+#include "TAppFrontend.h"
 #include "enums.h"
 
 #include <QBuffer>
@@ -48,24 +51,23 @@
 
 #include <memory>
 
-// Undoes the rich-text markup TLuaInterpreter::compile() adds (kept in step by hand), for the
-// console line and installPackage()'s reason. Unescaped in reverse order, ampersand last, so a
-// script whose own text says "&amp;lt;b&amp;gt;" comes back as itself rather than as markup.
-static QString compileErrorAsPlainText(const QString& error)
-{
-    QString plainText = error;
-    plainText.remove(qsl("<b>"));
-    plainText.remove(qsl("</b>"));
-    plainText.replace(qsl("&quot;"), qsl("\""));
-    plainText.replace(qsl("&lt;"), qsl("<"));
-    plainText.replace(qsl("&gt;"), qsl(">"));
-    plainText.replace(qsl("&amp;"), qsl("&"));
-    return plainText;
-}
-
 XMLimport::XMLimport(Host* pH)
 : mpHost(pH)
 {
+}
+
+// Called once the item is read, as its <script> and <regex> can come before its <name>, so its
+// children are recorded first: inserting at the sizes taken before them keeps document order
+void XMLimport::recordItemErrors(const QString& itemName, const QStringList& errors, const qsizetype errorsAt, const qsizetype namesAt)
+{
+    if (errors.isEmpty()) {
+        return;
+    }
+    qsizetype at = errorsAt;
+    for (const QString& error : errors) {
+        mItemsWithErrors.insert(at++, qsl("%1: %2").arg(itemName, error));
+    }
+    mItemsWithErrorNames.insert(namesAt, itemName);
 }
 
 std::pair<bool, QString> XMLimport::importPackage(QFile* pfile, QString packName, int moduleFlag, QString* pVersionString)
@@ -148,6 +150,7 @@ std::pair<bool, QString> XMLimport::importPackage(QFile* pfile, QString packName
         mpHost->getScriptUnit()->registerScript(mpScript);
     }
 
+    QString laterMudletRefusal;
     while (!atEnd()) {
         readNext();
 
@@ -179,7 +182,11 @@ std::pair<bool, QString> XMLimport::importPackage(QFile* pfile, QString packName
                                                "and this one cannot read it, you need a newer Mudlet!")
                                                     .arg(pfile->fileName(), versionString);
                     mpHost->postMessage(moanMsg);
-                    return {false, moanMsg};
+                    //: The reason handed back to whoever asked for the file to be read, after the alert above; %1 is the version the file reports
+                    laterMudletRefusal =
+                            tr("the file reports a version (%1), so it must have come from a later Mudlet version and this one cannot read it, you need a newer Mudlet").arg(versionString);
+                    // Out through the clean-up below, which takes away the empty item folders made above
+                    break;
                 }
 
                 readPackage();
@@ -240,6 +247,9 @@ std::pair<bool, QString> XMLimport::importPackage(QFile* pfile, QString packName
         }
     }
 
+    if (!laterMudletRefusal.isEmpty()) {
+        return {false, laterMudletRefusal};
+    }
     return {!hasError(), errorString()};
 }
 
@@ -309,6 +319,7 @@ void XMLimport::readVariable(TVar* pParent)
                 var->setValue(value, valueType);
                 vu->addSavedVar(var);
                 lI->setValue(var);
+                gotOtherContent = true;
                 continue;
             } else if (name() == qsl("VariableGroup") || name() == qsl("Variable")) { // NOLINT(readability-else-after-return)
                 readVariable(var);
@@ -336,6 +347,7 @@ void XMLimport::readHiddenVariables()
             if (name() == qsl("name")) {
                 const QString var = readElementText();
                 vu->addHidden(var);
+                gotOtherContent = true;
                 continue;
             }
         }
@@ -406,7 +418,9 @@ void XMLimport::readMap()
 
         mpHost->mpMap->mpRoomDB->setAreaRooms(areaId, areaRoomsSet);
         currentRoomCount += areaRoomsSet.count();
-        mpHost->mpMap->reportProgressToProgressDialog(currentRoomCount, roomTotal);
+        if (!itAreaWithRooms.hasNext() || mapProgressDue()) {
+            mpHost->mpMap->reportProgressToProgressDialog(currentRoomCount, roomTotal);
+        }
     }
 }
 
@@ -451,6 +465,17 @@ void XMLimport::readArea()
 
         mpHost->mpMap->mpRoomDB->addArea(id, name);
     }
+}
+
+// Each report repaints the map beneath its translucent progress overlay, which
+// costs more than parsing the rooms in between when the reports come too often
+bool XMLimport::mapProgressDue()
+{
+    if (mMapProgressTimer.isValid() && mMapProgressTimer.elapsed() < 30) {
+        return false;
+    }
+    mMapProgressTimer.start();
+    return true;
 }
 
 void XMLimport::readRooms(QMultiHash<int, int>& areaRoomsHash)
@@ -599,7 +624,7 @@ void XMLimport::readRoom(QMultiHash<int, int>& areamRoomMultiHash, unsigned int*
     }
 
     if (pT->id > 0) {
-        if (++(*roomCount) % 100 == 0) {
+        if (++(*roomCount) % 100 == 0 && mapProgressDue()) {
             mpHost->mpMap->reportStringToProgressDialog(tr("Parsing room data [count: %1]...").arg(*roomCount));
         }
         areamRoomMultiHash.insert(pT->area, pT->id);
@@ -688,6 +713,7 @@ void XMLimport::readHelpPackage()
             if (name() == qsl("helpURL")) {
                 const QString contents = readElementText();
                 mpHost->moduleHelp[mPackageName].insert("helpURL", contents);
+                gotOtherContent = gotOtherContent || !contents.isEmpty();
             }
         }
     }
@@ -733,6 +759,7 @@ void XMLimport::readHostPackage()
         }
         if (isStartElement()) {
             if (name() == qsl("Host")) {
+                gotOtherContent = true;
                 readHost(mpHost);
             } else {
                 readUnknownElement(qsl("HostPackage"));
@@ -766,6 +793,11 @@ void XMLimport::readHost(Host* pHost)
 
     setBoolAttributeWithDefault(qsl("announceIncomingText"), pHost->mAnnounceIncomingText, true);
     setBoolAttributeWithDefault(qsl("advertiseScreenReader"), pHost->mAdvertiseScreenReader, false);
+    // Through the setter: a package carrying a host section is read into a profile whose labels already exist.
+    // Only when it is there, as a package from before the setting would otherwise turn the player's off.
+    if (attributes().hasAttribute(qsl("accessibleLabels"))) {
+        pHost->setAccessibleLabels(attributes().value(qsl("accessibleLabels")) == YES);
+    }
     setBoolAttributeWithDefault(qsl("enableOSC8Hyperlinks"), pHost->mEnableOSC8Hyperlinks, true);
     setBoolAttributeWithDefault(qsl("enableClosedCaption"), pHost->mEnableClosedCaption, false);
     setBoolAttributeWithDefault(qsl("mEnableMTTS"), pHost->mEnableMTTS, true);
@@ -777,7 +809,9 @@ void XMLimport::readHost(Host* pHost)
     setBoolAttributeWithDefault(qsl("mEnableNEWENVIRON"), pHost->mEnableNEWENVIRON, getBoolValueFromLegacyAttributeOrDefault(qsl("forceNewEnvironNegotiationOff"), true, true));
 
     setBoolAttribute(qsl("autoClearCommandLineAfterSend"), pHost->mAutoClearCommandLineAfterSend);
-    setBoolAttributeWithDefault(qsl("disablePasswordMasking"), pHost->mDisablePasswordMasking, false);
+    bool disablePasswordMasking = false;
+    setBoolAttributeWithDefault(qsl("disablePasswordMasking"), disablePasswordMasking, false);
+    pHost->setDisablePasswordMasking(disablePasswordMasking);
 
     // Handle command echo mode with backward compatibility
     if (attributes().hasAttribute(qsl("commandEchoMode"))) {
@@ -823,6 +857,7 @@ void XMLimport::readHost(Host* pHost)
     setBoolAttribute(qsl("mAcceptServerMedia"), pHost->mAcceptServerMedia);
     setBoolAttribute(qsl("mMapperUseAntiAlias"), pHost->mMapperUseAntiAlias);
     setBoolAttribute(qsl("mMapperShowGrid"), pHost->mMapperShowGrid);
+    setBoolAttributeWithDefault(qsl("mMapperStitchAreas"), pHost->mMapperStitchAreas, true);
     setBoolAttribute(qsl("mEditorAutoComplete"), pHost->mEditorAutoComplete);
     setBoolAttribute(qsl("mVersionInTTYPE"), pHost->mVersionInTTYPE);
     setBoolAttribute(qsl("mPromptedForVersionInTTYPE"), pHost->mPromptedForVersionInTTYPE);
@@ -1059,12 +1094,19 @@ void XMLimport::readHost(Host* pHost)
     const bool compactInputLine = attributes().value(QLatin1String("CompactInputLine")) == YES;
     pHost->setCompactInputLine(compactInputLine);
 
-    if (mudlet::self()->mpCurrentActiveHost == pHost) {
-        mudlet::self()->dactionInputLine->setChecked(compactInputLine);
+    if (auto* frontend = TAppFrontend::instance()) {
+        frontend->setCompactInputLineChecked(pHost, compactInputLine);
     }
 
     if (attributes().hasAttribute(QLatin1String("CommandLineHistorySaveSize"))) {
-        pHost->setCommandLineHistorySaveSize(attributes().value(QLatin1String("CommandLineHistorySaveSize")).toInt());
+        bool sizeRead = false;
+        const int lines = attributes().value(QLatin1String("CommandLineHistorySaveSize")).toInt(&sizeRead);
+        if (!sizeRead) {
+            // toInt() gives 0 for a size it cannot read, which would turn saving the history off:
+            qWarning().nospace().noquote() << "XMLimport::readHost(...) WARNING - unreadable CommandLineHistorySaveSize \"" << attributes().value(QLatin1String("CommandLineHistorySaveSize"))
+                                           << "\", using 500 instead.";
+        }
+        pHost->setCommandLineHistorySaveSize(sizeRead ? lines : 500);
     } else {
         // This is the default value, though prior to the introduction of this
         // it would have effectively been zero:
@@ -1104,6 +1146,12 @@ void XMLimport::readHost(Host* pHost)
         // The default (and for profile files from before 4.18.0):
         pHost->setShowIdsInEditor(false);
     }
+
+    // A style this version does not have, perhaps saved by a newer one, falls back to the default
+    if (!attributes().hasAttribute(qsl("mapStyle")) || !pHost->setMapStyle(attributes().value(qsl("mapStyle")).toString())) {
+        pHost->setMapStyle(MapStyle::defaultId());
+    }
+    pHost->setFolderViewInEditor(attributes().value(qsl("FolderViewInEditor")) == YES);
 
     if (attributes().hasAttribute(qsl("Large2DMapAreaExitArrows"))) {
         pHost->setLargeAreaExitArrows(attributes().value(qsl("Large2DMapAreaExitArrows")) == YES);
@@ -1248,10 +1296,13 @@ void XMLimport::readHost(Host* pHost)
 
     pHost->setUserBorders(borders);
     pHost->loadPackageInfo();
+    // The map holds its own copy of the ANSI colours just read, for environments 257 to 272
+    pHost->mpMap->restore16ColorSet();
+    pHost->mpMap->updateArea(-1);
     // A package import comes through here too, into a profile that does have a
     // console - and that one needs the whole restyle, not just the model:
     pHost->applyMainConsoleColors();
-    if (!pHost->mpConsole) {
+    if (!pHost->hasConsoleView()) {
         TConsoleModel& model = pHost->mainConsoleModel();
         model.setWrapAt(pHost->mWrapAt);
         model.setIndentCount(pHost->mWrapIndentCount);
@@ -1404,6 +1455,9 @@ int XMLimport::readTrigger(TTrigger* pParent)
     pT->mSoundTrigger = attributes().value(qsl("isSoundTrigger")) == YES;
     pT->mColorTrigger = attributes().value(qsl("isColorTrigger")) == YES;
 
+    QStringList itemErrors;
+    const qsizetype errorsAt = mItemsWithErrors.size();
+    const qsizetype namesAt = mItemsWithErrorNames.size();
     // Is this a "TriggerGroup" or a "Trigger"
     const QString what = name().toString();
     while (!atEnd()) {
@@ -1419,8 +1473,7 @@ int XMLimport::readTrigger(TTrigger* pParent)
                 const QString tempScript = readScriptElement();
                 if (!pT->setScript(tempScript)) {
                     qDebug().nospace() << "XMLimport::readTrigger(...): ERROR: can not compile trigger's lua code for: " << pT->getName();
-                    mItemsWithErrors.append(qsl("%1: %2").arg(pT->getName(), compileErrorAsPlainText(pT->getError())));
-                    mItemsWithErrorNames.append(pT->getName());
+                    itemErrors.append(TLuaInterpreter::compileErrorAsPlainText(pT->getError()));
                 }
             } else if (name() == qsl("packageName")) {
                 pT->mPackageName = readElementText();
@@ -1475,11 +1528,14 @@ int XMLimport::readTrigger(TTrigger* pParent)
         }
     }
 
-    if (!pT->setRegexCodeList(pT->mPatterns, pT->mPatternKinds)) {
-        qDebug().nospace() << "XMLimport::readTrigger(...): ERROR: can not "
-                              "initialize pattern list for trigger: "
-                           << pT->getName();
+    // Taken before the call, which clears mPatterns: a trigger with none is refused, but one kept
+    // only for its script is not broken
+    const bool hasPatterns = !pT->mPatterns.isEmpty();
+    if (!pT->setRegexCodeList(pT->mPatterns, pT->mPatternKinds) && hasPatterns) {
+        qDebug().nospace() << "XMLimport::readTrigger(...): ERROR: can not compile pattern list for trigger: " << pT->getName();
+        itemErrors.append(TLuaInterpreter::compileErrorAsPlainText(pT->getError()));
     }
+    recordItemErrors(pT->getName(), itemErrors, errorsAt, namesAt);
 
     return pT->getID();
 }
@@ -1540,7 +1596,7 @@ int XMLimport::readTimer(TTimer* pParent)
                 const QString tempScript = readScriptElement();
                 if (!pT->setScript(tempScript)) {
                     qDebug().nospace() << "XMLimport::readTimer(...): ERROR: can not compile timer's lua code for: " << pT->getName();
-                    mItemsWithErrors.append(qsl("%1: %2").arg(pT->getName(), compileErrorAsPlainText(pT->getError())));
+                    mItemsWithErrors.append(qsl("%1: %2").arg(pT->getName(), TLuaInterpreter::compileErrorAsPlainText(pT->getError())));
                     mItemsWithErrorNames.append(pT->getName());
                 }
             } else if (name() == qsl("command")) {
@@ -1596,6 +1652,9 @@ int XMLimport::readAlias(TAlias* pParent)
         pT->mModuleMember = true;
     }
 
+    QStringList itemErrors;
+    const qsizetype errorsAt = mItemsWithErrors.size();
+    const qsizetype namesAt = mItemsWithErrorNames.size();
     const QString what = name().toString();
     while (!atEnd()) {
         readNext();
@@ -1612,13 +1671,16 @@ int XMLimport::readAlias(TAlias* pParent)
                 const QString tempScript = readScriptElement();
                 if (!pT->setScript(tempScript)) {
                     qDebug().nospace() << "XMLimport::readAlias(...): ERROR: can not compile alias's lua code for: " << pT->getName();
-                    mItemsWithErrors.append(qsl("%1: %2").arg(pT->getName(), compileErrorAsPlainText(pT->getError())));
-                    mItemsWithErrorNames.append(pT->getName());
+                    itemErrors.append(TLuaInterpreter::compileErrorAsPlainText(pT->getError()));
                 }
             } else if (name() == qsl("command")) {
                 pT->mCommand = readElementText();
             } else if (name() == qsl("regex")) {
                 pT->setRegexCode(readElementText());
+                // Taken here, as a later <script> that fails replaces getError()
+                if (!pT->mOK_init) {
+                    itemErrors.append(TLuaInterpreter::compileErrorAsPlainText(pT->getError()));
+                }
             } else if (name() == qsl("AliasGroup") || name() == qsl("Alias")) {
                 readAlias(pT);
             } else {
@@ -1626,6 +1688,8 @@ int XMLimport::readAlias(TAlias* pParent)
             }
         }
     }
+
+    recordItemErrors(pT->getName(), itemErrors, errorsAt, namesAt);
 
     return pT->getID();
 }
@@ -1682,7 +1746,7 @@ int XMLimport::readAction(TAction* pParent)
                 const QString tempScript = readScriptElement();
                 if (!pT->setScript(tempScript)) {
                     qDebug().nospace() << "XMLimport::readAction(...): ERROR: can not compile action's lua code for: " << pT->getName();
-                    mItemsWithErrors.append(qsl("%1: %2").arg(pT->getName(), compileErrorAsPlainText(pT->getError())));
+                    mItemsWithErrors.append(qsl("%1: %2").arg(pT->getName(), TLuaInterpreter::compileErrorAsPlainText(pT->getError())));
                     mItemsWithErrorNames.append(pT->getName());
                 }
             } else if (name() == qsl("css")) {
@@ -1779,7 +1843,7 @@ int XMLimport::readScript(TScript* pParent)
                 const QString tempScript = readScriptElement();
                 if (!script->setScript(tempScript)) {
                     qDebug().nospace().noquote() << "XMLimport::readScript(...) ERROR - can not compile script's lua code for \"" << script->getName() << "\"; reason: " << script->getError() << ".";
-                    mItemsWithErrors.append(qsl("%1: %2").arg(script->getName(), compileErrorAsPlainText(script->getError())));
+                    mItemsWithErrors.append(qsl("%1: %2").arg(script->getName(), TLuaInterpreter::compileErrorAsPlainText(script->getError())));
                     mItemsWithErrorNames.append(script->getName());
                 }
             } else if (name() == qsl("eventHandlerList")) {
@@ -1845,7 +1909,7 @@ int XMLimport::readKey(TKey* pParent)
                 const QString tempScript = readScriptElement();
                 if (!pT->setScript(tempScript)) {
                     qDebug().nospace() << "XMLimport::readKey(...): ERROR: can not compile key's lua code for: " << pT->getName();
-                    mItemsWithErrors.append(qsl("%1: %2").arg(pT->getName(), compileErrorAsPlainText(pT->getError())));
+                    mItemsWithErrors.append(qsl("%1: %2").arg(pT->getName(), TLuaInterpreter::compileErrorAsPlainText(pT->getError())));
                     mItemsWithErrorNames.append(pT->getName());
                 }
             } else if (name() == qsl("command")) {

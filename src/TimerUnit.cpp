@@ -118,8 +118,19 @@ void TimerUnit::uninstall(const QString& packageName)
 
 void TimerUnit::stopAllTriggers()
 {
+    QList<TTimer*> armedWithBrokenScript;
+    for (auto* pT : std::as_const(mTimerMap)) {
+        if (!pT->mOK_code && pT->mpQTimer->isActive()) {
+            armedWithBrokenScript << pT;
+        }
+    }
     for (auto timer : mTimerRootNodeList) {
         timer->disableTimer(timer->getID());
+    }
+    for (auto* pT : std::as_const(armedWithBrokenScript)) {
+        if (!pT->mpQTimer->isActive()) {
+            mBrokenScriptTimersStopped.insert(pT->getID());
+        }
     }
 }
 
@@ -145,6 +156,13 @@ void TimerUnit::reenableAllTriggers()
         }
         timer->enableTimer(timer->getID());
     }
+    for (const int id : std::as_const(mBrokenScriptTimersStopped)) {
+        TTimer* pT = getTimerPrivate(id);
+        if (pT && !mCleanupSet.contains(pT) && !uninstallList.contains(pT) && pT->canBeUnlocked() && pT->keepArmedWithBrokenScript()) {
+            pT->mpQTimer->start();
+        }
+    }
+    mBrokenScriptTimersStopped.clear();
 }
 
 
@@ -158,13 +176,13 @@ void TimerUnit::addTimerRootNode(TTimer* pT, int parentPosition, int childPositi
     }
 
     if ((parentPosition == -1) || (childPosition >= static_cast<int>(mTimerRootNodeList.size()))) {
-        mTimerRootNodeList.push_back(pT);
+        listRootNode(pT, mTimerRootNodeList.end());
     } else {
         // insert item at proper position
         int cnt = 0;
         for (auto it = mTimerRootNodeList.begin(); it != mTimerRootNodeList.end(); it++) {
             if (cnt >= childPosition) {
-                mTimerRootNodeList.insert(it, pT);
+                listRootNode(pT, it);
                 break;
             }
             cnt++;
@@ -190,7 +208,7 @@ void TimerUnit::reParentTimer(int childID, int oldParentID, int newParentID, int
         pOldParent->popChild(pChild);
     }
     if (!pOldParent) {
-        mTimerRootNodeList.remove(pChild);
+        unlistRootNode(pChild);
     }
     if (pNewParent) {
         pNewParent->addChild(pChild, parentPosition, childPosition);
@@ -241,7 +259,23 @@ void TimerUnit::_removeTimerRootNode(TTimer* pT)
     // the session
     mLookupTable.remove(pT->getName(), pT);
     mTimerMap.remove(pT->getID());
-    mTimerRootNodeList.remove(pT);
+    unlistRootNode(pT);
+}
+
+void TimerUnit::listRootNode(TTimer* pT, std::list<TTimer*>::iterator before)
+{
+    if (!mRootNodePositions.contains(pT)) {
+        mRootNodePositions.insert(pT, mTimerRootNodeList.insert(before, pT));
+    }
+}
+
+void TimerUnit::unlistRootNode(TTimer* pT)
+{
+    const auto position = mRootNodePositions.constFind(pT);
+    if (position != mRootNodePositions.cend()) {
+        mTimerRootNodeList.erase(position.value());
+        mRootNodePositions.erase(position);
+    }
 }
 
 TTimer* TimerUnit::getTimer(int id)
@@ -453,6 +487,19 @@ std::vector<int> TimerUnit::findItems(const QString& name, const bool exactMatch
         }
     }
     return ids;
+}
+
+bool TimerUnit::pendingDeletion(TTimer* pItem) const
+{
+    if (!hasPendingDeletes()) {
+        return false;
+    }
+    for (auto* pAncestor = pItem; pAncestor; pAncestor = pAncestor->getParent()) {
+        if (mCleanupSet.contains(pAncestor) || uninstallList.contains(pAncestor)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool TimerUnit::killTimer(const QString& name)

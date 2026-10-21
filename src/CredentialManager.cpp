@@ -20,8 +20,8 @@
 
 #include "CredentialManager.h"
 #include "MudletApp.h"
-#include "mudlet.h"
 #include "SecureStringUtils.h"
+#include "TAppFrontend.h"
 #include "utils.h"
 
 #include <QCoreApplication>
@@ -50,16 +50,23 @@
 #include <qt6keychain/keychain.h>
 #endif
 
-// Forward declaration to avoid including mudlet.h
-class mudlet;
-
 namespace {
 // Whether a delete job's result means the credential is not left behind. EntryNotFound (nothing
 // to delete) and NoBackendAvailable/NotImplemented (the keychain isn't the store here, so the
 // file fallback is authoritative) are not failures; anything else is a genuine failure to remove
 // an entry that may still exist.
-bool keychainDeleteSucceeded(QKeychain::Error error)
+bool keychainDeleteSucceeded(const QKeychain::Job& job)
 {
+    const QKeychain::Error error = job.error();
+#if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
+    // libsecret reports a Secret Service missing from D-Bus as OtherError, where KWallet says
+    // NoBackendAvailable; on macOS and Windows the store is part of the OS, so there it is the entry's own failure
+    if (error == QKeychain::OtherError) {
+        // Logged all the same: an entry saved in a session that had the keychain is still in it
+        qWarning().noquote() << "CredentialManager: could not reach the keychain to remove an entry, so taking it to hold none:" << job.errorString();
+        return true;
+    }
+#endif
     return error == QKeychain::NoError || error == QKeychain::EntryNotFound || error == QKeychain::NoBackendAvailable || error == QKeychain::NotImplemented;
 }
 
@@ -322,9 +329,9 @@ bool CredentialManager::isOperationValid() const
     if (const std::optional<bool>& override = profileStorageOverrideForTesting(); override.has_value()) {
         return override;
     }
-    // No instance in a unit test, and nothing to read the preference from - the caller's own default
+    // No main window in a unit test, and nothing to read the preference from - the caller's own default
     // stands, which keeps this the keychain as it was
-    if (!mudlet::self()) {
+    if (!TAppFrontend::hasView()) {
         return std::nullopt;
     }
     return !MudletApp::storingPasswordsSecurely();
@@ -441,7 +448,7 @@ void CredentialManager::retrievePassword(const QString& profileName, const QStri
     retrievePassword(
             profileName,
             key,
-            [callback = std::move(callback)](bool success, QString password, const QString& errorMessage, bool) {
+            [callback = std::move(callback)](bool success, QString password, const QString& errorMessage, ReadOutcome) {
                 if (callback) {
                     callback(success, std::move(password), errorMessage);
                 } else {
@@ -457,7 +464,7 @@ void CredentialManager::retrievePassword(
 {
     if (profileName.isEmpty() || key.isEmpty()) {
         if (callback) {
-            callback(false, QString(), qsl("Profile name and key cannot be empty"), false);
+            callback(false, QString(), qsl("Profile name and key cannot be empty"), ReadOutcome::Unavailable);
         }
 
         return;
@@ -466,7 +473,7 @@ void CredentialManager::retrievePassword(
     // Match the static API: a key it refuses would be filed where its migration and cleanup never look.
     if (!isValidKeyName(key)) {
         if (callback) {
-            callback(false, QString(), scmInvalidKeyNameError, false);
+            callback(false, QString(), scmInvalidKeyNameError, ReadOutcome::Unavailable);
         }
 
         return;
@@ -477,7 +484,7 @@ void CredentialManager::retrievePassword(
         qWarning() << "CredentialManager: Rejecting retrievePassword operation during shutdown";
 
         if (callback) {
-            callback(false, QString(), qsl("Application is shutting down"), false);
+            callback(false, QString(), qsl("Application is shutting down"), ReadOutcome::Unavailable);
         }
 
         return;
@@ -573,6 +580,7 @@ void CredentialManager::retrievePassword(
             }
             stages.swap(fileOnly);
             lookup->keychainError = qsl("the keychain refused a read moments ago - unlock it, or answer its prompt, and try again");
+            lookup->keychainRefused = true;
         }
 
         // One deadline for the whole chain rather than one per read. The chain is several keychain
@@ -585,22 +593,53 @@ void CredentialManager::retrievePassword(
             qWarning().noquote().nospace() << "CredentialManager: gave up looking up the saved password for profile \"" << lookup->profileName << "\", key \"" << lookup->key << "\" after "
                                            << mOperationTimeoutMs << "ms, waiting on the read of the " << lookup->stages[lookup->currentStage].description
                                            << " (or on another keychain job ahead of it in the queue)";
-            // Before finishLookup() lets go of the read that is still out
+            // Before finishLookup() lets go of the read that is still out, even when the file answers:
+            // a keychain write leaves an older copy in the file, which the keychain's answer replaces
             awaitLateAnswer(lookup);
-            finishLookup(lookup, false, QString(), qsl("Operation timed out"), true);
+            // The file needs nothing from the keychain, so a read stalled ahead of it is no reason
+            // to leave it unread - and the next lookup would stall at the same read
+            for (std::size_t index = lookup->currentStage + 1; index < lookup->stages.size(); ++index) {
+                if (!lookup->stages[index].fromFile) {
+                    continue;
+                }
+                ReadOutcome failure = ReadOutcome::NothingStored;
+                if (QString password = retrieveCredentialFromFile(lookup->profileName, lookup->key, &failure); !password.isEmpty()) {
+                    finishLookup(lookup, std::move(password), QString(), ReadOutcome::Found);
+                    return;
+                }
+                if (lookup->fileOutcome != ReadOutcome::Unreadable && failure != ReadOutcome::NothingStored) {
+                    lookup->fileOutcome = failure;
+                }
+                break;
+            }
+            // Still a timeout when the file is unreadable: the read given up on may yet answer with the password
+            const QString error = lookup->fileOutcome == ReadOutcome::Unreadable ? unreadableFileError(lookup->profileName) : qsl("Operation timed out");
+            finishLookup(lookup, QString(), error, ReadOutcome::TimedOut);
         });
         deadline->start(mOperationTimeoutMs);
 
         runLookupStage(lookup, 0);
     } else {
         // Use SecureStringUtils directly (portable/test mode)
-        QString password = retrieveCredentialFromFile(profileName, key);
+        ReadOutcome failure = ReadOutcome::NothingStored;
+        QString password = retrieveCredentialFromFile(profileName, key, &failure);
         bool success = !password.isEmpty();
 
         if (callback) {
-            // Empty password is normal for first-time profiles - not an error. Move the buffer so the
-            // receiver takes sole ownership and can scrub the secret in place.
-            callback(success, std::move(password), success ? QString() : qsl("No password stored in encrypted file storage"), false);
+            // Nothing stored is normal for first-time profiles, so only an unreadable file is reported as
+            // one. Move the buffer so the receiver takes sole ownership and can scrub the secret in place.
+            const ReadOutcome outcome = success ? ReadOutcome::Found : failure;
+            QString error;
+            if (!success) {
+                if (failure == ReadOutcome::Unreadable) {
+                    error = unreadableFileError(profileName);
+                } else if (failure == ReadOutcome::NothingStored) {
+                    error = qsl("No password stored in encrypted file storage");
+                } else {
+                    error = qsl("Could not read encrypted file storage");
+                }
+            }
+            callback(outcome == ReadOutcome::Found, std::move(password), error, outcome);
         }
     }
 }
@@ -611,7 +650,7 @@ void CredentialManager::credentialExists(const QString& profileName, const QStri
     // (retrievePassword moves it in), then zero it in place before forwarding only whether a credential
     // exists. QString is copy-on-write, so scrubbing a shared copy would detach and leave the original
     // intact - sole ownership is what makes the wipe effective.
-    auto answer = [callback](bool success, QString password, const QString&, bool) {
+    auto answer = [callback](bool success, QString password, const QString&, ReadOutcome) {
         const bool exists = success && !password.isEmpty();
         SecureStringUtils::secureStringClear(password);
         if (callback) {
@@ -623,7 +662,7 @@ void CredentialManager::credentialExists(const QString& profileName, const QStri
     if (scope == StoreScope::EveryStore && keychainMayHoldAnEarlierCopy()) {
         QString password = retrieveCredentialFromFile(profileName, key);
         if (!password.isEmpty()) {
-            answer(true, std::move(password), QString(), false);
+            answer(true, std::move(password), QString(), ReadOutcome::Found);
             return;
         }
     }
@@ -638,7 +677,7 @@ void CredentialManager::startJob(QKeychain::Job* job)
     job->start();
 }
 
-void CredentialManager::finishLookup(const LookupPtr& lookup, bool success, QString password, const QString& errorMessage, bool timedOut)
+void CredentialManager::finishLookup(const LookupPtr& lookup, QString password, const QString& errorMessage, ReadOutcome outcome)
 {
     if (lookup->answered) {
         SecureStringUtils::secureStringClear(password);
@@ -656,7 +695,7 @@ void CredentialManager::finishLookup(const LookupPtr& lookup, bool success, QStr
     auto callback = std::exchange(lookup->callback, nullptr);
     if (callback) {
         // Move so ownership of the secret buffer threads through to the final callback.
-        callback(success, std::move(password), errorMessage, timedOut);
+        callback(outcome == ReadOutcome::Found, std::move(password), errorMessage, outcome);
     } else {
         SecureStringUtils::secureStringClear(password);
     }
@@ -731,11 +770,25 @@ void CredentialManager::runLookupStage(const LookupPtr& lookup, std::size_t inde
         return;
     }
     if (index >= lookup->stages.size()) {
-        // A keychain that refused a read may still hold the password, so say so rather than
-        // reporting that nothing is stored.
-        const QString error =
-                lookup->keychainError.isEmpty() ? qsl("No stored credentials found for profile %1").arg(lookup->profileName) : qsl("Could not read the keychain: %1").arg(lookup->keychainError);
-        finishLookup(lookup, false, QString(), error);
+        // A store that refused a read - keychain or file - may still hold the password, so say so rather
+        // than reporting that nothing is stored.
+        QString error = qsl("No stored credentials found for profile %1").arg(lookup->profileName);
+        // The file first: the keychain's failure was logged when it happened, and an unreadable file is
+        // the one the player can put right, by typing the password again
+        if (lookup->fileOutcome == ReadOutcome::Unreadable) {
+            error = unreadableFileError(lookup->profileName);
+        } else if (!lookup->keychainError.isEmpty()) {
+            error = qsl("Could not read the keychain: %1").arg(lookup->keychainError);
+        } else if (lookup->fileOutcome != ReadOutcome::NothingStored) {
+            error = qsl("Could not read the encrypted credential file for profile %1").arg(lookup->profileName);
+        }
+        ReadOutcome outcome = ReadOutcome::NothingStored;
+        if (lookup->keychainRefused || lookup->fileOutcome == ReadOutcome::Unreadable) {
+            outcome = ReadOutcome::Unreadable;
+        } else if (!lookup->keychainError.isEmpty() || lookup->fileOutcome == ReadOutcome::Unavailable) {
+            outcome = ReadOutcome::Unavailable;
+        }
+        finishLookup(lookup, QString(), error, outcome);
         return;
     }
 
@@ -749,12 +802,16 @@ void CredentialManager::runLookupStage(const LookupPtr& lookup, std::size_t inde
         return;
     }
     if (stage.fromFile) {
-        QString password = retrieveCredentialFromFile(lookup->profileName, lookup->key);
+        ReadOutcome failure = ReadOutcome::NothingStored;
+        QString password = retrieveCredentialFromFile(lookup->profileName, lookup->key, &failure);
+        if (lookup->fileOutcome != ReadOutcome::Unreadable && failure != ReadOutcome::NothingStored) {
+            lookup->fileOutcome = failure;
+        }
         if (password.isEmpty()) {
             runLookupStage(lookup, index + 1);
             return;
         }
-        finishLookup(lookup, true, std::move(password), QString());
+        finishLookup(lookup, std::move(password), QString(), ReadOutcome::Found);
         return;
     }
 
@@ -792,7 +849,7 @@ void CredentialManager::runLookupStage(const LookupPtr& lookup, std::size_t inde
                 qWarning() << "CredentialManager: Not re-filing the password found in the" << finishedStage.description << "for profile" << lookup->profileName
                            << "under the current name, as an earlier keychain read failed";
             }
-            finishLookup(lookup, true, std::move(password), QString());
+            finishLookup(lookup, std::move(password), QString(), ReadOutcome::Found);
             return;
         }
         if (error == QKeychain::NoError || readFoundNothing(error)) {
@@ -809,6 +866,7 @@ void CredentialManager::runLookupStage(const LookupPtr& lookup, std::size_t inde
                 lookup->keychainError = errorString;
             }
             if (readWasRefusedOutright(error)) {
+                lookup->keychainRefused = true;
                 ++lookup->consecutiveRefusals;
                 // One refusal can be this entry's own - a per-item ACL, or a keychain item another
                 // build saved under terms this one cannot meet - and an older layout behind it may
@@ -1170,7 +1228,8 @@ void CredentialManager::storeCredential(const QString& service, const QString& a
             [this, writeJob, service, account, password, profileName]() {
                 // Early exit if operation is no longer valid
                 if (!isOperationValid()) {
-                    qWarning() << "CredentialManager: Ignoring keychain callback - operation no longer valid";
+                    qWarning().noquote() << "CredentialManager: dropped the answer to the" << mCurrentOperationDescription
+                                         << "- the application is shutting down, so its caller is not told the outcome";
                     writeJob->deleteLater();
                     return;
                 }
@@ -1264,14 +1323,15 @@ void CredentialManager::removeCredential(const QString& service, const QString& 
             [this, deleteJob, service, account, profileName]() {
                 // Early exit if operation is no longer valid
                 if (!isOperationValid()) {
-                    qWarning() << "CredentialManager: Ignoring keychain callback - operation no longer valid";
+                    qWarning().noquote() << "CredentialManager: dropped the answer to the" << mCurrentOperationDescription
+                                         << "- the application is shutting down, so its caller is not told the outcome";
                     deleteJob->deleteLater();
                     return;
                 }
 
                 cleanupTimeout();
 
-                const bool primarySuccess = keychainDeleteSucceeded(deleteJob->error());
+                const bool primarySuccess = keychainDeleteSucceeded(*deleteJob);
                 const QString primaryError = primarySuccess ? QString() : deleteJob->errorString();
                 deleteJob->deleteLater();
 
@@ -1299,14 +1359,15 @@ void CredentialManager::removeCredential(const QString& service, const QString& 
                         this,
                         [this, bareJob, service, account, profileName, primarySuccess, primaryError]() {
                             if (!isOperationValid()) {
-                                qWarning() << "CredentialManager: Ignoring keychain callback - operation no longer valid";
+                                qWarning().noquote() << "CredentialManager: dropped the answer to the" << mCurrentOperationDescription
+                                                     << "- the application is shutting down, so its caller is not told the outcome";
                                 bareJob->deleteLater();
                                 return;
                             }
 
                             cleanupTimeout();
 
-                            const bool bareSuccess = keychainDeleteSucceeded(bareJob->error());
+                            const bool bareSuccess = keychainDeleteSucceeded(*bareJob);
                             const QString bareError = bareSuccess ? QString() : bareJob->errorString();
                             bareJob->deleteLater();
 
@@ -1395,7 +1456,8 @@ void CredentialManager::isKeychainAvailable(AvailabilityCallback callback)
             [this, testJob]() {
                 // Early exit if operation is no longer valid
                 if (!isOperationValid()) {
-                    qWarning() << "CredentialManager: Ignoring keychain callback - operation no longer valid";
+                    qWarning().noquote() << "CredentialManager: dropped the answer to the" << mCurrentOperationDescription
+                                         << "- the application is shutting down, so its caller is not told the outcome";
                     testJob->deleteLater();
                     return;
                 }
@@ -1530,23 +1592,42 @@ bool CredentialManager::storeCredentialToFile(const QString& profileName, const 
     return true;
 }
 
-QString CredentialManager::retrieveCredentialFromFile(const QString& profileName, const QString& key)
+/*static*/ QString CredentialManager::unreadableFileError(const QString& profileName)
 {
+    return qsl("The saved password for profile %1 could not be read").arg(profileName);
+}
+
+QString CredentialManager::retrieveCredentialFromFile(const QString& profileName, const QString& key, ReadOutcome* failure)
+{
+    if (failure) {
+        *failure = ReadOutcome::NothingStored;
+    }
     QString filePath = generateFilePath(profileName, key);
 
     // Check if path generation failed due to validation
     if (filePath.isEmpty()) {
         qWarning() << "CredentialManager: Failed to generate valid file path for retrieving encrypted credential";
+        if (failure) {
+            *failure = ReadOutcome::Unavailable;
+        }
         return QString();
     }
 
     // An older Mudlet uses only the truncated path, so a newer copy there is the latest password
     const QString legacyPath = generateLegacyFilePath(profileName, key);
 
+    // A copy under the old name that is newer but cannot be opened may hold the latest password
+    bool legacyUnreadable = false;
     if (!legacyPath.isEmpty() && fileWrittenAfter(legacyPath, filePath)) {
-        const QString migrated = readLegacyFileCredential(profileName, key);
+        bool legacyUsedDerivableKey = false;
+        const QString migrated = readLegacyFileCredential(profileName, key, &legacyUnreadable, &legacyUsedDerivableKey);
 
         if (!migrated.isEmpty()) {
+            // Before the copy across, which then stays the newer one and is read from next time
+            if (legacyUsedDerivableKey && !writeCredentialFile(legacyPath, profileName, migrated)) {
+                qWarning() << "CredentialManager: could not re-encrypt the" << key << "credential saved under the derivable key at" << legacyPath << "for profile" << profileName;
+            }
+
             // Copied, not moved: an older Mudlet sharing this config directory looks only there
             if (!writeCredentialFile(filePath, profileName, migrated)) {
                 qWarning() << "CredentialManager: could not copy the newer credential at" << legacyPath << "across to" << filePath << "- it will be read from the older path again next time";
@@ -1555,6 +1636,14 @@ QString CredentialManager::retrieveCredentialFromFile(const QString& profileName
             qDebug() << "CredentialManager: Found the" << key << "credential for profile" << profileName << "in the encrypted file left by the earlier naming scheme";
 
             return migrated;
+        }
+
+        // The newer copy is the latest password, so the older one below would be stale
+        if (legacyUnreadable) {
+            if (failure) {
+                *failure = ReadOutcome::Unreadable;
+            }
+            return QString();
         }
 
         // Undecryptable: a profile this one used to collide with wrote it, or it is damaged
@@ -1570,6 +1659,22 @@ QString CredentialManager::retrieveCredentialFromFile(const QString& profileName
         // Only log warning if file should exist (not for first-time access)
         if (file.exists()) {
             qWarning() << "CredentialManager: Failed to open existing file for reading:" << filePath << "Error:" << file.errorString();
+            if (failure) {
+                *failure = ReadOutcome::Unreadable;
+            }
+        } else if (failure) {
+#if !defined(Q_OS_WIN)
+            // A folder without search permission hides everything below it, so "not there" is not proof of
+            // absence: check the nearest folder that does show. Not on Windows, which has no search permission.
+            QString folderPath = QFileInfo(filePath).absolutePath();
+            while (!QFileInfo::exists(folderPath) && QFileInfo(folderPath).absolutePath() != folderPath) {
+                folderPath = QFileInfo(folderPath).absolutePath();
+            }
+            const QFileInfo folder(folderPath);
+            if (folder.exists() && !folder.isExecutable()) {
+                *failure = ReadOutcome::Unreadable;
+            }
+#endif
         }
 
         return QString();
@@ -1581,18 +1686,41 @@ QString CredentialManager::retrieveCredentialFromFile(const QString& profileName
     SecureStringUtils::restrictDirectoryToOwner(QFileInfo(filePath).absolutePath());
 
     QString encrypted = QString::fromUtf8(file.readAll());
+    const bool readFailed = file.error() != QFileDevice::NoError;
+    const QString readError = file.errorString();
     file.close();
 
-    if (encrypted.isEmpty()) {
+    // An empty file is how "no password" is written; one that failed to read is not that
+    if (readFailed) {
+        qWarning() << "CredentialManager: Failed to read the encrypted credential file:" << filePath << "Error:" << readError;
+        if (failure) {
+            *failure = ReadOutcome::Unreadable;
+        }
+        if (encrypted.isEmpty()) {
+            return QString();
+        }
+    } else if (encrypted.isEmpty()) {
         qWarning() << "CredentialManager: Retrieved empty encrypted data from file:" << filePath;
         return QString();
     }
 
-    // Decrypt credential using profile-specific key
-    QString decrypted = SecureStringUtils::decryptStringForProfile(encrypted, profileName);
+    bool usedDerivableKey = false;
+    QString decrypted = SecureStringUtils::decryptStringForProfile(encrypted, profileName, &usedDerivableKey);
+
+    if (usedDerivableKey) {
+        if (writeCredentialFile(filePath, profileName, decrypted)) {
+            // The legacy copy was most likely written alongside this one, so under the same key
+            refreshLegacyFileCredential(profileName, key, decrypted);
+        } else {
+            qWarning() << "CredentialManager: could not re-encrypt the" << key << "credential saved under the derivable key for profile" << profileName;
+        }
+    }
 
     if (decrypted.isEmpty()) {
         qWarning() << "CredentialManager: Failed to decrypt credential for profile" << profileName;
+        if (failure) {
+            *failure = ReadOutcome::Unreadable;
+        }
     } else {
         // Logged here because the caller can't tell keychain from file fallback. The key is named because
         // this also serves the proxy password and credentialExists()'s reconnect token.
@@ -1727,7 +1855,7 @@ QString CredentialManager::generateLegacyFilePath(const QString& profileName, co
 
 // Empty when nothing there is this profile's. Decrypts rather than just reading: a file this profile
 // can't decrypt belongs to a profile it used to collide with.
-QString CredentialManager::readLegacyFileCredential(const QString& profileName, const QString& key)
+QString CredentialManager::readLegacyFileCredential(const QString& profileName, const QString& key, bool* unreadable, bool* usedDerivableKey)
 {
     const QString legacyPath = generateLegacyFilePath(profileName, key);
 
@@ -1740,6 +1868,9 @@ QString CredentialManager::readLegacyFileCredential(const QString& profileName, 
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
         if (file.exists()) {
             qWarning() << "CredentialManager: Failed to open credential file left by the earlier naming scheme:" << legacyPath << "Error:" << file.errorString();
+            if (unreadable) {
+                *unreadable = true;
+            }
         }
 
         return QString();
@@ -1750,9 +1881,20 @@ QString CredentialManager::readLegacyFileCredential(const QString& profileName, 
     SecureStringUtils::restrictDirectoryToOwner(QFileInfo(legacyPath).absolutePath());
 
     const QString encrypted = QString::fromUtf8(file.readAll());
+    const bool readFailed = file.error() != QFileDevice::NoError;
+    const QString readError = file.errorString();
     file.close();
 
-    return SecureStringUtils::decryptStringForProfile(encrypted, profileName);
+    // Unlike a copy that won't decrypt, which may be another profile's, a failed read says nothing about whose it is
+    if (readFailed) {
+        qWarning() << "CredentialManager: Failed to read credential file left by the earlier naming scheme:" << legacyPath << "Error:" << readError;
+        if (unreadable) {
+            *unreadable = true;
+        }
+        return QString();
+    }
+
+    return SecureStringUtils::decryptStringForProfile(encrypted, profileName, usedDerivableKey);
 }
 
 // Only decrypting tells our legacy file from one a formerly-colliding profile left, so refresh and

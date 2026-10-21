@@ -195,7 +195,7 @@ private slots:
 
         mudlet::self()->show();
         mpHost->showHideOrCreateMapper(false);
-        mpMapper = map()->mpMapper;
+        mpMapper = map()->mapper();
         QVERIFY2(mpMapper, "the profile has no mapper to take the cues");
         mp2dMap = mpMapper->mp2dMap;
         QVERIFY(mp2dMap);
@@ -225,7 +225,7 @@ private slots:
         if (QTest::currentTestFailed()) {
             return;
         }
-        QVERIFY2(map()->mpMapper == mpMapper, "the mapper made for this test is no longer the one drawing the map");
+        QVERIFY2(map()->mapper() == mpMapper, "the mapper made for this test is no longer the one drawing the map");
         mpMapper->show();
         mpMapper->updateAreaComboBox();
         QCOMPARE(areaListOf(mpMapper), (QStringList{qsl("Ground"), qsl("Upstairs")}));
@@ -294,6 +294,23 @@ private slots:
 
         QVERIFY2(mp2dMap->mNewMoveAction, "the mapper was not told a move happened");
         QVERIFY2(paintRequested(), "the mapper was not repainted after a move");
+    }
+
+    void test_changesToTwoAreasAtOnceAreAnnouncedForEveryArea()
+    {
+        QSignalSpy announced(map(), &TMap::signal_areaChanged);
+        map()->updatePlayerArea(1);
+        map()->updateArea(2);
+        QCoreApplication::sendPostedEvents(map(), QEvent::MetaCall);
+        QCOMPARE(announced.size(), 1);
+        QCOMPARE(announced.first().first().toInt(), -1);
+
+        announced.clear();
+        map()->updateArea(3);
+        map()->updateArea(3);
+        QCoreApplication::sendPostedEvents(map(), QEvent::MetaCall);
+        QCOMPARE(announced.size(), 1);
+        QCOMPARE(announced.first().first().toInt(), 3);
     }
 
     void test_addingAndDeletingALabelRepaintsTheDrawingMapper()
@@ -382,7 +399,7 @@ private slots:
     void test_onlyTheMapperDrawingTheMapFollowsItsCues()
     {
         auto other = std::make_unique<dlgMapper>(nullptr, mpHost, map());
-        QVERIFY2(map()->mpMapper == mpMapper, "making a second mapper took the map over");
+        QVERIFY2(map()->mapper() == mpMapper, "making a second mapper took the map over");
         other->updateAreaComboBox();
         const QStringList otherAreasBefore = areaListOf(other.get());
         other->mp2dMap->mNewMoveAction = false;

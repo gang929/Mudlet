@@ -61,6 +61,7 @@ extern "C" {
 #include <vector>
 #include <memory>
 #include <optional>
+#include <utility>
 
 class Host;
 class TAction;
@@ -100,17 +101,18 @@ public:
     void initIndenterGlobals();
     lua_State* getLuaGlobalState();
 
-    bool call(const QString& function, const QString& mName, const bool muteDebugOutput = false);
+    bool call(const QString& function, const QString& mName, const bool muteDebugOutput = false, const bool aliasScript = false);
     std::pair<bool, bool> callReturnBool(const QString& function, const QString& mName);
     bool callMulti(const QString& function, const QString& mName);
     std::pair<bool, bool> callMultiReturnBool(const QString& function, const QString& mName);
     bool callConditionFunction(std::string& function, const QString& mName);
-    bool call_luafunction(void* pT, const QString& itemName = QString());
+    bool call_luafunction(void* pT, const QString& itemName = QString(), const bool aliasScript = false);
     void delete_luafunction(void* pT);
     void delete_luafunction(const QString& name);
     std::pair<bool, bool> callLuaFunctionReturnBool(void* pT, const QString& itemName = QString());
     double condenseMapLoad();
     bool compile(const QString& code, QString& error, const QString& name);
+    static QString compileErrorAsPlainText(const QString& error);
     void setAtcpTable(const QString&, const QString&);
     void signalMXPEvent(const QString& type, const QMap<QString, QString>& attrs, const QStringList& actions, const QString& caption = QString());
     void setGMCPTable(QString&, const QString&);
@@ -143,10 +145,39 @@ public:
     void setMultiCaptureGroups(std::list<std::list<std::string>>&& captureList, std::list<std::list<int>>&& posList, QVector<NameGroupMatches>&& nameMatches);
     void takeBackMultiCaptureGroups(std::list<std::list<std::string>>& captureList, std::list<std::list<int>>& posList);
     void adjustCaptureGroups(int x, int a);
+    void adjustCaptureGroupsForReplace(int x, int replacedLength, const QString& replacement);
     void clearCaptureGroups();
     bool buildingCaptureTables();
-    int pushNestedDispatchState();
+    int pushNestedDispatchState(const bool parkCommand);
     void popNestedDispatchState(const int depth);
+    // While an alias pass runs, for settleCommandAfterAliasPass(): the "command"
+    // the pass ends with unless a script changes it, and the value the last
+    // restore put back
+    struct PassCommandState
+    {
+        int passCommandRef = LUA_NOREF;
+        int restoredCommandRef = LUA_NOREF;
+    };
+    void setExpandedCommand(const QString&);
+    void settleCommandAfterAliasPass();
+    // expandAlias() gives "command" back only to an alias script, so every way into
+    // a script says whether it is one
+    class ScriptCallerScope
+    {
+    public:
+        ScriptCallerScope(TLuaInterpreter& lua, const bool aliasScript)
+        : mLua(lua)
+        , mWasAliasScript(std::exchange(lua.mRunningAliasScript, aliasScript))
+        {
+        }
+        ~ScriptCallerScope() { mLua.mRunningAliasScript = mWasAliasScript; }
+        ScriptCallerScope(const ScriptCallerScope&) = delete;
+        ScriptCallerScope& operator=(const ScriptCallerScope&) = delete;
+
+    private:
+        TLuaInterpreter& mLua;
+        const bool mWasAliasScript;
+    };
     bool callEventHandler(const QString& function, const TEvent& pE);
     bool callCmdLineAction(const int func, QString);
     bool callAnonymousFunction(const int func, QString name);
@@ -189,6 +220,7 @@ public:
     static int sendMSDP(lua_State*);
     static int auditAreas(lua_State*);
     static int getAreaExits(lua_State*);
+    static int getAreaGraph(lua_State*);
     static int setMergeTables(lua_State*);
     static int addSupportedTelnetOption(lua_State*);
     static int setDoor(lua_State*);
@@ -348,6 +380,7 @@ public:
     static int setCustomEnvColor(lua_State*);
     static int roomLocked(lua_State*);
     static int setAreaName(lua_State*);
+    static int setAreaGraphPosition(lua_State*);
     static int getRoomCoordinates(lua_State*);
     static int setRoomCoordinates(lua_State*);
     static int roomExists(lua_State*);
@@ -356,6 +389,7 @@ public:
     static int createRoomID(lua_State*);
     static int setRoomArea(lua_State*);
     static int resetRoomArea(lua_State*);
+    static int resetAreaGraphLayout(lua_State*);
     static int getRoomArea(lua_State*);
     static int denyCurrentSend(lua_State*);
     static int tempBeginOfLineTrigger(lua_State*);
@@ -409,6 +443,7 @@ public:
     static int setFont(lua_State*);
     static int getFont(lua_State*);
     static int setFontSize(lua_State*);
+    static int setMiniConsoleFontSize(lua_State*);
     static int getFontSize(lua_State*);
     static int openUserWindow(lua_State*);
     static int setUserWindowTitle(lua_State*);
@@ -509,6 +544,12 @@ public:
     static int deleteScrollBox(lua_State*);
     static int setLabelToolTip(lua_State*);
     static int getLabelToolTip(lua_State*);
+    static int setLabelAccessibleName(lua_State*);
+    static int getLabelAccessibleName(lua_State*);
+    static int setLabelAccessibleRole(lua_State*);
+    static int getLabelAccessibleRole(lua_State*);
+    static int setLabelLiveRegion(lua_State*);
+    static int getLabelLiveRegion(lua_State*);
     static int setLabelCursor(lua_State*);
     static int setLabelCustomCursor(lua_State*);
     static int moveWindow(lua_State*);
@@ -556,6 +597,7 @@ public:
     static int showToolBar(lua_State*);
     static int hideToolBar(lua_State*);
     static int loadReplay(lua_State*);
+    static int loadRawFile(lua_State*);
     static int setBold(lua_State*);
     static int setItalics(lua_State*);
     static int setReverse(lua_State*);
@@ -591,6 +633,9 @@ public:
     static int pauseSounds(lua_State*);
     static int pauseMusic(lua_State*);
     static int pauseVideos(lua_State*);
+    static int updateSounds(lua_State*);
+    static int setMediaListener(lua_State*);
+    static int getMediaListener(lua_State*);
     static int purgeMediaCache(lua_State*);
     static int setBorderSizes(lua_State*);
     static int setBorderTop(lua_State*);
@@ -680,9 +725,15 @@ public:
     static int addMapEvent(lua_State*);
     static int removeMapEvent(lua_State*);
     static int getMapEvents(lua_State*);
+    static int getMapEnvironmentKit(lua_State*);
+    static int getMapEnvironmentKits(lua_State*);
+    static int setMapEnvironmentKit(lua_State*);
     static int addMapMenu(lua_State*);
     static int removeMapMenu(lua_State*);
     static int getMapMenus(lua_State*);
+    static int hideMapMenuItem(lua_State*);
+    static int showMapMenuItem(lua_State*);
+    static int getHiddenMapMenuItems(lua_State*);
     static int getMudletVersion(lua_State*);
     static int openWebPage(lua_State*);
     static int getAllRoomEntrances(lua_State*);
@@ -843,7 +894,7 @@ public:
     int duplicateLuaRegistryIndex(int index);
     void freeAllInLuaRegistry(TEvent);
     // For C++ that runs a nested event loop for this profile outside a Lua call,
-    // so pumpingEvents() holds off a reset or close until it returns.
+    // so pumpingEvents() refuses a reset or a profile close while it runs.
     void enterNestedEventLoop() { ++mEventPumpDepth; }
     void leaveNestedEventLoop() { --mEventPumpDepth; }
 
@@ -886,6 +937,8 @@ public slots:
     void slot_deleteSender(int, QProcess::ExitStatus);
 
 private:
+    static int loadReplayFile(lua_State*, const char* functionName);
+    static int setConsoleFontSize(lua_State*, const char* functionName, const bool windowNamed);
     static bool getVerifiedBool(lua_State*, const char* functionName, const int pos, const char* publicName, const bool isOptional = false);
     static QString getVerifiedString(lua_State*, const char* functionName, const int pos, const char* publicName, const bool isOptional = false);
     static bool checkStringArg(lua_State*, const char* functionName, const int pos, const char* publicName, const bool isOptional = false);
@@ -906,9 +959,11 @@ private:
     static int warnArgumentChoice(lua_State*, const char* functionName, const QString& argumentName, const QStringList& accepted, const QString& value);
     static int setLabelCallback(lua_State*, const char* funcName);
     static int movieFunc(lua_State*, const char* funcName);
+    static int setMapMenuItemHidden(lua_State*, const char* functionName, const bool hidden);
     static std::pair<bool, QString> discordApiEnabled(lua_State*, bool writeAccess = false);
     static void setRequestDefaults(const QUrl& url, QNetworkRequest& request);
     static int performHttpRequest(lua_State*, const char* functionName, const int pos, QNetworkAccessManager::Operation operation, const char* verb);
+    static bool httpSchemeAllowed(const QUrl&);
     static void validateHttpHeaders(lua_State*, const int index, const char* functionName);
     static void applyHttpHeaders(lua_State*, const int index, QNetworkRequest& request);
     // The last argument is only needed if the third one is true:
@@ -1079,8 +1134,9 @@ private:
     bool mGlobalsHandlersLinger = false;
     int mIndexHandlerRef = LUA_NOREF;
     int mNewindexHandlerRef = LUA_NOREF;
-    // expandAlias() overwrites "command" and the captures; the caller's are saved here (one entry per
-    // nesting level) and restored when the pass returns.
+    // A nested alias pass - from expandAlias(), feedTriggers(), or an alias's or trigger's command field - overwrites
+    // "command" and the captures; the caller's are saved here (one entry per nesting level) and
+    // restored when the pass returns - "command" only for an alias script's expandAlias().
     struct NestedDispatchState
     {
         std::vector<std::string> captureGroupList;
@@ -1096,6 +1152,8 @@ private:
         bool captureScopeOpen = false;
     };
     std::vector<NestedDispatchState> mNestedDispatchStates;
+    bool mRunningAliasScript = false;
+    PassCommandState mPassCommand;
     void releaseNestedDispatchState(NestedDispatchState&);
     // Registry references to how callEventHandler() finds each handler, by
     // handler name: the name itself, read raw from the globals, or else the

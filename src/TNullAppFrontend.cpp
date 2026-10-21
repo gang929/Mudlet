@@ -1,6 +1,5 @@
 /***************************************************************************
- *   Copyright (C) 2020 by Piotr Wilczynski - delwing@gmail.com            *
- *   Copyright (C) 2022 by Stephen Lyons - slysven@virginmedia.com         *
+ *   Copyright (C) 2026 by Vadim Peretokin - vadim.peretokin@mudlet.org    *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
  *   it under the terms of the GNU General Public License as published by  *
@@ -18,26 +17,18 @@
  *   59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.             *
  ***************************************************************************/
 
-#include "AltFocusMenuBarDisable.h"
+#include "TNullAppFrontend.h"
 
-AltFocusMenuBarDisable::AltFocusMenuBarDisable()
+#include "TLabelModel.h"
+
+TAppFrontend* TAppFrontend::nullView()
 {
-    setObjectName(baseStyle()->objectName());
+    // Function-local, so it exists before any static initialiser can ask for it
+    static TNullAppFrontend view;
+    return &view;
 }
 
-AltFocusMenuBarDisable::AltFocusMenuBarDisable(const QString& style)
-: QProxyStyle(QStyleFactory::create(style))
+std::optional<QSize> TNullAppFrontend::getImageSize(const QString& imageLocation)
 {
-}
-
-int AltFocusMenuBarDisable::styleHint(StyleHint styleHint, const QStyleOption* opt, const QWidget* widget, QStyleHintReturn* returnData) const
-{
-    if (styleHint == QStyle::SH_MenuBar_AltKeyNavigation) {
-        return 0;
-    }
-    if (styleHint == QStyle::SH_ItemView_ActivateItemOnSingleClick) {
-        return 0;
-    }
-
-    return QProxyStyle::styleHint(styleHint, opt, widget, returnData);
+    return TLabelModel::imageSize(imageLocation);
 }

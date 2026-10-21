@@ -138,15 +138,16 @@ void TriggerUnit::addTriggerRootNode(TTrigger* pT, int parentPosition, int child
         pT->setID(getNewID());
     }
     if ((parentPosition == -1) || (childPosition >= static_cast<int>(mTriggerRootNodeList.size()))) {
-        mTriggerRootNodeList.push_back(pT);
-        markRootNodeAppended(pT);
+        if (listRootNode(pT, mTriggerRootNodeList.end())) {
+            markRootNodeAppended(pT);
+        }
     } else {
         markRootNodeListReordered();
         // insert item at proper position
         int cnt = 0;
         for (auto it = mTriggerRootNodeList.begin(); it != mTriggerRootNodeList.end(); it++) {
             if (cnt >= childPosition) {
-                mTriggerRootNodeList.insert(it, pT);
+                listRootNode(pT, it);
                 break;
             }
             cnt++;
@@ -171,12 +172,13 @@ void TriggerUnit::reParentTrigger(int childID, int oldParentID, int newParentID,
 
     // Changes the prescan list: a trigger under a chain matches its parent's capture, not the line
     TTrigger::bumpStructureGeneration();
+    unfileTreeNode(pChild);
 
     if (pOldParent) {
         pOldParent->popChild(pChild);
     } else {
         markRootNodeRemoved(pChild);
-        mTriggerRootNodeList.remove(pChild);
+        unlistRootNode(pChild);
     }
 
     // Convert enum mode to the internal flags
@@ -216,7 +218,7 @@ void TriggerUnit::removeTriggerRootNode(TTrigger* pT)
     mLookupTable.remove(pT->getName(), pT);
     mTriggerMap.remove(pT->getID());
     markRootNodeRemoved(pT);
-    mTriggerRootNodeList.remove(pT);
+    unlistRootNode(pT);
 }
 
 TTrigger* TriggerUnit::getTrigger(int id)
@@ -289,6 +291,9 @@ void TriggerUnit::unregisterTrigger(TTrigger* pT)
     // of the end-of-pass reset, so drop its lineage here instead.
     std::replace(mRootNodesAddedWhileProcessing.begin(), mRootNodesAddedWhileProcessing.end(), pT, static_cast<TTrigger*>(nullptr));
     pT->setSameLineChain(0, 0);
+    if (pT->mTreeIndexPosition >= 0) {
+        unfileTreeNode(pT);
+    }
     if (pT->getParent()) {
         removeTrigger(pT);
         return;
@@ -308,6 +313,7 @@ void TriggerUnit::addTrigger(TTrigger* pT)
     }
 
     mTriggerMap.insert(pT->getID(), pT);
+    mTreeIndexStale = true;
 }
 
 void TriggerUnit::removeTrigger(TTrigger* pT)
@@ -333,10 +339,28 @@ void TriggerUnit::reorderTriggersAfterPackageImport()
     }
     markRootNodeListReordered();
     for (auto& trigger : tempList) {
-        mTriggerRootNodeList.remove(trigger);
+        unlistRootNode(trigger);
     }
     for (auto& trigger : tempList) {
-        mTriggerRootNodeList.push_back(trigger);
+        listRootNode(trigger, mTriggerRootNodeList.end());
+    }
+}
+
+bool TriggerUnit::listRootNode(TTrigger* pT, std::list<TTrigger*>::iterator before)
+{
+    if (mRootNodePositions.contains(pT)) {
+        return false;
+    }
+    mRootNodePositions.insert(pT, mTriggerRootNodeList.insert(before, pT));
+    return true;
+}
+
+void TriggerUnit::unlistRootNode(TTrigger* pT)
+{
+    const auto position = mRootNodePositions.constFind(pT);
+    if (position != mRootNodePositions.cend()) {
+        mTriggerRootNodeList.erase(position.value());
+        mRootNodePositions.erase(position);
     }
 }
 
@@ -435,6 +459,88 @@ void TriggerUnit::rebuildPrescanTasksIfStale()
         collectPrescanTasks(trigger);
     }
     mPrescanTasksGeneration = generation;
+}
+
+TriggerUnit::TreeIndexMode TriggerUnit::smTreeIndexMode = TriggerUnit::readTreeIndexMode();
+
+TriggerUnit::TreeIndexMode TriggerUnit::readTreeIndexMode()
+{
+    const QString value = qEnvironmentVariable("MUDLET_TREE_INDEX");
+    if (value == QLatin1String("0")) {
+        return TreeIndexMode::Off;
+    }
+    if (value == QLatin1String("verify")) {
+        return TreeIndexMode::Verify;
+    }
+    return TreeIndexMode::On;
+}
+
+void TriggerUnit::fileTreeNodes(TTrigger* pT, std::vector<quint64>& grams)
+{
+    for (auto* childNode : *pT->mpMyChildrenList) {
+        auto* child = static_cast<TTrigger*>(childNode);
+        if (child->treeIndexGrams(grams)) {
+            child->mTreeIndexPosition = static_cast<int>(mTreeNodes.size());
+            mTreeNodes.push_back(child);
+            mTreeIndex.appendSlot(grams);
+        }
+        fileTreeNodes(child, grams);
+    }
+}
+
+void TriggerUnit::clearTreeNodes()
+{
+    for (TTrigger* node : mTreeNodes) {
+        if (node) {
+            node->mTreeIndexPosition = -1;
+        }
+    }
+    mTreeNodes.clear();
+}
+
+void TriggerUnit::rebuildTreeIndex()
+{
+    clearTreeNodes();
+    mTreeIndex.rebuild({});
+    std::vector<quint64> grams;
+    for (auto* root : mTriggerRootNodeList) {
+        fileTreeNodes(root, grams);
+    }
+    if (!mTreeIndex.active()) {
+        // Nothing stamps, so nothing may be skipped
+        clearTreeNodes();
+    }
+    mTreeIndexStale = false;
+}
+
+void TriggerUnit::unfileTreeNode(TTrigger* pT)
+{
+    const int position = pT->mTreeIndexPosition;
+    if (position >= 0 && position < static_cast<int>(mTreeNodes.size()) && mTreeNodes[position] == pT) {
+        mTreeNodes[position] = nullptr;
+    }
+    pT->mTreeIndexPosition = -1;
+    mTreeIndexStale = true;
+}
+
+// Rebuilt only by this unit's outermost pass: a nested rebuild would file a trigger the outer line's
+// stamping never saw, and the outer walk would then skip it on a line it matches. Until then a
+// changed or new trigger is unfiled, so it is visited.
+void TriggerUnit::stampTreeCandidates(const QString& line)
+{
+    if (mTreeIndexStale && mProcessingDepth == 1) {
+        rebuildTreeIndex();
+    }
+    if (!mTreeIndex.active()) {
+        return;
+    }
+    mTreeIndex.hits(line, mTreeHits);
+    const quint32 stamp = TTrigger::lineStamp();
+    for (const int position : mTreeHits) {
+        if (TTrigger* node = mTreeNodes[position]) {
+            node->mLineStamp = stamp;
+        }
+    }
 }
 
 void TriggerUnit::markPrescanStale(TTrigger* pT)
@@ -608,6 +714,14 @@ void TriggerUnit::processDataStream(const QString& data, int line)
     }
     const auto pinnedSnapshot = mpRootNodeSnapshot;
     const std::vector<TTrigger*>& pinnedNodeList = pinnedSnapshot->mNodes;
+    TTrigger::enterPass();
+    const auto passGuard = qScopeGuard([] {
+        TTrigger::leavePass();
+    });
+    if (smTreeIndexMode != TreeIndexMode::Off) {
+        // After enterPass(): the stamps have to carry this line's stamp
+        stampTreeCandidates(data);
+    }
     // Triggers registered by a script during this pass (tempTrigger() & Co.)
     // are missing from the snapshot but must still match the current line:
     // before the snapshot the loop walked the live std::list, which a push_back
@@ -798,6 +912,19 @@ std::vector<int> TriggerUnit::findItems(const QString& name, const bool exactMat
     return ids;
 }
 
+bool TriggerUnit::pendingDeletion(TTrigger* pItem) const
+{
+    if (!hasPendingDeletes()) {
+        return false;
+    }
+    for (auto* pAncestor = pItem; pAncestor; pAncestor = pAncestor->getParent()) {
+        if (mCleanupSet.contains(pAncestor) || uninstallList.contains(pAncestor)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool TriggerUnit::enableTrigger(const QString& name)
 {
     bool found = false;
@@ -875,8 +1002,10 @@ bool TriggerUnit::killTrigger(const QString& name)
         // is on the call stack - so until then it is still findable by name.
         // tempComplexRegexTrigger() replaces a temporary trigger under the name it
         // was given, so a corpse and a live trigger can share one: keep looking
-        // rather than report a kill that would achieve nothing.
-        if (mCleanupSet.contains(pT)) {
+        // rather than report a kill that would achieve nothing. One a mid-pass
+        // uninstallPackage() queued must stay out of mCleanupSet too: doCleanup()
+        // would free its children twice.
+        if (pendingDeletion(pT)) {
             continue;
         }
         // Deactivating matters as much as queueing the delete: the trigger stays
