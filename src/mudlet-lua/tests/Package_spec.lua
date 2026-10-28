@@ -4435,8 +4435,9 @@ describe("Tests opening a profile whose script fails as it loads", function()
     end)
 
     local consoleTexts = {}
-    local handler = registerAnonymousEventHandler("mudletSpecLoadBrokenConsole", function(_, text)
+    local handler = registerAnonymousEventHandler("mudletSpecLoadBrokenConsole", function(_, text, moduleRuns)
       consoleTexts[#consoleTexts + 1] = text
+      consoleTexts.moduleRuns = moduleRuns
     end)
     defer(function()
       killAnonymousEventHandler(handler)
@@ -4463,7 +4464,7 @@ describe("Tests opening a profile whose script fails as it loads", function()
     local moduleFile = directory .. "/" .. moduleName .. ".xml"
     writePackageXml(moduleFile, table.concat({
       '<ScriptPackage>',
-      scriptXml("mudlet-spec-load-module-script", "mudletSpecMissingInModule()"),
+      scriptXml("mudlet-spec-load-module-script", "mudletSpecModuleRuns = (mudletSpecModuleRuns or 0) + 1 mudletSpecMissingInModule()"),
       '</ScriptPackage>',
     }))
     writePackageXml(directory .. "/current/2026-01-01#00-00-00.xml", table.concat({
@@ -4487,7 +4488,7 @@ describe("Tests opening a profile whose script fails as it loads", function()
         'function mudletSpecLoadResetter() setScript("mudlet-spec-fixed-before-reset", "mudletSpecFixed = true") disableScript("mudlet-spec-disabled-before-reset") clearWindow() resetProfile() end',
         {handler = "mudletSpecLoadBrokenReset"}),
       scriptXml("mudlet-spec-load-reporter",
-        'tempTimer(0, function() raiseGlobalEvent("mudletSpecLoadBrokenConsole", table.concat(getLines("main", 0, getLastLineNumber("main") + 1), "\\n")) end)'),
+        'tempTimer(0, function() raiseGlobalEvent("mudletSpecLoadBrokenConsole", table.concat(getLines("main", 0, getLastLineNumber("main") + 1), "\\n"), mudletSpecModuleRuns or 0) end)'),
       '</ScriptPackage>',
     }))
 
@@ -4507,6 +4508,10 @@ describe("Tests opening a profile whose script fails as it loads", function()
     assert.is_false(containsWrapped(consoleText, '"mudlet-spec-load-reporter"'), "a script that ran fine was reported too: " .. consoleText)
     assert.is_false(containsWrapped(consoleText, '"mudlet-spec-inactive-fails"'), "an inactive script was reported: " .. consoleText)
     assert.is_false(containsWrapped(consoleText, '"mudlet-spec-load-module-script"'), "a module's script was reported: " .. consoleText)
+  end)
+
+  it("runs a failing body of a module loaded before the profile's scripts only once", function()
+    assert.equals(1, openFixtureProfile().moduleRuns)
   end)
 
   it("names them again after a reset, leaving out those fixed or disabled since", function()
@@ -5334,13 +5339,24 @@ describe("Tests exporting the profile to a file with saveProfile", function()
     }, "\n"))
     installAndConfirm(installPackage, bulkXml, function() return packageInstalled(bulk) end, "the bulky package")
     assert.is_true(waitForTheBulkySave(), "a profile save was still running")
-    local mark = getLastLineNumber("main")
+    local mark, movedAway, whyNot
+    -- The write can still finish before the move, for example when the main thread is held up
+    -- after the call. That shows nothing about the console, so put the folder back and race again.
+    for attempt = 1, 5 do
+      if attempt > 1 then
+        assert(os.remove(moved .. "/mudlet-spec-raced.xml"))
+        assert(os.rename(moved, folder))
+      end
+      mark = getLastLineNumber("main")
+      local ok = saveProfile(folder, "mudlet-spec-raced")
+      movedAway, whyNot = os.rename(folder, moved)
 
-    local ok = saveProfile(folder, "mudlet-spec-raced")
-    local movedAway, whyNot = os.rename(folder, moved)
-
-    assert.is_true(ok)
-    assert.is_true(waitForTheBulkySave(), "the profile save never finished")
+      assert.is_true(ok)
+      assert.is_true(waitForTheBulkySave(), "the profile save never finished")
+      if not movedAway or not fileExists(moved .. "/mudlet-spec-raced.xml") then
+        break
+      end
+    end
     if not movedAway and getOS() == "windows" then
       -- Windows will not move a folder while a file in it is open
       pending("the folder could not be moved away while it was being written to: " .. tostring(whyNot))
